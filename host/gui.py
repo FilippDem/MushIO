@@ -1036,12 +1036,17 @@ class MushIOGUI:
         self._wf_fft_btn     = None
         # PGA gain (ADS124S08 PGA: 1,2,4,8,16,32).  Total gain = PGA x AFE_GAIN(11)
         self._pga_gain       = tk.IntVar(value=1)
+        # ADS124S08 digital filter (DATARATE reg bits 4:2)
+        self._adc_filter_var = tk.StringVar(value='SINC3')
 
         # ---- bandpass state ------------------------------------------------
         self._bp_enabled   = tk.BooleanVar(value=False)
         self._bp_low       = tk.DoubleVar(value=1.0)
         self._bp_high      = tk.DoubleVar(value=300.0)
         self._bp_order_var = tk.IntVar(value=4)
+
+        # ---- self-test / stream control ------------------------------------
+        self._stream_paused_var = tk.BooleanVar(value=False)
 
         # ---- FFT zoom ------------------------------------------------------
         self._fft_max_hz   = tk.DoubleVar(value=0.0)  # 0 = auto (Nyquist)
@@ -1132,6 +1137,7 @@ class MushIOGUI:
         # ---- firmware / programming tab vars (init here so helpers always work) --
         self._fw_fw_dir_var   = tk.StringVar(value='firmware')
         self._fw_c_fw_dir_var = tk.StringVar(value='firmware_c')
+        self._fw_flash_method = tk.StringVar(value='auto')   # 'auto' | 'usb' | 'ota'
         # 'c_demo' | 'c_real'
         self._fw_mode         = tk.StringVar(value='c_demo')
         self._fw_stub_mode    = self._fw_mode   # legacy alias — do not remove
@@ -1417,7 +1423,7 @@ class MushIOGUI:
         outer.pack_propagate(False)
 
         self._build_display_section(outer)
-        self._build_bandpass_section(outer)
+        self._build_signal_chain_section(outer)
         self._build_electrode_grid_section(outer)
         self._build_cam_preview_left(outer)
 
@@ -1461,53 +1467,118 @@ class MushIOGUI:
         frame = ttk.LabelFrame(parent, text="Display", padding=6)
         frame.pack(fill=tk.X, padx=4, pady=3)
 
+        # ---- Time window -----------------------------------------------
         tk.Label(frame, text="Time window (s):", bg=BG_DARK,
                  fg=FG_DIM).grid(row=0, column=0, sticky=tk.W)
-        cb1 = ttk.Combobox(frame, textvariable=self._display_secs, width=6,
-                            values=[1, 2, 5, 10, 20], state='readonly')
-        cb1.grid(row=0, column=1, sticky=tk.W, padx=4)
+        _tw_values = [1, 2, 5, 10, 20, 'Custom']
+        self._tw_combo = ttk.Combobox(frame, textvariable=self._display_secs,
+                                       width=6, values=_tw_values, state='readonly')
+        self._tw_combo.grid(row=0, column=1, sticky=tk.W, padx=4)
 
+        # Custom time-window entry (hidden until 'Custom' is selected)
+        self._tw_custom_frame = tk.Frame(frame, bg=BG_DARK)
+        self._tw_custom_frame.grid(row=1, column=0, columnspan=2, sticky=tk.W,
+                                    pady=(0, 2))
+        self._tw_custom_frame.grid_remove()   # hidden by default
+        tk.Label(self._tw_custom_frame, text="Seconds:", bg=BG_DARK,
+                 fg=FG_DIM).pack(side=tk.LEFT)
+        self._tw_custom_var = tk.StringVar(value='')
+        _tw_entry = tk.Entry(self._tw_custom_frame, textvariable=self._tw_custom_var,
+                              width=7, bg=BG_LIGHT, fg=FG_MAIN,
+                              insertbackground=FG_MAIN, relief=tk.FLAT)
+        _tw_entry.pack(side=tk.LEFT, padx=4)
+        _tw_entry.bind('<Return>',      self._apply_custom_time_window)
+        _tw_entry.bind('<FocusOut>',    self._apply_custom_time_window)
+        self._tw_combo.bind('<<ComboboxSelected>>', self._on_tw_combo_select)
+
+        # ---- Y-scale ---------------------------------------------------
         tk.Label(frame, text="Y-scale (uV):", bg=BG_DARK,
-                 fg=FG_DIM).grid(row=1, column=0, sticky=tk.W)
+                 fg=FG_DIM).grid(row=2, column=0, sticky=tk.W)
         cb2 = ttk.Combobox(frame, textvariable=self._uv_scale, width=6,
                             values=[50, 100, 200, 500, 1000, 2000, 5000], state='readonly')
-        cb2.grid(row=1, column=1, sticky=tk.W, padx=4)
+        cb2.grid(row=2, column=1, sticky=tk.W, padx=4)
 
         ttk.Checkbutton(frame, text="Auto-scale Y",
                          variable=self._auto_scale).grid(
-                         row=2, column=0, columnspan=2, sticky=tk.W, pady=2)
+                         row=3, column=0, columnspan=2, sticky=tk.W, pady=2)
 
-        tk.Label(frame, text="ADC PGA gain:", bg=BG_DARK,
-                 fg=FG_DIM).grid(row=3, column=0, sticky=tk.W)
-        cb3 = ttk.Combobox(frame, textvariable=self._pga_gain, width=6,
-                            values=[1, 2, 4, 8, 16, 32], state='readonly')
-        cb3.grid(row=3, column=1, sticky=tk.W, padx=4)
-        self._gain_info = tk.Label(frame, bg=BG_DARK, fg=FG_DIMMER,
-                                    font=('Helvetica', 7))
-        self._gain_info.grid(row=4, column=0, columnspan=2, sticky=tk.W)
-        self._pga_gain.trace_add('write', self._update_gain_label)
-        self._update_gain_label()
-
+        # ---- FFT max Hz ------------------------------------------------
         tk.Label(frame, text="FFT max (Hz):", bg=BG_DARK,
-                 fg=FG_DIM).grid(row=5, column=0, sticky=tk.W, pady=(6, 0))
+                 fg=FG_DIM).grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
         tk.Entry(frame, textvariable=self._fft_max_hz, width=6,
                  bg=BG_LIGHT, fg=FG_MAIN, insertbackground=FG_MAIN,
-                 relief=tk.FLAT).grid(row=5, column=1, sticky=tk.W,
-                                      padx=4, pady=(6, 0))
+                 relief=tk.FLAT).grid(row=4, column=1, sticky=tk.W,
+                                      padx=4, pady=(4, 0))
         tk.Label(frame, text="0 = auto (Nyquist)", bg=BG_DARK, fg=FG_DIMMER,
-                 font=('Helvetica', 7)).grid(row=6, column=0, columnspan=2,
+                 font=('Helvetica', 7)).grid(row=5, column=0, columnspan=2,
                                              sticky=tk.W)
+
+    def _on_tw_combo_select(self, _event=None):
+        val = self._tw_combo.get()
+        if val == 'Custom':
+            self._tw_custom_frame.grid()
+            self._tw_custom_var.set('')
+        else:
+            self._tw_custom_frame.grid_remove()
+            try:
+                self._display_secs.set(float(val))
+            except ValueError:
+                pass
+
+    def _apply_custom_time_window(self, _event=None):
+        try:
+            v = float(self._tw_custom_var.get())
+            if v > 0:
+                self._display_secs.set(v)
+        except ValueError:
+            pass
 
     def _update_gain_label(self, *_):
         total = self._pga_gain.get() * GAIN
         self._gain_info.config(text=f"Total gain: {self._pga_gain.get()} x {GAIN} (AFE) = {total}x")
 
-    def _build_bandpass_section(self, parent):
-        frame = ttk.LabelFrame(parent, text="Bandpass Filter", padding=6)
+    def _build_signal_chain_section(self, parent):
+        frame = ttk.LabelFrame(parent, text="Signal Chain", padding=6)
         frame.pack(fill=tk.X, padx=4, pady=3)
 
+        # ---- PGA gain ---------------------------------------------------
+        r0 = tk.Frame(frame, bg=BG_DARK)
+        r0.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(r0, text="PGA gain:", bg=BG_DARK, fg=FG_DIM, width=9,
+                 anchor=tk.W).pack(side=tk.LEFT)
+        ttk.Combobox(r0, textvariable=self._pga_gain, width=5,
+                     values=[1, 2, 4, 8, 16, 32],
+                     state='readonly').pack(side=tk.LEFT, padx=2)
+        self._gain_info = tk.Label(r0, bg=BG_DARK, fg=FG_DIMMER,
+                                    font=('Helvetica', 7))
+        self._gain_info.pack(side=tk.LEFT, padx=(4, 0))
+        self._pga_gain.trace_add('write', self._update_gain_label)
+        self._update_gain_label()
+
+        # ---- ADC digital filter -----------------------------------------
+        # ADS124S08 DATARATE register bits 4:2.  Lower = better noise, slower settling.
+        r1 = tk.Frame(frame, bg=BG_DARK)
+        r1.pack(fill=tk.X, pady=2)
+        tk.Label(r1, text="ADC filter:", bg=BG_DARK, fg=FG_DIM, width=9,
+                 anchor=tk.W).pack(side=tk.LEFT)
+        _filt_opts = ['SINC1', 'SINC2', 'SINC3', 'SINC4', 'FIR']
+        ttk.Combobox(r1, textvariable=self._adc_filter_var, width=7,
+                     values=_filt_opts,
+                     state='readonly').pack(side=tk.LEFT, padx=2)
+        tk.Label(r1, text="(reg 0x04[4:2])", bg=BG_DARK, fg=FG_DIMMER,
+                 font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(4, 0))
+
+        tk.Label(frame,
+                 text="SINC1=fast/noisy  SINC3=default  FIR=50/60 Hz reject",
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
+                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+
+        # ---- Separator --------------------------------------------------
+        ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=4)
+
+        # ---- Bandpass filter --------------------------------------------
         if not HAS_SCIPY:
-            tk.Label(frame, text="Install scipy to enable\n(pip install scipy)",
+            tk.Label(frame, text="Bandpass: install scipy to enable\n(pip install scipy)",
                      bg=BG_DARK, fg=FG_DIM, font=('Helvetica', 8),
                      justify=tk.LEFT).pack(anchor=tk.W)
             return
@@ -1637,6 +1708,16 @@ class MushIOGUI:
     def _build_selftest_section(self, parent):
         frame = ttk.LabelFrame(parent, text="Self-Test", padding=6)
         frame.pack(fill=tk.X, padx=4, pady=3)
+
+        # Pause / Resume streaming so self-test results aren't drowned out
+        self._pause_btn = tk.Button(
+            frame, text="  Pause Streaming  ",
+            bg=BG_LIGHT, fg=FG_MAIN, activebackground=ORANGE,
+            activeforeground=BG_DARK, relief=tk.FLAT, pady=4,
+            font=('Consolas', 9, 'bold'),
+            command=self._toggle_stream_pause)
+        self._pause_btn.pack(fill=tk.X, pady=(0, 6))
+
         for label, cmd in [("Ping",                "ping"),
                             ("Status",             "status"),
                             ("Read ADC Registers", "read_regs"),
@@ -1651,6 +1732,19 @@ class MushIOGUI:
                   font=('Helvetica', 8, 'bold'),
                   command=lambda: self._send_cmd("blink_led 5")
                   ).pack(fill=tk.X, pady=(4, 1))
+
+    def _toggle_stream_pause(self):
+        """Pause or resume data ingestion for self-test operations."""
+        paused = not self._stream_paused_var.get()
+        self._stream_paused_var.set(paused)
+        if self._receiver:
+            self._receiver._paused = paused
+        if paused:
+            self._pause_btn.config(text="  Resume Streaming  ",
+                                   bg=ORANGE, fg=BG_DARK)
+        else:
+            self._pause_btn.config(text="  Pause Streaming  ",
+                                   bg=BG_LIGHT, fg=FG_MAIN)
 
     def _build_webcam_section(self, parent):
         frame = ttk.LabelFrame(parent, text="Webcam Capture", padding=6)
@@ -3420,25 +3514,74 @@ class MushIOGUI:
                     _set_status("Flash failed — copy error.", RED)
                     return False
 
+            flash_method = self._fw_flash_method.get()   # 'auto' | 'usb' | 'ota'
+
+            def _flash_via_ota():
+                """Trigger ota_reboot via CMD port then wait for BOOTSEL drive."""
+                import sys as _sys
+                script = os.path.join(os.path.dirname(__file__), 'ota_client.py')
+                host = ''
+                if self._cmd_client and self._cmd_client.connected:
+                    host = self._cmd_client.host or ''
+                if not host and self._receiver:
+                    host = self._receiver.client_ip or ''
+                if not host:
+                    _log("OTA: no Pico IP known — connect CMD port or data stream first.")
+                    _set_status("OTA flash failed — no Pico IP.", RED)
+                    return False
+                cmd = [_sys.executable, script, uf2]
+                cmd += ['--host', host]
+                _log(f"OTA: running ota_client.py --host {host} ...")
+                _set_status(f"OTA flashing via {host} ...", ORANGE)
+                try:
+                    proc = subprocess.Popen(cmd,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT,
+                                            text=True, bufsize=1)
+                    for line in proc.stdout:
+                        ln = line.rstrip()
+                        if ln:
+                            _log(f"  {ln}")
+                    proc.wait()
+                    if proc.returncode == 0:
+                        _log("OTA flash complete.")
+                        return True
+                    else:
+                        _log(f"OTA flash exited with code {proc.returncode}.")
+                        _set_status("OTA flash failed — see log.", RED)
+                        return False
+                except Exception as _oe:
+                    _log(f"OTA error: {_oe}")
+                    _set_status("OTA flash failed — see log.", RED)
+                    return False
+
             flashed = False
-            if picotool:
-                _log("Attempting picotool load --force ...")
-                r = subprocess.run([picotool, 'load', uf2, '--force'],
-                                   capture_output=True, text=True, timeout=60)
-                for ln in (r.stdout + r.stderr).splitlines():
-                    if ln.strip():
-                        _log(f"  {ln}")
-                if r.returncode == 0:
-                    _log("picotool flash OK.  Rebooting ...")
-                    subprocess.run([picotool, 'reboot'],
-                                   capture_output=True, text=True, timeout=10)
-                    flashed = True
-                else:
-                    _log("picotool failed — falling back to BOOTSEL drive copy ...")
-                    flashed = _flash_via_copy()
-            else:
-                _log("picotool not in PATH — using BOOTSEL drive copy ...")
+            if flash_method == 'ota':
+                _log("Flash method: OTA (WiFi)")
+                flashed = _flash_via_ota()
+            elif flash_method == 'usb':
+                _log("Flash method: USB (BOOTSEL)")
                 flashed = _flash_via_copy()
+            else:
+                # auto: picotool first, BOOTSEL fallback
+                if picotool:
+                    _log("Flash method: Auto — attempting picotool load --force ...")
+                    r = subprocess.run([picotool, 'load', uf2, '--force'],
+                                       capture_output=True, text=True, timeout=60)
+                    for ln in (r.stdout + r.stderr).splitlines():
+                        if ln.strip():
+                            _log(f"  {ln}")
+                    if r.returncode == 0:
+                        _log("picotool flash OK.  Rebooting ...")
+                        subprocess.run([picotool, 'reboot'],
+                                       capture_output=True, text=True, timeout=10)
+                        flashed = True
+                    else:
+                        _log("picotool failed — falling back to BOOTSEL drive copy ...")
+                        flashed = _flash_via_copy()
+                else:
+                    _log("Flash method: Auto — picotool not in PATH, using BOOTSEL drive copy ...")
+                    flashed = _flash_via_copy()
 
             if not flashed:
                 return
@@ -4303,6 +4446,37 @@ class MushIOGUI:
         _fw_field(fw_frame, "Data port:",    self._fw_data_port,  8)
         _fw_field(fw_frame, "Command port:", self._fw_cmd_port,   8)
 
+        # ---- Flash method --------------------------------------------------
+        fw_fm = tk.Frame(fw_frame, bg=BG_DARK)
+        fw_fm.pack(fill=tk.X, pady=(6, 2))
+        tk.Label(fw_fm, text="Flash method:", bg=BG_DARK, fg=FG_DIM,
+                 font=_FL, width=_LW, anchor=tk.W).pack(side=tk.LEFT)
+        for _val, _lbl, _tip in [
+            ('auto', 'Auto',        'picotool if available, else BOOTSEL drive copy'),
+            ('usb',  'USB (BOOTSEL)', 'hold BOOTSEL + plug USB → drive copy'),
+            ('ota',  'OTA (WiFi)',  'send ota_reboot via CMD port → network flash'),
+        ]:
+            tk.Radiobutton(fw_fm, text=_lbl, value=_val,
+                           variable=self._fw_flash_method,
+                           bg=BG_DARK, fg=FG_MAIN, selectcolor=BG_LIGHT,
+                           activebackground=BG_DARK, activeforeground=ACCENT,
+                           font=_FL).pack(side=tk.LEFT, padx=6)
+        tk.Label(fw_fm, textvariable=tk.StringVar(), bg=BG_DARK, fg=FG_DIMMER,
+                 font=_FLd).pack(side=tk.LEFT)
+
+        # Flash-method tip (updates on selection change)
+        _fm_tip_texts = {
+            'auto': 'picotool if available, else BOOTSEL drive copy',
+            'usb':  'Hold BOOTSEL + plug USB cable → drive appears → UF2 copied',
+            'ota':  'Pico must be running firmware with CMD port — reboots wirelessly',
+        }
+        _fm_tip_var = tk.StringVar(value=_fm_tip_texts['auto'])
+        def _on_fm_change(*_):
+            _fm_tip_var.set(_fm_tip_texts.get(self._fw_flash_method.get(), ''))
+        self._fw_flash_method.trace_add('write', _on_fm_change)
+        tk.Label(fw_frame, textvariable=_fm_tip_var, bg=BG_DARK, fg=FG_DIMMER,
+                 font=_FLd, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+
         fw_btn_row = tk.Frame(fw_frame, bg=BG_DARK)
         fw_btn_row.pack(fill=tk.X, pady=8)
         tk.Button(fw_btn_row, text="  \u26a1  Deploy to Pico  ",
@@ -4615,7 +4789,8 @@ class MushIOGUI:
                 ax.set_xlim(0, self._fft_xlim(fps_stable))
                 ax.set_ylim(0, max(float(mag.max()) * 1.2, 1.0))
                 ax.set_xlabel('Hz', color=FG_DIM, fontsize=9)
-                ax.set_ylabel('µV', color=FG_DIM, fontsize=9)
+                ax.set_ylabel(self._smart_uv_label(ax.get_ylim()),
+                              color=FG_DIM, fontsize=9)
             else:
                 n_raw  = len(raw)
                 arr    = display_decimate(arr)
@@ -4630,7 +4805,8 @@ class MushIOGUI:
                 else:
                     ax.set_ylim(-uv_half, uv_half)
                 ax.set_xlabel('s', color=FG_DIM, fontsize=9)
-                ax.set_ylabel('µV', color=FG_DIM, fontsize=9)
+                ax.set_ylabel(self._smart_uv_label(ax.get_ylim()),
+                              color=FG_DIM, fontsize=9)
 
         z['canvas'].draw_idle()
         self.root.after(100, self._update_zoom)   # 10 FPS
@@ -4724,6 +4900,17 @@ class MushIOGUI:
             return float(user)
         nyq = fps_est / 2.0
         return max(25.0, round(nyq / 25) * 25)
+
+    @staticmethod
+    def _smart_uv_label(ylim):
+        """Return 'µV', 'mV', or 'V' depending on the y-axis range (in µV).
+        Only changes the label text — data values are never rescaled."""
+        abs_max = max(abs(ylim[0]), abs(ylim[1]))
+        if abs_max >= 1_000_000:
+            return 'V'
+        if abs_max >= 1_000:
+            return 'mV'
+        return 'µV'
 
     # ---- grid ------------------------------------------------------------
 
@@ -4917,7 +5104,8 @@ class MushIOGUI:
                     shifted = mag + ch_i * abs(offset)
                     ax.plot(freq, shifted, color=color, linewidth=0.8, label=label)
                     ax.set_xlabel('Frequency (Hz)', fontsize=7, color=FG_DIM)
-                    ax.set_ylabel('Amplitude (uV)', fontsize=7, color=FG_DIM)
+                    ax.set_ylabel(f'Amplitude ({self._smart_uv_label(ax.get_ylim())})',
+                                  fontsize=7, color=FG_DIM)
                     ax.set_xlim(0, self._fft_xlim(fps_stable))
                 else:
                     med = float(np.median(arr))
@@ -4931,7 +5119,9 @@ class MushIOGUI:
                     shifted = arr_disp + ch_i * offset
                     ax.plot(t_disp, shifted, color=color, linewidth=0.8, label=label)
                     ax.set_xlabel('Time (s)', fontsize=7, color=FG_DIM)
-                    ax.set_ylabel('uV (AC)' if auto_sc else 'uV', fontsize=7, color=FG_DIM)
+                    _lbl = self._smart_uv_label(ax.get_ylim())
+                    ax.set_ylabel(f'{_lbl} (AC)' if auto_sc else _lbl,
+                                  fontsize=7, color=FG_DIM)
                     ax.set_xlim(-win_secs, 0)
                     arr_ac = arr - med   # AC component for scale regardless of mode
                     mad = float(np.median(np.abs(arr_ac))) * 1.4826
@@ -5076,14 +5266,16 @@ class MushIOGUI:
 
         if fft_mode:
             ax.set_xlabel('Frequency (Hz)', fontsize=8, color=FG_DIM)
-            ax.set_ylabel('Amplitude (uV)', fontsize=8, color=FG_DIM)
+            ax.set_ylabel(f'Amplitude ({self._smart_uv_label(ax.get_ylim())})',
+                          fontsize=8, color=FG_DIM)
             ax.set_xlim(0, self._fft_xlim(fps_stable))
             ax.legend(loc='upper right', fontsize=6, ncol=2,
                       facecolor=BG_LIGHT, edgecolor=BG_LIGHT,
                       labelcolor=FG_MAIN, framealpha=0.85, handlelength=1.2)
         else:
             ax.set_xlabel('Time (s)', fontsize=8, color=FG_DIM)
-            ax.set_ylabel('uV (AC)', fontsize=8, color=FG_DIM)
+            ax.set_ylabel(f'{self._smart_uv_label(ax.get_ylim())} (AC)',
+                          fontsize=8, color=FG_DIM)
             ax.set_xlim(-win_secs, 0)
 
             # Y-ticks: one per channel, labelled with channel name
@@ -5507,6 +5699,13 @@ class MushIOGUI:
             elif not r.connected:
                 self._auto_log_started  = False  # reset so next connect auto-starts
                 self._cmd_auto_next_try = 0.0    # allow immediate auto-connect on next data link
+                # Clear any streaming pause so next connection starts unpaused
+                if self._stream_paused_var.get():
+                    self._stream_paused_var.set(False)
+                    r._paused = False
+                    if hasattr(self, '_pause_btn'):
+                        self._pause_btn.config(text="  Pause Streaming  ",
+                                               bg=BG_LIGHT, fg=FG_MAIN)
 
             # Auto-detect Pico IP from the data connection and wire up CMD channel.
             # When the Pico connects on port 9000 its source IP is stored in

@@ -206,22 +206,25 @@ def ota_flash(uf2_path: str, host: str, port: int, no_reboot: bool):
 
     print(f"[OTA] Copy complete ({uf2_size:,} bytes written).")
     print("[OTA] Pico will reboot automatically after flashing.")
-    print("[OTA] Waiting 5 s for Pico to come back online...")
-    time.sleep(5)
+    print("[OTA] Waiting 10 s for Pico WiFi to come back online...")
+    time.sleep(10)
 
-    # Step 4: Quick connectivity check
+    # Step 4: Quick connectivity check (best-effort — flash already succeeded)
     print(f"[OTA] Probing CMD port {host}:{port} ...")
     for attempt in range(10):
         try:
             sock = socket.create_connection((host, port), timeout=2.0)
             sock.close()
-            print(f"[OTA] Pico is back online after {(attempt + 1) * 2} s.")
+            print(f"[OTA] Pico CMD port online after ~{10 + (attempt + 1) * 2} s.")
             return
         except OSError:
             time.sleep(2)
             print(f"  [{attempt + 1}/10] not yet...")
 
-    print("[OTA] Pico did not reconnect within 20 s — check USB serial for errors.")
+    # Probe failed — but the UF2 copy succeeded so exit 0.
+    # The Pico may have a new DHCP IP; the GUI will find it via the data stream.
+    print("[OTA] CMD port not reachable at this IP (Pico may have a new DHCP address).")
+    print("[OTA] Flash complete — GUI will connect once the Pico rejoins the network.")
 
 
 # ---------------------------------------------------------------------------

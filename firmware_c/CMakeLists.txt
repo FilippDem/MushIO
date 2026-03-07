@@ -56,10 +56,10 @@ target_include_directories(mushio_c PRIVATE
 # Pass -DMUSHIO_DEMO=0 to cmake to build for the real MushIO board.
 # Default ON so any Pico 2 W can run demo without needing the shield.
 
-option(MUSHIO_DEMO "Synthetic sine-wave ADC data (no real SPI hardware)" ON)
+option(MUSHIO_DEMO "Synthetic ADC data (sine/triangle/chirp/sawtooth, no real SPI hardware)" ON)
 if(MUSHIO_DEMO)
     target_compile_definitions(mushio_c PRIVATE MUSHIO_DEMO=1)
-    message(STATUS "MUSHIO_DEMO=1: synthetic sine-wave data")
+    message(STATUS "MUSHIO_DEMO=1: synthetic waveform data (sine/triangle/chirp/sawtooth)")
 else()
     message(STATUS "MUSHIO_DEMO=0: real ADS124S08 SPI data")
 endif()

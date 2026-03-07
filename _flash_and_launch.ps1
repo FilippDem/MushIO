@@ -27,14 +27,28 @@ if ($bootsel) {
     Start-Sleep 5
 } else {
     Write-Host "[FLASH] No BOOTSEL drive - trying OTA (Pico must be running firmware)..." -ForegroundColor Yellow
-    $host_ip = ""
-    # Check for active connection on port 9000 to guess Pico IP
-    $conn = netstat -an 2>$null | Select-String "9000\s+ESTABLISHED"
+
+    # Auto-detect Pico IP from the active data-stream connection on port 9000.
+    # netstat line looks like: TCP  192.168.x.y:PORT  192.168.a.b:9000  ESTABLISHED
+    $pico_ip = $null
+    $conn = netstat -an 2>$null | Select-String ":9000\s+ESTABLISHED"
     if ($conn) {
-        Write-Host "[INFO] Found active port-9000 connection: $conn"
+        # Extract the remote address field (second address in the line)
+        if ($conn -match '(\d+\.\d+\.\d+\.\d+):\d+\s+(\d+\.\d+\.\d+\.\d+):9000\s+ESTABLISHED') {
+            $pico_ip = $Matches[2]
+        } elseif ($conn -match '(\d+\.\d+\.\d+\.\d+):9000\s+ESTABLISHED') {
+            $pico_ip = $Matches[1]
+        }
     }
-    # Run ota_client - it will handle drive detection itself
-    python $ota $uf2
+
+    if ($pico_ip) {
+        Write-Host "[OTA] Detected Pico at $pico_ip via port-9000 data stream." -ForegroundColor Cyan
+        python $ota $uf2 --host $pico_ip
+    } else {
+        Write-Host "[OTA] No active data stream found - using default host." -ForegroundColor Yellow
+        python $ota $uf2
+    }
+
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[WARN] OTA flash failed or Pico not reachable." -ForegroundColor Yellow
         Write-Host "       Hold BOOTSEL on the Pico, plug USB, then re-run this script." -ForegroundColor Yellow

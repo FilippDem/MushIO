@@ -47,8 +47,20 @@ echo [2/3] Built: %UF2%
 
 :: ---- 3. Flash ----------------------------------------------------------
 echo [3/3] Flashing...
+:: Auto-detect Pico IP from active data-stream connection on port 9000
+set PICO_IP=
+for /f "tokens=3" %%i in ('netstat -an 2^>nul ^| findstr ":9000 " ^| findstr "ESTABLISHED"') do (
+    if not defined PICO_IP (
+        for /f "tokens=1 delims=:" %%a in ("%%i") do set PICO_IP=%%a
+    )
+)
 :: Try OTA first (Pico already running firmware)
-python "%ROOT%host\ota_client.py" "%UF2%" 2>nul
+if defined PICO_IP (
+    echo [OTA] Detected Pico at %PICO_IP% via port-9000 data stream.
+    python "%ROOT%host\ota_client.py" "%UF2%" --host %PICO_IP% 2>nul
+) else (
+    python "%ROOT%host\ota_client.py" "%UF2%" 2>nul
+)
 if errorlevel 1 (
     echo [INFO] OTA not available. Checking for RPI-RP2 BOOTSEL drive...
     :: Look for the drive

@@ -39,7 +39,7 @@ import time
 DEFAULT_HOST = "192.168.68.115"
 DEFAULT_PORT = 9001
 
-BOOTSEL_TIMEOUT_S = 30    # seconds to wait for RPI-RP2 drive
+BOOTSEL_TIMEOUT_S = 60    # seconds to wait for RPI-RP2 drive
 POLL_INTERVAL_S   = 0.5   # polling interval while waiting
 
 
@@ -166,14 +166,7 @@ def ota_flash(uf2_path: str, host: str, port: int, no_reboot: bool):
     if not no_reboot:
         ok = send_ota_reboot(host, port)
         if not ok:
-            import sys
-            if sys.stdin.isatty():
-                ans = input("[OTA] Could not reach CMD port. "
-                            "Put Pico in BOOTSEL manually, then press Enter to continue "
-                            "(or Ctrl-C to abort): ")
-                _ = ans  # ignore
-            else:
-                print("[OTA] Non-interactive: waiting for BOOTSEL drive anyway...")
+            print("[OTA] Could not reach CMD port - put Pico in BOOTSEL mode now.")
 
     # Step 2: Wait for RPI-RP2 drive
     print(f"\n[OTA] Waiting for RPI-RP2 drive (up to {BOOTSEL_TIMEOUT_S} s)...")

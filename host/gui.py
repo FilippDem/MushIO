@@ -66,6 +66,12 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
+try:
+    import h5py
+    HAS_H5PY = True
+except ImportError:
+    HAS_H5PY = False
+
 sys.path.insert(0, os.path.dirname(__file__))
 import receiver as rx
 
@@ -327,6 +333,12 @@ class DataReceiver(threading.Thread):
         self._log_roll_mins = 60
         self._log_next_roll = None
         self.log_curr_path  = ''
+        # --- HDF5 log (optional; requires h5py) ---
+        self._hdf5_file     = None
+        self._hdf5_ds       = None   # dataset for raw int32 samples (N, 72)
+        self._hdf5_ts_ds    = None   # dataset for timestamps_us (N,)
+        self.hdf5_active    = False
+        self.hdf5_frames    = 0
 
     def run(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -431,6 +443,17 @@ class DataReceiver(threading.Thread):
                 if self._log_file:
                     self._log_file.write(frame_bytes)
                     self.log_frames += 1
+        # HDF5 log (valid frames only)
+        if self.hdf5_active and self._hdf5_file is not None:
+            with self._log_lock:
+                row = np.array(parsed['samples'], dtype=np.int32)
+                ts  = parsed['timestamp_us']
+                n   = self.hdf5_frames
+                self._hdf5_ds.resize(n + 1, axis=0)
+                self._hdf5_ts_ds.resize(n + 1, axis=0)
+                self._hdf5_ds[n]    = row
+                self._hdf5_ts_ds[n] = ts
+                self.hdf5_frames += 1
 
     # --- binary rolling log API ---
 
@@ -462,6 +485,47 @@ class DataReceiver(threading.Thread):
                 try: self._log_file.close()
                 except Exception: pass
                 self._log_file = None
+
+    # --- HDF5 log API -------------------------------------------------------
+
+    def start_hdf5_logging(self, data_dir, prefix):
+        """Open an HDF5 file and start appending frames.  Requires h5py."""
+        import h5py  # guarded at call site by HAS_H5PY check
+        with self._log_lock:
+            os.makedirs(data_dir, exist_ok=True)
+            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(data_dir, f"{prefix}_{ts}.h5")
+            f    = h5py.File(path, 'w')
+            # Unlimited chunked dataset: rows = frames, cols = 72 channels
+            self._hdf5_ds    = f.create_dataset(
+                'samples',
+                shape=(0, rx.TOTAL_CHANNELS),
+                maxshape=(None, rx.TOTAL_CHANNELS),
+                dtype=np.int32,
+                chunks=(256, rx.TOTAL_CHANNELS),
+                compression='gzip', compression_opts=1,
+            )
+            self._hdf5_ts_ds = f.create_dataset(
+                'timestamp_us',
+                shape=(0,), maxshape=(None,),
+                dtype=np.uint32,
+                chunks=(256,),
+            )
+            # Store channel names as attribute
+            self._hdf5_ds.attrs['channel_names'] = rx.CHANNEL_NAMES
+            self._hdf5_file  = f
+            self.hdf5_active = True
+            self.hdf5_frames = 0
+
+    def stop_hdf5_logging(self):
+        with self._log_lock:
+            self.hdf5_active = False
+            if self._hdf5_file is not None:
+                try: self._hdf5_file.close()
+                except Exception: pass
+                self._hdf5_file  = None
+                self._hdf5_ds    = None
+                self._hdf5_ts_ds = None
 
     def stop(self):
         self._stop_event.set()
@@ -1057,6 +1121,10 @@ class MushIOGUI:
         self._log_status_var = tk.StringVar(value='Not recording')
         self._log_file_var   = tk.StringVar(value='')
         self._settings_status = tk.StringVar(value='')
+        self._hdf5_enabled_var  = tk.BooleanVar(value=False)
+        # Hardware test / OTA status
+        self._hw_test_status_var = tk.StringVar(value='')
+        self._ota_status_var     = tk.StringVar(value='')
 
         # ---- firmware / programming tab vars (init here so helpers always work) --
         self._fw_fw_dir_var   = tk.StringVar(value='firmware')
@@ -2646,6 +2714,16 @@ class MushIOGUI:
                  text="~45 KB/s at 200 FPS  \u00b7  164 MB/hr  \u00b7  3.9 GB/day  \u00b7  27 GB/week",
                  bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7)).pack(anchor=tk.W, pady=(2, 6))
 
+        rh5 = tk.Frame(log_frame, bg=BG_DARK)
+        rh5.pack(fill=tk.X, pady=2)
+        _h5_state = tk.NORMAL if HAS_H5PY else tk.DISABLED
+        _h5_txt   = "Also log to HDF5 (.h5) — chunked, gzip-compressed, channel-labelled" \
+                    if HAS_H5PY else \
+                    "HDF5 logging (pip install h5py to enable)"
+        ttk.Checkbutton(rh5, text=_h5_txt,
+                        variable=self._hdf5_enabled_var,
+                        state=_h5_state).pack(side=tk.LEFT)
+
         bf = tk.Frame(log_frame, bg=BG_DARK)
         bf.pack(fill=tk.X, pady=4)
         self._rec_btn = tk.Button(
@@ -2671,6 +2749,46 @@ class MushIOGUI:
                  width=_LW, anchor=tk.W).pack(side=tk.LEFT)
         tk.Label(ff, textvariable=self._log_file_var, bg=BG_DARK, fg=ACCENT,
                  font=('Consolas', 8), anchor=tk.W).pack(side=tk.LEFT)
+
+        # =====================================================================
+        # --- Hardware self-test ---
+        # =====================================================================
+        hw_frame = ttk.LabelFrame(pad, text="Hardware Self-Test", padding=8)
+        hw_frame.pack(fill=tk.X, padx=12, pady=4)
+
+        hw_row = tk.Frame(hw_frame, bg=BG_DARK)
+        hw_row.pack(fill=tk.X, pady=2)
+        ttk.Button(hw_row, text="Run Hardware Test",
+                   command=self._run_hardware_test).pack(side=tk.LEFT, padx=2)
+        tk.Label(hw_row,
+                 text="Sends 'test_hardware' CMD — checks ADC IDs, DRDY lines, ring buffer, WiFi RSSI",
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7)).pack(side=tk.LEFT, padx=8)
+
+        hw_st = tk.Frame(hw_frame, bg=BG_DARK)
+        hw_st.pack(fill=tk.X, pady=1)
+        tk.Label(hw_st, textvariable=self._hw_test_status_var,
+                 bg=BG_DARK, fg=FG_DIM, font=('Consolas', 8), anchor=tk.W
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # =====================================================================
+        # --- OTA firmware update ---
+        # =====================================================================
+        ota_frame = ttk.LabelFrame(pad, text="OTA Firmware Update", padding=8)
+        ota_frame.pack(fill=tk.X, padx=12, pady=4)
+
+        ota_row = tk.Frame(ota_frame, bg=BG_DARK)
+        ota_row.pack(fill=tk.X, pady=2)
+        ttk.Button(ota_row, text="OTA Flash\u2026",
+                   command=self._ota_flash).pack(side=tk.LEFT, padx=2)
+        tk.Label(ota_row,
+                 text="Browse for .uf2, reboot Pico into BOOTSEL, copy file automatically",
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7)).pack(side=tk.LEFT, padx=8)
+
+        ota_st = tk.Frame(ota_frame, bg=BG_DARK)
+        ota_st.pack(fill=tk.X, pady=1)
+        tk.Label(ota_st, textvariable=self._ota_status_var,
+                 bg=BG_DARK, fg=FG_DIM, font=('Consolas', 8), anchor=tk.W
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # =====================================================================
         # --- Webcam preview + periodic capture settings ---
@@ -3520,6 +3638,63 @@ class MushIOGUI:
             self.root.after(0, lambda: self._serial_append(
                 "--- Serial monitor disconnected ---\n"))
 
+    def _run_hardware_test(self):
+        """Send 'test_hardware' CMD and display results in terminal + status label."""
+        self._hw_test_status_var.set("Running test...")
+        if self._cmd_client and self._cmd_client.connected:
+            self._send_cmd("test_hardware")
+            self._term_append("> test_hardware\n", 'cmd')
+            # Also check crash log while we're at it
+            self._send_cmd("crash_log")
+            self._term_append("> crash_log\n", 'cmd')
+        else:
+            self._hw_test_status_var.set("Not connected — connect CMD port first")
+            self._term_append("[TEST] Not connected.\n", 'err')
+
+    def _ota_flash(self):
+        """Browse for a .uf2 file, then run ota_client.py in a background thread."""
+        uf2_path = filedialog.askopenfilename(
+            title="Select firmware .uf2 file",
+            filetypes=[("UF2 firmware", "*.uf2"), ("All files", "*.*")],
+        )
+        if not uf2_path:
+            return
+
+        self._ota_status_var.set(f"Flashing: {os.path.basename(uf2_path)}")
+        self._term_append(f"[OTA] Starting OTA flash: {uf2_path}\n", 'info')
+
+        def _run():
+            import subprocess, sys as _sys
+            script = os.path.join(os.path.dirname(__file__), 'ota_client.py')
+            # Determine host IP from CMD client or receiver
+            host = ''
+            if hasattr(self, '_cmd_client') and self._cmd_client:
+                host = self._cmd_client.host or ''
+            if not host and self._receiver:
+                host = self._receiver.client_ip or ''
+            cmd = [_sys.executable, script, uf2_path]
+            if host:
+                cmd += ['--host', host]
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                )
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    self.root.after(0, lambda l=line:
+                        (self._term_append(l + '\n', 'info'),
+                         self._ota_status_var.set(l)))
+                proc.wait()
+                final = "[OTA] Done." if proc.returncode == 0 else f"[OTA] Exited with code {proc.returncode}"
+                self.root.after(0, lambda: self._ota_status_var.set(final))
+            except Exception as e:
+                self.root.after(0, lambda: self._ota_status_var.set(f"[OTA] Error: {e}"))
+
+        import threading as _thr
+        _thr.Thread(target=_run, daemon=True).start()
+
     def _toggle_recording(self):
         if self._log_active:
             self._stop_recording()
@@ -3532,6 +3707,11 @@ class MushIOGUI:
         roll_key = self._log_roll_var.get()
         roll_min = LOG_ROLL_OPTIONS.get(roll_key, 60)
         self._receiver.start_logging(data_dir, prefix, roll_min)
+        if HAS_H5PY and self._hdf5_enabled_var.get():
+            try:
+                self._receiver.start_hdf5_logging(data_dir, prefix)
+            except Exception as e:
+                self._log_status_var.set(f"HDF5 open failed: {e}")
         self._log_active = True
         self._rec_btn.config(text="  \u25a0 Stop Recording  ",
                               bg='#3a1a1a', fg=RED,
@@ -3540,6 +3720,8 @@ class MushIOGUI:
 
     def _stop_recording(self):
         self._receiver.stop_logging()
+        if self._receiver.hdf5_active:
+            self._receiver.stop_hdf5_logging()
         self._log_active = False
         self._rec_btn.config(text="  \u25b6 Start Recording  ",
                               bg='#1a3a1a', fg=GREEN,
@@ -5123,6 +5305,15 @@ class MushIOGUI:
             if line == 'END':
                 self._term_append("--- end ---\n", 'end')
             elif line.startswith('ERROR'):
+                self._term_append(line + '\n', 'err')
+            elif line.startswith('[TEST]'):
+                self._term_append(line + '\n', 'info')
+                # Mirror last result line to the Settings tab status label
+                self._hw_test_status_var.set(line)
+            elif line.startswith('[OTA]'):
+                self._term_append(line + '\n', 'info')
+                self._ota_status_var.set(line)
+            elif line.startswith('[CRASH]'):
                 self._term_append(line + '\n', 'err')
             elif line.startswith('[CMD]') or line.startswith('[REGS]'):
                 self._term_append(line + '\n', 'info')

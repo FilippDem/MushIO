@@ -73,6 +73,7 @@ target_link_libraries(mushio_c
     pico_multicore                            # multicore_launch_core1
     pico_float                               # sinf() via hardware FPU
     hardware_timer                           # get_absolute_time, busy_wait_us
+    hardware_watchdog                        # watchdog_enable, watchdog_update, scratch regs
     pico_cyw43_arch_lwip_threadsafe_background  # WiFi + lwIP (alarm-IRQ model)
 )
 

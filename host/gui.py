@@ -1049,6 +1049,9 @@ class MushIOGUI:
         # ---- electrode / STIM selection ------------------------------------
         self._selected_elec  = set()
         self._stim_active    = set()
+
+        # ---- zoom popup ----------------------------------------------------
+        self._zoom_win       = None   # dict with win/fig/ax/line/canvas or None
         self._elec_btns      = {}
         self._stim_btns      = {}   # flat_idx -> Button (outer-ring in 10x10 grid)
         self._stim_phys_btns = {}   # same: populated in electrode grid section
@@ -4416,19 +4419,14 @@ class MushIOGUI:
     # ==========================================================================
 
     def _on_grid_click(self, event):
-        """Matplotlib button_press_event: click an electrode or STIM cell to toggle it."""
+        """Matplotlib button_press_event: click a cell to open a zoom popup."""
         ax = event.inaxes
         if ax is None:
             return
         if ax in self._grid_ax_to_elec:
-            flat = self._grid_ax_to_elec[ax]
-            # find (col, row) from flat
-            for (c, r), f in ELEC_GRID.items():
-                if f == flat:
-                    self._toggle_electrode(c, r)
-                    break
+            self._open_zoom_window(self._grid_ax_to_elec[ax], is_stim=False)
         elif ax in self._grid_ax_to_stim:
-            self._toggle_stim(self._grid_ax_to_stim[ax])
+            self._open_zoom_window(self._grid_ax_to_stim[ax], is_stim=True)
 
     def _toggle_electrode(self, col, row):
         flat = ELEC_GRID.get((col, row))
@@ -4487,6 +4485,155 @@ class MushIOGUI:
         for flat, btn in self._stim_btns.items():
             btn.config(bg=ORANGE if flat in self._stim_active else BG_LIGHT,
                        fg=BG_DARK if flat in self._stim_active else FG_MAIN)
+
+    # ==========================================================================
+    # Zoom popup
+    # ==========================================================================
+
+    def _open_zoom_window(self, flat, is_stim=False):
+        """Open (or bring to front) a zoom popup for the given channel flat index."""
+        z = self._zoom_win
+        if z is not None:
+            try:
+                if z['flat'] == flat and z['win'].winfo_exists():
+                    z['win'].lift()
+                    return
+                z['win'].destroy()
+            except tk.TclError:
+                pass
+            self._zoom_win = None
+
+        # Resolve channel name and line colour
+        if is_stim:
+            ch_name = next((n for n, f in STIM_BY_NAME if f == flat), f'STIM_{flat}')
+            color   = ORANGE
+        else:
+            ch_name = ALL_NAMES[flat]
+            col, row = next(((c, r) for (c, r), f in ELEC_GRID.items() if f == flat), (0, 0))
+            color   = COLORS[(col * 8 + row) % len(COLORS)]
+
+        win = tk.Toplevel(self.root)
+        win.title(f'Zoom  {ch_name}')
+        win.configure(bg=BG_DARK)
+        win.geometry('720x360')
+        win.resizable(True, True)
+
+        fig = Figure(figsize=(7.2, 3.6), dpi=100, facecolor=BG_DARK)
+        fig.subplots_adjust(left=0.10, right=0.97, top=0.90, bottom=0.15)
+        zoom_ax = fig.add_subplot(111, facecolor=BG_MID)
+        zoom_ax.tick_params(colors=FG_DIM, labelsize=9)
+        zoom_ax.title.set_text(ch_name)
+        zoom_ax.title.set_color(color)
+        zoom_ax.title.set_fontsize(11)
+        for sp in zoom_ax.spines.values():
+            sp.set_color(BG_LIGHT)
+        zoom_line, = zoom_ax.plot([], [], color=color, lw=1.2)
+
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self._zoom_win = {
+            'flat':    flat,
+            'win':     win,
+            'ax':      zoom_ax,
+            'line':    zoom_line,
+            'canvas':  canvas,
+            'is_stim': is_stim,
+        }
+
+        win.bind('<Escape>', lambda e: self._close_zoom())
+        win.protocol('WM_DELETE_WINDOW', self._close_zoom)
+
+        self._update_zoom()
+
+    def _close_zoom(self):
+        z = self._zoom_win
+        if z is not None:
+            try:
+                z['win'].destroy()
+            except tk.TclError:
+                pass
+            self._zoom_win = None
+
+    def _update_zoom(self):
+        """Refresh the zoom popup at ~10 FPS, honouring all display settings."""
+        z = self._zoom_win
+        if z is None:
+            return
+        try:
+            if not z['win'].winfo_exists():
+                self._zoom_win = None
+                return
+        except tk.TclError:
+            self._zoom_win = None
+            return
+
+        win_secs   = self._display_secs.get()
+        fft_mode   = self._fft_mode.get()
+        auto_sc    = self._auto_scale.get()
+        uv_half    = self._uv_scale.get()
+        fps_est, fps_stable, n_samp = self._get_fps_nsamp(win_secs)
+        total_gain = self._pga_gain.get() * GAIN
+        bp_on      = self._bp_enabled.get()
+        ax         = z['ax']
+        line       = z['line']
+        flat       = z['flat']
+
+        if z['is_stim']:
+            t_prog, arr = self._stim_waveform_for_display(flat, n_samp, fps_est, win_secs)
+            if fft_mode:
+                freq, mag = compute_fft(arr, fps_stable)
+                line.set_xdata(freq); line.set_ydata(mag)
+                ax.set_xlim(0, self._fft_xlim(fps_stable))
+                ax.set_ylim(0, max(float(mag.max()) * 1.2, 0.1))
+                ax.set_xlabel('Hz', color=FG_DIM, fontsize=9)
+                ax.set_ylabel('µA', color=FG_DIM, fontsize=9)
+            else:
+                line.set_xdata(t_prog); line.set_ydata(arr)
+                ax.set_xlim(-win_secs, 0)
+                mn, mx = float(arr.min()), float(arr.max())
+                pad = max((mx - mn) * 0.15, 0.1)
+                ax.set_ylim(mn - pad, mx + pad)
+                ax.set_xlabel('s', color=FG_DIM, fontsize=9)
+                ax.set_ylabel('µA', color=FG_DIM, fontsize=9)
+        else:
+            raw = self._receiver.get_channel(flat, n_samp) if self._receiver else []
+            if fft_mode:
+                raw_fft = self._receiver.get_channel(flat, self._get_n_fft(fps_stable)) \
+                          if self._receiver else []
+                arr = np.array(raw_fft, dtype=float) / FS * VREF / total_gain * 1e6
+            else:
+                arr = np.array(raw, dtype=float) / FS * VREF / total_gain * 1e6
+
+            if bp_on and len(arr) > 10:
+                arr = bandpass_filter(arr, self._bp_low.get(), self._bp_high.get(),
+                                      fps_stable, self._bp_order_var.get())
+
+            if fft_mode:
+                freq, mag = compute_fft(arr, fps_stable)
+                line.set_xdata(freq); line.set_ydata(mag)
+                ax.set_xlim(0, self._fft_xlim(fps_stable))
+                ax.set_ylim(0, max(float(mag.max()) * 1.2, 1.0))
+                ax.set_xlabel('Hz', color=FG_DIM, fontsize=9)
+                ax.set_ylabel('µV', color=FG_DIM, fontsize=9)
+            else:
+                n_raw  = len(raw)
+                arr    = display_decimate(arr)
+                win_actual = n_raw / fps_stable if fps_stable > 0 else win_secs
+                t = np.linspace(-win_actual, 0, len(arr))
+                line.set_xdata(t); line.set_ydata(arr)
+                ax.set_xlim(-win_secs, 0)
+                if auto_sc and len(arr) > 0:
+                    mn, mx = float(arr.min()), float(arr.max())
+                    pad = max((mx - mn) * 0.15, 1.0)
+                    ax.set_ylim(mn - pad, mx + pad)
+                else:
+                    ax.set_ylim(-uv_half, uv_half)
+                ax.set_xlabel('s', color=FG_DIM, fontsize=9)
+                ax.set_ylabel('µV', color=FG_DIM, fontsize=9)
+
+        z['canvas'].draw_idle()
+        self.root.after(100, self._update_zoom)   # 10 FPS
 
     # ==========================================================================
     # FFT / tab switching

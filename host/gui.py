@@ -490,14 +490,14 @@ class DemoDataInjector(threading.Thread):
 
     Column types
     ------------
-    Col 0 : Gaussian white noise          (resting-state baseline)
-    Col 1 : 1 Hz sine wave                (slow LFP oscillation)
+    Col 0 : Gaussian white noise           (resting-state baseline)
+    Col 1 : Triangle wave 1.5 Hz           (slow LFP — visually distinct from sine)
     Col 2 : Action-potential spike trains  (Poisson, ~5 Hz)
     Col 3 : Pure DC offsets per row        (demonstrates baseline/gain/saturation)
-    Col 4 : 8 Hz theta + noise             (hippocampal theta)
+    Col 4 : Chirp 2→20 Hz over 4 s         (frequency sweep)
     Col 5 : 20 Hz burst firing             (periodic 0.5 s bursts / 2 s)
     Col 6 : Brownian random walk           (1/f-like noise)
-    Col 7 : 40 Hz gamma + noise            (cortical gamma band)
+    Col 7 : Sawtooth 6 Hz + noise          (asymmetric ramp)
     """
 
     FPS = 200.0
@@ -577,8 +577,11 @@ class DemoDataInjector(threading.Thread):
             return int(random.gauss(0, amp * 0.9))
 
         elif col == 1:
-            # Clean 1 Hz sine (slow LFP)
-            return int(amp * 3.5 * math.sin(2 * math.pi * 1.0 * t + phase))
+            # Triangle wave 1.5 Hz — slow LFP, visually distinct from sine
+            # asin(sin(x))/pi*2 gives a triangle with range [-1, 1]
+            tri = 2.0 / math.pi * math.asin(
+                math.sin(2 * math.pi * 1.5 * t + phase))
+            return int(amp * 3.5 * tri)
 
         elif col == 2:
             # Poisson action-potential spike train (~5 Hz)
@@ -592,9 +595,13 @@ class DemoDataInjector(threading.Thread):
             return int(dc + random.gauss(0, 12))
 
         elif col == 4:
-            # Theta 8 Hz + moderate noise
-            theta = amp * 2.2 * math.sin(2 * math.pi * 8.0 * t + phase)
-            return int(theta + random.gauss(0, amp * 0.45))
+            # Chirp: frequency sweeps 2→20 Hz over a 4 s period + light noise
+            chirp_period = 4.0
+            f_lo, f_hi   = 2.0, 20.0
+            frac         = math.fmod(t + row * chirp_period / 8.0, chirp_period) / chirp_period
+            f_inst       = f_lo + (f_hi - f_lo) * frac
+            chirp        = amp * 2.2 * math.sin(2 * math.pi * f_inst * t + phase)
+            return int(chirp + random.gauss(0, amp * 0.2))
 
         elif col == 5:
             # Burst activity: 20 Hz oscillation in 0.5 s bursts every 2 s
@@ -613,9 +620,10 @@ class DemoDataInjector(threading.Thread):
             return int(self._rw[ch])
 
         elif col == 7:
-            # Gamma 40 Hz + noise
-            gamma = amp * 1.6 * math.sin(2 * math.pi * 40.0 * t + phase)
-            return int(gamma + random.gauss(0, amp * 0.55))
+            # Sawtooth 6 Hz + light noise — asymmetric ramp, visually unlike sine
+            # math.fmod gives [0,1) ramp; shift to [-1, 1)
+            saw = 2.0 * math.fmod(6.0 * t + phase / (2 * math.pi), 1.0) - 1.0
+            return int(amp * 2.2 * saw + random.gauss(0, amp * 0.25))
 
         return 0
 
@@ -1045,6 +1053,7 @@ class MushIOGUI:
         self._cam_dir_var   = tk.StringVar(value=_s.get('cam_dir',   'captures'))
         self._log_active        = False
         self._auto_log_started  = False   # True once auto-log fired for this connection
+        self._cmd_auto_next_try = 0.0     # time.time() after which CMD auto-connect may fire
         self._log_status_var = tk.StringVar(value='Not recording')
         self._log_file_var   = tk.StringVar(value='')
         self._settings_status = tk.StringVar(value='')
@@ -4459,11 +4468,16 @@ class MushIOGUI:
                     if do_auto: ax.set_ylim(0, max(float(mag.max())*1.2, 1.0))
                     elif not auto_sc: ax.set_ylim(0, uv_half)
                 else:
+                    n_raw = len(raw)   # save pre-decimate count for correct time span
                     arr = display_decimate(arr)
                     # win_actual may be < win_secs when buffer is filling or
                     # was just flushed after a frame gap.  Anchor the waveform
                     # to t=0 so it grows in from the right with no false zeros.
-                    win_actual = len(arr) / fps_stable if fps_stable > 0 else win_secs
+                    # Use n_raw (not len(arr)) because display_decimate shrinks
+                    # the array; dividing the decimated length by the original
+                    # fps would under-estimate the window and compress the trace
+                    # into the right portion of the cell.
+                    win_actual = n_raw / fps_stable if fps_stable > 0 else win_secs
                     t = np.linspace(-win_actual, 0, len(arr))
                     line.set_xdata(t); line.set_ydata(arr)
                     ax.set_xlim(-win_secs, 0)
@@ -5153,7 +5167,8 @@ class MushIOGUI:
                     if not self._log_active:
                         self._start_recording()
             elif not r.connected:
-                self._auto_log_started = False   # reset so next connect auto-starts
+                self._auto_log_started  = False  # reset so next connect auto-starts
+                self._cmd_auto_next_try = 0.0    # allow immediate auto-connect on next data link
 
             # Auto-detect Pico IP from the data connection and wire up CMD channel.
             # When the Pico connects on port 9000 its source IP is stored in
@@ -5165,7 +5180,7 @@ class MushIOGUI:
                     and not self._demo_mode
                     and hasattr(self, '_cmd_client') and self._cmd_client
                     and not self._cmd_client.connected
-                    and self._cmd_client.host != pico_ip):
+                    and time.time() >= self._cmd_auto_next_try):
                 # Fill field only if the user hasn't typed something already
                 if not self._cmd_host_var.get().strip():
                     self._cmd_host_var.set(pico_ip)
@@ -5174,6 +5189,7 @@ class MushIOGUI:
                 except (ValueError, AttributeError):
                     cmd_port = 9001
                 self._cmd_client.set_host(pico_ip, cmd_port)
+                self._cmd_auto_next_try = time.time() + 10.0  # back-off: retry at most every 10 s
                 self._term_append(
                     f"[CMD] Auto-detected Pico at {pico_ip} — connecting CMD channel...\n",
                     'info')

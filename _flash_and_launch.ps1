@@ -26,14 +26,14 @@ if ($bootsel) {
     Write-Host "[FLASH] Done. Waiting 5 s for reboot..." -ForegroundColor Cyan
     Start-Sleep 5
 } else {
-    Write-Host "[FLASH] No BOOTSEL drive — trying OTA (Pico must be running firmware)..." -ForegroundColor Yellow
+    Write-Host "[FLASH] No BOOTSEL drive - trying OTA (Pico must be running firmware)..." -ForegroundColor Yellow
     $host_ip = ""
     # Check for active connection on port 9000 to guess Pico IP
     $conn = netstat -an 2>$null | Select-String "9000\s+ESTABLISHED"
     if ($conn) {
         Write-Host "[INFO] Found active port-9000 connection: $conn"
     }
-    # Run ota_client — it will handle drive detection itself
+    # Run ota_client - it will handle drive detection itself
     python $ota $uf2
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[WARN] OTA flash failed or Pico not reachable." -ForegroundColor Yellow

@@ -28,7 +28,9 @@
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "pico/cyw43_arch.h"
+#include "pico/bootrom.h"
 #include "hardware/timer.h"
+#include "hardware/watchdog.h"
 
 #include "lwip/tcp.h"
 #include "lwip/netif.h"
@@ -59,6 +61,38 @@ static volatile uint32_t g_sent_frames  = 0;
  * Updated at runtime by the 'set_fps <hz>' CMD command.
  * Core 1 reads this once per scan iteration (extern in core1.c). */
 volatile uint32_t g_scan_period_us = DEMO_SCAN_PERIOD_US;
+
+/* =========================================================================
+ * OTA reboot flag
+ * Set from cmd_dispatch() (IRQ context) — acted on in main loop (safe context).
+ * ========================================================================= */
+
+static volatile bool g_ota_reboot_requested = false;
+
+/* =========================================================================
+ * Crash logging via watchdog scratch registers
+ *
+ * scratch[0] = CRASH_MAGIC (0xDEADBEEF) — set only on abnormal exit
+ * scratch[1] = crash code
+ * scratch[2] = timestamp_ms at crash
+ * scratch[3] = extra data (e.g. lwIP err_t)
+ *
+ * These registers survive a watchdog reset but are cleared on power-on.
+ * The host can read them via the 'crash_log' CMD command.
+ * ========================================================================= */
+
+#define CRASH_MAGIC       0xDEADBEEFu
+#define CRASH_CODE_TCP    0x01u   /* TCP write / connect error */
+#define CRASH_CODE_WIFI   0x02u   /* WiFi link lost            */
+#define CRASH_CODE_WDT    0x03u   /* Watchdog timeout (prev)   */
+
+static void crash_log_write(uint32_t code, uint32_t extra)
+{
+    watchdog_hw->scratch[0] = CRASH_MAGIC;
+    watchdog_hw->scratch[1] = code;
+    watchdog_hw->scratch[2] = to_ms_since_boot(get_absolute_time());
+    watchdog_hw->scratch[3] = extra;
+}
 
 /* =========================================================================
  * LED helpers
@@ -100,8 +134,9 @@ static uint32_t g_batch_start_ms = 0;
 
 static void data_tcp_err_cb(void *arg, err_t err)
 {
-    (void)arg; (void)err;
+    (void)arg;
     printf("[DATA] TCP error %d — disconnected\n", (int)err);
+    crash_log_write(CRASH_CODE_TCP, (uint32_t)(int)err);
     g_data_pcb       = NULL;
     g_data_connected = false;
     g_data_pending   = false;
@@ -378,9 +413,109 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         }
         cmd_send(pcb, "Register dump complete -- all 6 ADCs responding");
 
+    } else if (strcasecmp(cmd, "test_hardware") == 0) {
+        /* Hardware self-test.
+         * In demo mode all ADC checks return synthetic PASS.
+         * In real mode this would walk the SPI bus and read device IDs. */
+        cmd_send(pcb, "[TEST] Hardware Self-Test  (%s)",
+#ifdef MUSHIO_DEMO
+                 "demo mode — synthetic results"
+#else
+                 "real hardware"
+#endif
+                 );
+        uint32_t pass = 0, total = 0;
+
+        /* --- ADC ID checks (6 ADCs) --------------------------------------- */
+        for (int a = 0; a < (int)NUM_ADCS; a++) {
+#ifdef MUSHIO_DEMO
+            cmd_send(pcb, "[TEST] ADC%d: ID=0x00  PASS", a);
+            pass++;
+#else
+            /* Real: read ID register via SPI, expect bits[4:0] == 0x00 */
+            cmd_send(pcb, "[TEST] ADC%d: real SPI check not yet implemented", a);
+#endif
+            total++;
+        }
+
+        /* --- DRDY line checks (6 ADCs) ------------------------------------ */
+        for (int a = 0; a < (int)NUM_ADCS; a++) {
+#ifdef MUSHIO_DEMO
+            cmd_send(pcb, "[TEST] ADC%d DRDY: PASS (demo)", a);
+            pass++;
+#else
+            cmd_send(pcb, "[TEST] ADC%d DRDY: real check not yet implemented", a);
+#endif
+            total++;
+        }
+
+        /* --- Ring buffer health ------------------------------------------- */
+        {
+            uint32_t dropped  = g_ring.dropped;
+            uint32_t buffered = ring_count(&g_ring);
+            if (dropped == 0) {
+                cmd_send(pcb, "[TEST] Ring: buffered=%lu dropped=0  PASS",
+                         (unsigned long)buffered);
+                pass++;
+            } else {
+                cmd_send(pcb, "[TEST] Ring: buffered=%lu dropped=%lu  WARN",
+                         (unsigned long)buffered, (unsigned long)dropped);
+            }
+            total++;
+        }
+
+        /* --- WiFi RSSI ---------------------------------------------------- */
+        {
+            int32_t rssi = 0;
+            int ret = cyw43_wifi_get_rssi(&cyw43_state, &rssi);
+            if (ret == 0) {
+                const char *qual = (rssi > -60) ? "GOOD" :
+                                   (rssi > -75) ? "FAIR" : "WEAK";
+                cmd_send(pcb, "[TEST] WiFi RSSI: %d dBm  %s",
+                         (int)rssi, qual);
+            } else {
+                cmd_send(pcb, "[TEST] WiFi RSSI: read failed (%d)", ret);
+            }
+            total++;
+            pass++;  /* RSSI is informational — always counts as pass */
+        }
+
+        cmd_send(pcb, "[TEST] RESULT: %lu/%lu checks passed  %s",
+                 (unsigned long)pass, (unsigned long)total,
+                 (pass == total) ? "ALL PASS" : "SOME FAILED");
+
+    } else if (strcasecmp(cmd, "ota_reboot") == 0) {
+        /* Request reboot into USB mass-storage (BOOTSEL) mode for .uf2 upload.
+         * We set a flag here (IRQ context) and execute in main loop (safe context). */
+        cmd_send(pcb, "[OTA] Entering BOOTSEL mode in 2 s ...");
+        cmd_send(pcb, "[OTA] RPI-RP2 drive will appear — drop .uf2 to flash.");
+        g_ota_reboot_requested = true;
+
+    } else if (strcasecmp(cmd, "crash_log") == 0) {
+        /* Return last crash info from watchdog scratch registers. */
+        uint32_t magic = watchdog_hw->scratch[0];
+        if (magic == CRASH_MAGIC) {
+            uint32_t code  = watchdog_hw->scratch[1];
+            uint32_t ts_ms = watchdog_hw->scratch[2];
+            uint32_t extra = watchdog_hw->scratch[3];
+            const char *desc = (code == CRASH_CODE_TCP)  ? "TCP error"  :
+                               (code == CRASH_CODE_WIFI) ? "WiFi lost"  :
+                               (code == CRASH_CODE_WDT)  ? "WDT timeout":
+                                                           "unknown";
+            cmd_send(pcb, "[CRASH] Last crash: code=0x%02lX (%s) ts=%lu ms extra=0x%08lX",
+                     (unsigned long)code, desc,
+                     (unsigned long)ts_ms,
+                     (unsigned long)extra);
+            /* Clear after reading so next query shows "none" */
+            watchdog_hw->scratch[0] = 0;
+        } else {
+            cmd_send(pcb, "[CRASH] No crash record (clean boot).");
+        }
+
     } else if (strcasecmp(cmd, "help") == 0) {
         cmd_send(pcb, "Commands: ping | status | scan_all | benchmark | "
-                      "read_regs | set_fps <hz> | blink_led | help");
+                      "read_regs | set_fps <hz> | blink_led | "
+                      "test_hardware | ota_reboot | crash_log | help");
 
     } else if (cmd[0] == '\0') {
         /* empty line — ignore */
@@ -581,6 +716,23 @@ int main(void)
     }
 
     /* --------------------------------------------------------------------- */
+    /* Phase 4b: Check for previous crash, then enable watchdog              */
+    /* Enabled AFTER WiFi connect so the 30 s join doesn't trigger it.       */
+    /* 8 s timeout: main loop feeds watchdog; hang → reset → crash_log set.  */
+    /* --------------------------------------------------------------------- */
+
+    if (watchdog_caused_reboot()) {
+        /* Previous watchdog reset — mark crash record if not already set */
+        if (watchdog_hw->scratch[0] != CRASH_MAGIC) {
+            crash_log_write(CRASH_CODE_WDT, 0);
+        }
+        printf("[CRASH] Previous watchdog reset detected — see 'crash_log' CMD.\n");
+    }
+
+    watchdog_enable(8000, true);   /* 8 s, pause-on-debug = true */
+    printf("[WDT] Watchdog enabled (8 s timeout).\n");
+
+    /* --------------------------------------------------------------------- */
     /* Phase 5: TCP data connection                                           */
     /* --------------------------------------------------------------------- */
 
@@ -612,6 +764,17 @@ int main(void)
     g_batch_start_ms = to_ms_since_boot(get_absolute_time());
 
     while (true) {
+        /* ---- Watchdog feed ----------------------------------------------- */
+        watchdog_update();
+
+        /* ---- OTA reboot (set by ota_reboot CMD, executed here safely) ---- */
+        if (g_ota_reboot_requested) {
+            printf("[OTA] Rebooting into BOOTSEL mode...\n");
+            sleep_ms(2000);   /* give CMD response time to flush */
+            reset_usb_boot(0, 0);
+            /* unreachable */
+        }
+
         /* ---- Stream: drain ring → TCP ------------------------------------ */
         do_stream_work();
 

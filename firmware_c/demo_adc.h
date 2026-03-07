@@ -1,10 +1,11 @@
 /*
  * demo_adc.h — Synthetic ADC data generator  (no hardware required)
  *
- * Produces 72 channels of sine-wave data at slightly different frequencies
- * so that the GUI waveform display shows clearly distinct signals.
+ * Produces 72 channels of varied synthetic waveforms (sine, triangle,
+ * chirp, sawtooth) so that the GUI waveform display shows clearly distinct
+ * signals across ADC groups.
  *
- * Output format: DATA_SIZE (216) bytes, 72 × 3-byte big-endian signed 24-bit,
+ * Output format: DATA_SIZE (216) bytes, 72 x 3-byte big-endian signed 24-bit,
  * matching the real ADS124S08 SPI output format.
  */
 
@@ -13,7 +14,7 @@
 #include <stdint.h>
 #include "config.h"
 
-/* Initialise the 256-entry sine lookup table.  Call once before first scan. */
+/* Initialise per-channel frequency and phase tables.  Call once before first scan. */
 void demo_adc_init(void);
 
 /*

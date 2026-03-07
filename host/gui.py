@@ -37,6 +37,7 @@ import argparse
 import sys
 import os
 import math
+import colorsys
 import random
 import json
 from datetime import datetime
@@ -890,6 +891,14 @@ class DemoCmdClient:
             ch_i = int(parts[1]) if len(parts) > 1 else 0
             self.rx_q.put(f"[STIM] Pulse train on STIM_{ch_i} ({len(parts)} params)")
             self.rx_q.put("OK")
+        elif op == 'selfocal':
+            self.rx_q.put("[CAL] Offset calibration running on all 6 ADCs  (simulated)...")
+            self.rx_q.put("[CAL] OFCAL0-2 registers updated — offset nulled to <1 LSB")
+            self.rx_q.put("OK")
+        elif op == 'selfgcal':
+            self.rx_q.put("[CAL] Full-scale gain calibration running on all 6 ADCs  (simulated)...")
+            self.rx_q.put("[CAL] FSCAL0-2 registers updated — gain error <±1 ppm")
+            self.rx_q.put("OK")
         elif op == 'help':
             for line in ["ping","status","read_regs","scan_all","benchmark",
                          "blink_led [count]",
@@ -1038,6 +1047,12 @@ class MushIOGUI:
         self._pga_gain       = tk.IntVar(value=1)
         # ADS124S08 digital filter (DATARATE reg bits 4:2)
         self._adc_filter_var = tk.StringVar(value='SINC3')
+        # ADS124S08 data rate (DATARATE reg bits 2:0)
+        self._adc_dr_var     = tk.StringVar(value='4000')
+        # ADS124S08 reference buffer (REF reg bits 5:4)
+        self._adc_refbuf_var = tk.BooleanVar(value=False)
+        # ADS124S08 system monitor (SYS reg bits 7:5)
+        self._adc_sysmon_var = tk.StringVar(value='Off')
 
         # ---- bandpass state ------------------------------------------------
         self._bp_enabled   = tk.BooleanVar(value=False)
@@ -1573,6 +1588,78 @@ class MushIOGUI:
                  bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
                  justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
 
+        # ---- Data rate --------------------------------------------------
+        # ADS124S08 DATARATE register bits 2:0.  Lower SPS = better SNR.
+        r2 = tk.Frame(frame, bg=BG_DARK)
+        r2.pack(fill=tk.X, pady=2)
+        tk.Label(r2, text="Data rate:", bg=BG_DARK, fg=FG_DIM, width=9,
+                 anchor=tk.W).pack(side=tk.LEFT)
+        _dr_opts = ['2.5', '5', '10', '16.6', '20', '50',
+                    '100', '200', '400', '800', '1000', '2000', '4000']
+        ttk.Combobox(r2, textvariable=self._adc_dr_var, width=7,
+                     values=_dr_opts,
+                     state='readonly').pack(side=tk.LEFT, padx=2)
+        tk.Label(r2, text="SPS  (reg 0x04[2:0])", bg=BG_DARK, fg=FG_DIMMER,
+                 font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(4, 0))
+
+        tk.Label(frame,
+                 text="Lower SPS = lower noise floor  |  2.5 SPS ideal for slow LFP",
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
+                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+
+        # ---- Reference buffer -------------------------------------------
+        # ADS124S08 REF register bits 5:4.  Buffers VREF to reduce noise on REFP/REFN.
+        r3 = tk.Frame(frame, bg=BG_DARK)
+        r3.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(r3, text="Enable reference buffer",
+                        variable=self._adc_refbuf_var).pack(side=tk.LEFT)
+        tk.Label(r3, text="  (REF reg 0x05[5:4])", bg=BG_DARK, fg=FG_DIMMER,
+                 font=('Helvetica', 7)).pack(side=tk.LEFT)
+
+        tk.Label(frame,
+                 text="Buffers REFP0/REFN0 to reduce VREF noise at cost of settling time",
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
+                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+
+        # ---- System monitor (internal temp / supply) --------------------
+        # ADS124S08 SYS register bits 7:5.  Routes internal signals to ADC mux.
+        r4 = tk.Frame(frame, bg=BG_DARK)
+        r4.pack(fill=tk.X, pady=2)
+        tk.Label(r4, text="Sys mon:", bg=BG_DARK, fg=FG_DIM, width=9,
+                 anchor=tk.W).pack(side=tk.LEFT)
+        _sm_opts = ['Off', 'Internal temp', 'AVDD/4', 'DVDD/4']
+        ttk.Combobox(r4, textvariable=self._adc_sysmon_var, width=13,
+                     values=_sm_opts,
+                     state='readonly').pack(side=tk.LEFT, padx=2)
+        tk.Label(r4, text="(SYS reg 0x09[7:5])", bg=BG_DARK, fg=FG_DIMMER,
+                 font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(4, 0))
+
+        tk.Label(frame,
+                 text="Routes ADC die temp or supply rails to ch 72 for board health mon.",
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
+                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+
+        # ---- Calibration ------------------------------------------------
+        # SELFOCAL = offset calibration; SELFGCAL = full-scale gain calibration.
+        # Applied per-ADC; results stored in OFCAL0-2 and FSCAL0-2 registers.
+        r5 = tk.Frame(frame, bg=BG_DARK)
+        r5.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(r5, text="Calibrate:", bg=BG_DARK, fg=FG_DIM, width=9,
+                 anchor=tk.W).pack(side=tk.LEFT)
+        tk.Button(r5, text="Offset (SELFOCAL)", bg=BG_LIGHT, fg=FG_MAIN,
+                  relief=tk.FLAT, padx=6, pady=2,
+                  command=lambda: self._do_adc_cal('selfocal')
+                  ).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(r5, text="Gain (SELFGCAL)", bg=BG_LIGHT, fg=FG_MAIN,
+                  relief=tk.FLAT, padx=6, pady=2,
+                  command=lambda: self._do_adc_cal('selfgcal')
+                  ).pack(side=tk.LEFT)
+
+        tk.Label(frame,
+                 text="Short AINP=AINN then run Offset cal.  Apply to live electrodes for Gain cal.",
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
+                 justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 4))
+
         # ---- Separator --------------------------------------------------
         ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=4)
 
@@ -1877,7 +1964,21 @@ class MushIOGUI:
 
                 else:  # inner electrode
                     flat = ELEC_GRID.get((pc, pr))
-                    ax.set_facecolor(BG_MID)
+                    # ---- Spatial colour-wheel background -------------------------
+                    # Hue  = compass direction from array centre (0..7 × 0..7).
+                    # Shade = distance from centre: outer cells are more saturated
+                    #         and slightly brighter; centre cells are near-neutral.
+                    _cx, _cy = 3.5, 3.5          # array centre in physical coords
+                    _dx, _dy = pc - _cx, _cy - pr  # flip dy so N=top=warm colours
+                    _max_d   = math.sqrt(_cx**2 + _cy**2)   # ≈ 4.95
+                    _dist    = math.sqrt(_dx**2 + _dy**2) / _max_d  # 0..1
+                    _hue     = (math.atan2(_dy, _dx) / (2 * math.pi)) % 1.0
+                    _sat     = _dist * 0.55          # 0 at centre → 0.55 at corner
+                    _val     = 0.11 + _dist * 0.06   # 0.11–0.17  (stays very dark)
+                    _r, _g, _b = colorsys.hsv_to_rgb(_hue, _sat, _val)
+                    _bg_cell = '#{:02x}{:02x}{:02x}'.format(
+                        int(_r * 255), int(_g * 255), int(_b * 255))
+                    ax.set_facecolor(_bg_cell)
                     for sp in ax.spines.values():
                         sp.set_color(BG_LIGHT); sp.set_linewidth(0.4)
                     if flat is not None:
@@ -5601,6 +5702,14 @@ class MushIOGUI:
             self._cmd_client.send(cmd)
         else:
             self._term_append("[Not connected]\n", 'err')
+
+    def _do_adc_cal(self, cal_type):
+        """Send a self-calibration command to all 6 ADCs.
+
+        cal_type: 'selfocal' (offset) or 'selfgcal' (full-scale gain).
+        Results are stored by the firmware in OFCAL0-2 / FSCAL0-2 registers.
+        """
+        self._send_cmd(cal_type)
 
     def _term_append(self, text, tag=None):
         if self._term_out is None:

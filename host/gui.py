@@ -791,6 +791,54 @@ class CommandClient(threading.Thread):
 
 
 # =============================================================================
+# Lightweight hover tooltip
+# =============================================================================
+
+class ToolTip:
+    """Show a tooltip label when the mouse hovers over a widget."""
+
+    def __init__(self, widget, text, delay=500):
+        self._widget = widget
+        self._text   = text
+        self._delay  = delay
+        self._after  = None
+        self._win    = None
+        widget.bind('<Enter>',       self._schedule,  add='+')
+        widget.bind('<Leave>',       self._cancel,    add='+')
+        widget.bind('<ButtonPress>', self._cancel,    add='+')
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after = self._widget.after(self._delay, self._show)
+
+    def _cancel(self, _event=None):
+        if self._after:
+            self._widget.after_cancel(self._after)
+            self._after = None
+        if self._win:
+            self._win.destroy()
+            self._win = None
+
+    def _show(self):
+        x = self._widget.winfo_rootx() + 20
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._win = tk.Toplevel(self._widget)
+        self._win.wm_overrideredirect(True)
+        self._win.wm_geometry(f'+{x}+{y}')
+        self._win.wm_attributes('-topmost', True)
+        tk.Label(self._win, text=self._text, justify=tk.LEFT,
+                 background='#2a2a3e', foreground='#cdd6f4',
+                 font=('Helvetica', 8), relief=tk.FLAT,
+                 padx=7, pady=5, wraplength=300).pack()
+
+
+def _tt(widget, text):
+    """Convenience wrapper — attach a ToolTip and return the widget."""
+    ToolTip(widget, text)
+    return widget
+
+
+# =============================================================================
 # Demo Command Client
 # =============================================================================
 
@@ -1431,18 +1479,39 @@ class MushIOGUI:
         self._cmd_status_lbl = tk.Label(cc, text="Not connected", bg=BG_MID, fg=FG_DIM)
         self._cmd_status_lbl.pack(side=tk.LEFT)
 
-    # ---- left panel (no scroll -- fits in normal window height) ----------
+    # ---- left panel (scrollable) -----------------------------------------
 
     def _build_left_panel(self, parent):
-        outer = tk.Frame(parent, bg=BG_DARK, width=256)
-        outer.pack_propagate(False)
+        """Return a vertically-scrollable sidebar containing all left-panel sections."""
+        container = tk.Frame(parent, bg=BG_DARK, width=260)
+        container.pack_propagate(False)
 
-        self._build_display_section(outer)
-        self._build_signal_chain_section(outer)
-        self._build_electrode_grid_section(outer)
-        self._build_cam_preview_left(outer)
+        canvas = tk.Canvas(container, bg=BG_DARK, highlightthickness=0,
+                           width=258, bd=0)
+        sb = ttk.Scrollbar(container, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        return outer
+        inner = tk.Frame(canvas, bg=BG_DARK)
+        _win  = canvas.create_window((0, 0), window=inner, anchor='nw')
+
+        inner.bind('<Configure>',
+                   lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>',
+                    lambda e: canvas.itemconfig(_win, width=e.width))
+
+        # Mousewheel scroll (Windows)
+        def _mwheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+        canvas.bind_all('<MouseWheel>', _mwheel)
+
+        self._build_display_section(inner)
+        self._build_signal_chain_section(inner)
+        self._build_electrode_grid_section(inner)
+        self._build_cam_preview_left(inner)
+
+        return container
 
     def _build_cam_preview_left(self, parent):
         """Compact camera preview pane in the left sidebar."""
@@ -1520,13 +1589,12 @@ class MushIOGUI:
         # ---- FFT max Hz ------------------------------------------------
         tk.Label(frame, text="FFT max (Hz):", bg=BG_DARK,
                  fg=FG_DIM).grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
-        tk.Entry(frame, textvariable=self._fft_max_hz, width=6,
-                 bg=BG_LIGHT, fg=FG_MAIN, insertbackground=FG_MAIN,
-                 relief=tk.FLAT).grid(row=4, column=1, sticky=tk.W,
-                                      padx=4, pady=(4, 0))
-        tk.Label(frame, text="0 = auto (Nyquist)", bg=BG_DARK, fg=FG_DIMMER,
-                 font=('Helvetica', 7)).grid(row=5, column=0, columnspan=2,
-                                             sticky=tk.W)
+        _fft_entry = tk.Entry(frame, textvariable=self._fft_max_hz, width=6,
+                              bg=BG_LIGHT, fg=FG_MAIN, insertbackground=FG_MAIN,
+                              relief=tk.FLAT)
+        _fft_entry.grid(row=4, column=1, sticky=tk.W, padx=4, pady=(4, 0))
+        _tt(_fft_entry, "Upper frequency limit for the FFT view.\n"
+                        "0 = auto (half the current sample rate / Nyquist).")
 
     def _on_tw_combo_select(self, _event=None):
         val = self._tw_combo.get()
@@ -1556,14 +1624,22 @@ class MushIOGUI:
         frame = ttk.LabelFrame(parent, text="Signal Chain", padding=6)
         frame.pack(fill=tk.X, padx=4, pady=3)
 
+        _W = 9   # label column width (chars)
+
         # ---- PGA gain ---------------------------------------------------
         r0 = tk.Frame(frame, bg=BG_DARK)
         r0.pack(fill=tk.X, pady=(0, 2))
-        tk.Label(r0, text="PGA gain:", bg=BG_DARK, fg=FG_DIM, width=9,
-                 anchor=tk.W).pack(side=tk.LEFT)
-        ttk.Combobox(r0, textvariable=self._pga_gain, width=5,
-                     values=[1, 2, 4, 8, 16, 32],
-                     state='readonly').pack(side=tk.LEFT, padx=2)
+        _tt(tk.Label(r0, text="PGA gain:", bg=BG_DARK, fg=FG_DIM, width=_W,
+                     anchor=tk.W),
+            "Programmable Gain Amplifier on each ADS124S08.\n"
+            "Total gain = PGA × AFE (11). Higher gain increases\n"
+            "sensitivity but reduces input range."
+            ).pack(side=tk.LEFT)
+        _tt(ttk.Combobox(r0, textvariable=self._pga_gain, width=5,
+                         values=[1, 2, 4, 8, 16, 32], state='readonly'),
+            "PGA gain setting (reg 0x03[4:2]).\n"
+            "AFE already provides ×11, so PGA=1 gives total ×11."
+            ).pack(side=tk.LEFT, padx=2)
         self._gain_info = tk.Label(r0, bg=BG_DARK, fg=FG_DIMMER,
                                     font=('Helvetica', 7))
         self._gain_info.pack(side=tk.LEFT, padx=(4, 0))
@@ -1571,94 +1647,89 @@ class MushIOGUI:
         self._update_gain_label()
 
         # ---- ADC digital filter -----------------------------------------
-        # ADS124S08 DATARATE register bits 4:2.  Lower = better noise, slower settling.
         r1 = tk.Frame(frame, bg=BG_DARK)
         r1.pack(fill=tk.X, pady=2)
-        tk.Label(r1, text="ADC filter:", bg=BG_DARK, fg=FG_DIM, width=9,
-                 anchor=tk.W).pack(side=tk.LEFT)
-        _filt_opts = ['SINC1', 'SINC2', 'SINC3', 'SINC4', 'FIR']
-        ttk.Combobox(r1, textvariable=self._adc_filter_var, width=7,
-                     values=_filt_opts,
-                     state='readonly').pack(side=tk.LEFT, padx=2)
-        tk.Label(r1, text="(reg 0x04[4:2])", bg=BG_DARK, fg=FG_DIMMER,
-                 font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(4, 0))
-
-        tk.Label(frame,
-                 text="SINC1=fast/noisy  SINC3=default  FIR=50/60 Hz reject",
-                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
-                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+        _tt(tk.Label(r1, text="ADC filter:", bg=BG_DARK, fg=FG_DIM, width=_W,
+                     anchor=tk.W),
+            "Digital filter mode (reg 0x04[4:2]).\n"
+            "SINC1: fastest response, most noise.\n"
+            "SINC3: default — good balance.\n"
+            "FIR: best 50/60 Hz rejection, slowest settling."
+            ).pack(side=tk.LEFT)
+        _tt(ttk.Combobox(r1, textvariable=self._adc_filter_var, width=7,
+                         values=['SINC1', 'SINC2', 'SINC3', 'SINC4', 'FIR'],
+                         state='readonly'),
+            "SINC1=fast/noisy   SINC3=default\n"
+            "FIR=50/60 Hz rejection (requires lower data rate)"
+            ).pack(side=tk.LEFT, padx=2)
 
         # ---- Data rate --------------------------------------------------
-        # ADS124S08 DATARATE register bits 2:0.  Lower SPS = better SNR.
         r2 = tk.Frame(frame, bg=BG_DARK)
         r2.pack(fill=tk.X, pady=2)
-        tk.Label(r2, text="Data rate:", bg=BG_DARK, fg=FG_DIM, width=9,
-                 anchor=tk.W).pack(side=tk.LEFT)
-        _dr_opts = ['2.5', '5', '10', '16.6', '20', '50',
-                    '100', '200', '400', '800', '1000', '2000', '4000']
-        ttk.Combobox(r2, textvariable=self._adc_dr_var, width=7,
-                     values=_dr_opts,
-                     state='readonly').pack(side=tk.LEFT, padx=2)
-        tk.Label(r2, text="SPS  (reg 0x04[2:0])", bg=BG_DARK, fg=FG_DIMMER,
-                 font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(4, 0))
-
-        tk.Label(frame,
-                 text="Lower SPS = lower noise floor  |  2.5 SPS ideal for slow LFP",
-                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
-                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+        _tt(tk.Label(r2, text="Data rate:", bg=BG_DARK, fg=FG_DIM, width=_W,
+                     anchor=tk.W),
+            "Sample rate per channel (reg 0x04[2:0]).\n"
+            "Lower SPS = better SNR (less noise floor).\n"
+            "2.5 SPS ideal for slow LFP / DC-coupled signals.\n"
+            "4000 SPS for real-time display at 200+ FPS."
+            ).pack(side=tk.LEFT)
+        _tt(ttk.Combobox(r2, textvariable=self._adc_dr_var, width=7,
+                         values=['2.5', '5', '10', '16.6', '20', '50',
+                                 '100', '200', '400', '800', '1000', '2000', '4000'],
+                         state='readonly'),
+            "SPS per channel — lower = quieter signal"
+            ).pack(side=tk.LEFT, padx=2)
+        tk.Label(r2, text="SPS", bg=BG_DARK, fg=FG_DIMMER,
+                 font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(3, 0))
 
         # ---- Reference buffer -------------------------------------------
-        # ADS124S08 REF register bits 5:4.  Buffers VREF to reduce noise on REFP/REFN.
         r3 = tk.Frame(frame, bg=BG_DARK)
         r3.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(r3, text="Enable reference buffer",
-                        variable=self._adc_refbuf_var).pack(side=tk.LEFT)
-        tk.Label(r3, text="  (REF reg 0x05[5:4])", bg=BG_DARK, fg=FG_DIMMER,
-                 font=('Helvetica', 7)).pack(side=tk.LEFT)
-
-        tk.Label(frame,
-                 text="Buffers REFP0/REFN0 to reduce VREF noise at cost of settling time",
-                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
-                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+        _tt(ttk.Checkbutton(r3, text="Reference buffer",
+                            variable=self._adc_refbuf_var),
+            "Enable REFP0/REFN0 input buffers (reg 0x05[5:4]).\n"
+            "Reduces noise on the VREF line at the cost of\n"
+            "slightly longer settling time after MUX switch."
+            ).pack(side=tk.LEFT)
 
         # ---- System monitor (internal temp / supply) --------------------
-        # ADS124S08 SYS register bits 7:5.  Routes internal signals to ADC mux.
         r4 = tk.Frame(frame, bg=BG_DARK)
         r4.pack(fill=tk.X, pady=2)
-        tk.Label(r4, text="Sys mon:", bg=BG_DARK, fg=FG_DIM, width=9,
-                 anchor=tk.W).pack(side=tk.LEFT)
-        _sm_opts = ['Off', 'Internal temp', 'AVDD/4', 'DVDD/4']
-        ttk.Combobox(r4, textvariable=self._adc_sysmon_var, width=13,
-                     values=_sm_opts,
-                     state='readonly').pack(side=tk.LEFT, padx=2)
-        tk.Label(r4, text="(SYS reg 0x09[7:5])", bg=BG_DARK, fg=FG_DIMMER,
-                 font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(4, 0))
-
-        tk.Label(frame,
-                 text="Routes ADC die temp or supply rails to ch 72 for board health mon.",
-                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
-                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+        _tt(tk.Label(r4, text="Sys mon:", bg=BG_DARK, fg=FG_DIM, width=_W,
+                     anchor=tk.W),
+            "System monitor (reg 0x09[7:5]).\n"
+            "Routes internal ADC signals to a virtual channel\n"
+            "for board health monitoring:\n"
+            "  Internal temp — die temperature (°C)\n"
+            "  AVDD/4 — analog supply ÷4\n"
+            "  DVDD/4 — digital supply ÷4"
+            ).pack(side=tk.LEFT)
+        _tt(ttk.Combobox(r4, textvariable=self._adc_sysmon_var, width=12,
+                         values=['Off', 'Internal temp', 'AVDD/4', 'DVDD/4'],
+                         state='readonly'),
+            "Off = normal operation.\n"
+            "Select a monitor source to log board health."
+            ).pack(side=tk.LEFT, padx=2)
 
         # ---- Calibration ------------------------------------------------
-        # SELFOCAL = offset calibration; SELFGCAL = full-scale gain calibration.
-        # Applied per-ADC; results stored in OFCAL0-2 and FSCAL0-2 registers.
         r5 = tk.Frame(frame, bg=BG_DARK)
-        r5.pack(fill=tk.X, pady=(2, 0))
-        tk.Label(r5, text="Calibrate:", bg=BG_DARK, fg=FG_DIM, width=9,
+        r5.pack(fill=tk.X, pady=(3, 1))
+        tk.Label(r5, text="Calibrate:", bg=BG_DARK, fg=FG_DIM, width=_W,
                  anchor=tk.W).pack(side=tk.LEFT)
-        tk.Button(r5, text="Offset (SELFOCAL)", bg=BG_LIGHT, fg=FG_MAIN,
-                  relief=tk.FLAT, padx=6, pady=2,
-                  command=lambda: self._do_adc_cal('selfocal')
-                  ).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(r5, text="Gain (SELFGCAL)", bg=BG_LIGHT, fg=FG_MAIN,
-                  relief=tk.FLAT, padx=6, pady=2,
-                  command=lambda: self._do_adc_cal('selfgcal')
-                  ).pack(side=tk.LEFT)
-
-        tk.Label(frame,
-                 text="Short AINP=AINN then run Offset cal.  Apply to live electrodes for Gain cal.",
-                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
-                 justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 4))
+        _tt(tk.Button(r5, text="Offset", bg=BG_LIGHT, fg=FG_MAIN,
+                      relief=tk.FLAT, padx=6, pady=2,
+                      command=lambda: self._do_adc_cal('selfocal')),
+            "SELFOCAL: self offset calibration.\n"
+            "Short AINP=AINN on all channels first.\n"
+            "Updates OFCAL0-2 registers on all 6 ADCs."
+            ).pack(side=tk.LEFT, padx=(0, 3))
+        _tt(tk.Button(r5, text="Gain", bg=BG_LIGHT, fg=FG_MAIN,
+                      relief=tk.FLAT, padx=6, pady=2,
+                      command=lambda: self._do_adc_cal('selfgcal')),
+            "SELFGCAL: self full-scale gain calibration.\n"
+            "Apply with live electrodes connected.\n"
+            "Updates FSCAL0-2 registers on all 6 ADCs."
+            ).pack(side=tk.LEFT)
 
         # ---- Separator --------------------------------------------------
         ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=4)
@@ -1670,30 +1741,36 @@ class MushIOGUI:
                      justify=tk.LEFT).pack(anchor=tk.W)
             return
 
-        ttk.Checkbutton(frame, text="Enable bandpass",
-                         variable=self._bp_enabled).pack(anchor=tk.W)
+        _tt(ttk.Checkbutton(frame, text="Enable bandpass",
+                            variable=self._bp_enabled),
+            "Apply a Butterworth bandpass filter before display.\n"
+            "Does not affect the raw data written to disk."
+            ).pack(anchor=tk.W)
 
-        for label, var, unit in [("Low  :", self._bp_low,  "Hz"),
-                                  ("High :", self._bp_high, "Hz")]:
+        for _lbl, _var, _unit, _tip in [
+            ("Low :", self._bp_low,  "Hz",
+             "High-pass cutoff. Set to ~0.1 Hz for LFP, ~300 Hz for spike detection."),
+            ("High:", self._bp_high, "Hz",
+             "Low-pass cutoff. Keep below Nyquist (half data rate).\n"
+             "e.g. 10 Hz for slow LFP, 3000 Hz for spikes."),
+        ]:
             r = tk.Frame(frame, bg=BG_DARK)
             r.pack(fill=tk.X, pady=1)
-            tk.Label(r, text=label, bg=BG_DARK, fg=FG_DIM, width=5).pack(side=tk.LEFT)
-            tk.Entry(r, textvariable=var, width=7,
-                     bg=BG_LIGHT, fg=FG_MAIN, insertbackground=FG_MAIN,
-                     relief=tk.FLAT).pack(side=tk.LEFT, padx=2)
-            tk.Label(r, text=unit, bg=BG_DARK, fg=FG_DIM).pack(side=tk.LEFT)
+            tk.Label(r, text=_lbl, bg=BG_DARK, fg=FG_DIM, width=5).pack(side=tk.LEFT)
+            _tt(tk.Entry(r, textvariable=_var, width=7,
+                         bg=BG_LIGHT, fg=FG_MAIN, insertbackground=FG_MAIN,
+                         relief=tk.FLAT), _tip).pack(side=tk.LEFT, padx=2)
+            tk.Label(r, text=_unit, bg=BG_DARK, fg=FG_DIM).pack(side=tk.LEFT)
 
-        r3 = tk.Frame(frame, bg=BG_DARK)
-        r3.pack(fill=tk.X, pady=1)
-        tk.Label(r3, text="Order:", bg=BG_DARK, fg=FG_DIM, width=5).pack(side=tk.LEFT)
-        ttk.Combobox(r3, textvariable=self._bp_order_var, width=4,
-                     values=[2, 4, 6, 8], state='readonly').pack(side=tk.LEFT, padx=2)
-
-        tk.Label(frame,
-                 text="Tip: set High < Nyquist to limit display BW\n"
-                      "e.g. Low=0.1 Hz  High=10 Hz  →  LFP view",
-                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
-                 justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
+        r_ord = tk.Frame(frame, bg=BG_DARK)
+        r_ord.pack(fill=tk.X, pady=1)
+        tk.Label(r_ord, text="Order:", bg=BG_DARK, fg=FG_DIM, width=5).pack(side=tk.LEFT)
+        _tt(ttk.Combobox(r_ord, textvariable=self._bp_order_var, width=4,
+                         values=[2, 4, 6, 8], state='readonly'),
+            "Butterworth filter order.\n"
+            "Higher order = steeper roll-off, more phase distortion.\n"
+            "4 is a good default."
+            ).pack(side=tk.LEFT, padx=2)
 
     def _build_stim_section(self, parent):
         frame = ttk.LabelFrame(parent, text="STIM Channels", padding=6)

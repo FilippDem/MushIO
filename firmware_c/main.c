@@ -44,6 +44,7 @@ extern void core1_main(void);
 #include "config.h"
 #include "ring.h"
 #include "crc16.h"
+#include "ota_server.h"
 
 /* =========================================================================
  * Shared ring buffer  (defined here; extern in core1.c)
@@ -516,6 +517,7 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         cmd_send(pcb, "Commands: ping | status | scan_all | benchmark | "
                       "read_regs | set_fps <hz> | blink_led | "
                       "test_hardware | ota_reboot | crash_log | help");
+        cmd_send(pcb, "True wireless OTA: connect ota_client.py to port %u", OTA_PORT);
 
     } else if (cmd[0] == '\0') {
         /* empty line — ignore */
@@ -675,6 +677,15 @@ int main(void)
     crc16_init_table();
 
     /* --------------------------------------------------------------------- */
+    /* Phase 1b: Check for a pending OTA image in the staging area.           */
+    /*           Must run BEFORE Core 1 is launched (no multicore lockout     */
+    /*           needed — Core 1 isn't alive yet).                            */
+    /*           Never returns if a valid OTA is found; reboots into new fw.  */
+    /* --------------------------------------------------------------------- */
+
+    ota_check_and_apply();
+
+    /* --------------------------------------------------------------------- */
     /* Phase 2: Initialise ring buffer, then launch Core 1                    */
     /* --------------------------------------------------------------------- */
 
@@ -748,6 +759,12 @@ int main(void)
     cmd_server_init();
 
     /* --------------------------------------------------------------------- */
+    /* Phase 6b: OTA server (true wireless firmware update, port 9002)       */
+    /* --------------------------------------------------------------------- */
+
+    ota_server_init();
+
+    /* --------------------------------------------------------------------- */
     /* Phase 7: Main loop                                                     */
     /* --------------------------------------------------------------------- */
 
@@ -766,6 +783,9 @@ int main(void)
     while (true) {
         /* ---- Watchdog feed ----------------------------------------------- */
         watchdog_update();
+
+        /* ---- True wireless OTA (port 9002) ------------------------------- */
+        ota_server_poll();
 
         /* ---- OTA reboot (set by ota_reboot CMD, executed here safely) ---- */
         if (g_ota_reboot_requested) {

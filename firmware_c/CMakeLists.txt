@@ -43,6 +43,7 @@ add_executable(mushio_c
     crc16.c
     frame.c
     demo_adc.c
+    ota_server.c
 )
 
 # Include our own headers (config.h, lwipopts.h, ring.h, ...)
@@ -70,10 +71,11 @@ endif()
 
 target_link_libraries(mushio_c
     pico_stdlib                               # stdio, sleep, time
-    pico_multicore                            # multicore_launch_core1
+    pico_multicore                            # multicore_launch_core1, lockout
     pico_float                               # sinf() via hardware FPU
     hardware_timer                           # get_absolute_time, busy_wait_us
     hardware_watchdog                        # watchdog_enable, watchdog_update, scratch regs
+    hardware_flash                           # flash_range_erase, flash_range_program (OTA)
     pico_cyw43_arch_lwip_threadsafe_background  # WiFi + lwIP (alarm-IRQ model)
 )
 

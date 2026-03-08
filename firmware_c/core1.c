@@ -38,6 +38,11 @@ void core1_main(void)
 {
     printf("[C1] Core 1 started — ADC scan loop\n");
 
+    /* Register this core as a multicore_lockout victim so that Core 0 can
+     * safely call multicore_lockout_start_blocking() before flash erase /
+     * program operations.  Must be called before the scan loop begins. */
+    multicore_lockout_victim_init();
+
     /* Initialise demo ADC (builds sine table using FPU sinf). */
     demo_adc_init();
 

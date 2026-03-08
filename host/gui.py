@@ -1129,6 +1129,7 @@ class MushIOGUI:
         self._grid_canvas    = None
         self._grid_lines     = {}
         self._grid_axes      = {}
+        self._ch_colors      = {}   # flat -> spatial colour-wheel hex string
         self._grid_texts     = {}
         self._stim_grid_lines = {}
         self._stim_grid_axes  = {}
@@ -1315,7 +1316,7 @@ class MushIOGUI:
         self._cam_idx_var      = tk.IntVar(value=0)
         self._cam_interval_var = tk.IntVar(value=10)
         self._cam_status_var   = tk.StringVar(value="Disabled")
-        self._cam_preview_label = None          # tk.Label widget, built in left panel
+        self._cam_preview_labels = []           # all preview label widgets (sidebar + Settings tab)
         self._cam_preview_photo = None          # keep PIL ref to avoid GC
         self._cam_preview_interval_var = tk.IntVar(value=10)   # auto-refresh minutes
 
@@ -1525,11 +1526,12 @@ class MushIOGUI:
             return
 
         # Preview image label
-        self._cam_preview_label = tk.Label(
+        _lbl_sidebar = tk.Label(
             frame, bg='#0d0d14',
             text="No preview", fg=FG_DIMMER,
             font=('Helvetica', 7), width=30, height=7)
-        self._cam_preview_label.pack(fill=tk.X, pady=(0, 4))
+        _lbl_sidebar.pack(fill=tk.X, pady=(0, 4))
+        self._cam_preview_labels.append(_lbl_sidebar)
 
         # Controls row
         ctrl = tk.Frame(frame, bg=BG_DARK)
@@ -2005,6 +2007,7 @@ class MushIOGUI:
         self._grid_axes       = {}
         self._grid_texts      = {}
         self._clip_texts      = {}   # flat -> Text artist, flashes CLIP! when raw signal saturates
+        self._ch_colors       = {}   # flat -> spatial colour-wheel hex string
         self._stim_grid_lines = {}
         self._stim_grid_axes  = {}
         # Reverse maps for click-to-toggle: axes object -> flat index
@@ -2041,33 +2044,34 @@ class MushIOGUI:
 
                 else:  # inner electrode
                     flat = ELEC_GRID.get((pc, pr))
-                    # ---- Spatial colour-wheel background -------------------------
-                    # Hue  = compass direction from array centre (0..7 × 0..7).
-                    # Shade = distance from centre: outer cells are more saturated
-                    #         and slightly brighter; centre cells are near-neutral.
-                    _cx, _cy = 3.5, 3.5          # array centre in physical coords
-                    _dx, _dy = pc - _cx, _cy - pr  # flip dy so N=top=warm colours
+                    # ---- Spatial colour-wheel line colour --------------------
+                    # Hue  = compass direction from array centre.
+                    # Saturation / brightness increase with distance so centre
+                    # electrodes are near-grey and corners are fully vivid.
+                    _cx, _cy = 3.5, 3.5
+                    _dx, _dy = pc - _cx, _cy - pr   # flip dy: N=top
                     _max_d   = math.sqrt(_cx**2 + _cy**2)   # ≈ 4.95
                     _dist    = math.sqrt(_dx**2 + _dy**2) / _max_d  # 0..1
                     _hue     = (math.atan2(_dy, _dx) / (2 * math.pi)) % 1.0
-                    _sat     = _dist * 0.55          # 0 at centre → 0.55 at corner
-                    _val     = 0.11 + _dist * 0.06   # 0.11–0.17  (stays very dark)
+                    _sat     = 0.15 + _dist * 0.85   # 0.15 (centre) → 1.0 (corner)
+                    _val     = 0.45 + _dist * 0.40   # 0.45 (centre) → 0.85 (corner)
                     _r, _g, _b = colorsys.hsv_to_rgb(_hue, _sat, _val)
-                    _bg_cell = '#{:02x}{:02x}{:02x}'.format(
+                    _line_col = '#{:02x}{:02x}{:02x}'.format(
                         int(_r * 255), int(_g * 255), int(_b * 255))
-                    ax.set_facecolor(_bg_cell)
+                    ax.set_facecolor(BG_MID)
                     for sp in ax.spines.values():
                         sp.set_color(BG_LIGHT); sp.set_linewidth(0.4)
                     if flat is not None:
                         nm = ALL_NAMES[flat]
-                        line, = ax.plot([], [], color=FG_DIMMER,
-                                        linewidth=0.5, rasterized=True)
+                        self._ch_colors[flat] = _line_col
+                        line, = ax.plot([], [], color=_line_col,
+                                        linewidth=0.6, rasterized=True)
                         self._grid_lines[flat] = line
                         self._grid_axes[flat]  = ax
                         self._grid_ax_to_elec[ax] = flat
                         self._grid_texts[flat] = ax.text(
                             0.04, 0.92, nm[4:], transform=ax.transAxes,
-                            fontsize=4, color=FG_DIMMER, va='top', ha='left')
+                            fontsize=4, color=_line_col, va='top', ha='left')
                         # Clipping warning — shown when bandpass on but raw clips
                         self._clip_texts[flat] = ax.text(
                             0.5, 0.5, 'CLIP!', transform=ax.transAxes,
@@ -2078,7 +2082,7 @@ class MushIOGUI:
                                       facecolor='#3a0000', edgecolor=RED,
                                       alpha=0.85))
                     else:
-                        ax.set_facecolor('#0d0d14')
+                        ax.set_facecolor(BG_MID)
 
         self._grid_canvas = FigureCanvasTkAgg(self._grid_fig, master=parent)
         self._grid_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -3112,11 +3116,12 @@ class MushIOGUI:
             ttk.Button(prev_lbl_row, text="Refresh Preview",
                        command=self._cam_refresh_preview).pack(side=tk.LEFT, padx=8)
 
-            self._cam_preview_label = tk.Label(cam_frame, bg='#0d0d14',
-                                                text="No preview yet  —  click Refresh Preview",
-                                                fg=FG_DIMMER, font=('Helvetica', 8),
-                                                width=48, height=10)
-            self._cam_preview_label.pack(anchor=tk.W, pady=4)
+            _lbl_settings = tk.Label(cam_frame, bg='#0d0d14',
+                                     text="No preview yet  —  click Refresh Preview",
+                                     fg=FG_DIMMER, font=('Helvetica', 8),
+                                     width=48, height=10)
+            _lbl_settings.pack(anchor=tk.W, pady=4)
+            self._cam_preview_labels.append(_lbl_settings)
 
         # =====================================================================
         # --- Save defaults ---
@@ -4861,8 +4866,7 @@ class MushIOGUI:
             color   = ORANGE
         else:
             ch_name = ALL_NAMES[flat]
-            col, row = next(((c, r) for (c, r), f in ELEC_GRID.items() if f == flat), (0, 0))
-            color   = COLORS[(col * 8 + row) % len(COLORS)]
+            color   = self._ch_colors.get(flat, FG_DIMMER)
 
         win = tk.Toplevel(self.root)
         win.title(f'Zoom  {ch_name}')
@@ -5725,19 +5729,23 @@ class MushIOGUI:
         self._cam_status_var.set("Image captured")
 
     def _cam_update_preview_label(self, img):
-        """Resize PIL image to fit the sidebar label and display it."""
-        if self._cam_preview_label is None:
+        """Resize PIL image and push it to all preview label widgets."""
+        if not self._cam_preview_labels:
             return
         try:
             from PIL import ImageTk
             target_w = 230
             w, h = img.size
-            img = img.resize((target_w, int(h * target_w / w)), Image.LANCZOS
-                              if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS)
-            self._cam_preview_photo = ImageTk.PhotoImage(img)
-            self._cam_preview_label.config(
-                image=self._cam_preview_photo, text='',
-                width=target_w, height=img.height)
+            img_small = img.resize((target_w, int(h * target_w / w)),
+                                   Image.LANCZOS if hasattr(Image, 'LANCZOS')
+                                   else Image.ANTIALIAS)
+            self._cam_preview_photo = ImageTk.PhotoImage(img_small)
+            for lbl in self._cam_preview_labels:
+                try:
+                    lbl.config(image=self._cam_preview_photo, text='',
+                               width=target_w, height=img_small.height)
+                except tk.TclError:
+                    pass   # label destroyed (tab not yet shown, etc.)
         except ImportError:
             self._cam_status_var.set("pip install Pillow for preview")
         except Exception as exc:
@@ -5745,7 +5753,7 @@ class MushIOGUI:
 
     def _schedule_cam_preview(self):
         """Auto-refresh the left-panel preview at the user-specified interval."""
-        if (not HAS_CV2 and not HAS_PIL) or self._cam_preview_label is None:
+        if (not HAS_CV2 and not HAS_PIL) or not self._cam_preview_labels:
             return
         img = self._cam_grab_frame()
         if img is not None:

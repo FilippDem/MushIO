@@ -1130,6 +1130,8 @@ class MushIOGUI:
         self._grid_lines     = {}
         self._grid_axes      = {}
         self._ch_colors      = {}   # flat -> spatial colour-wheel hex string
+        self._ch_colors_hc   = {}   # flat -> high-contrast palette hex string
+        self._grid_color_mode = tk.StringVar(value='spatial')
         self._grid_texts     = {}
         self._stim_grid_lines = {}
         self._stim_grid_axes  = {}
@@ -1992,6 +1994,20 @@ class MushIOGUI:
         ttk.Button(tb, text="Select None", command=self._select_none_elec).pack(side=tk.LEFT, padx=2)
         tk.Label(tb, text="  Selected = bright + added to Overlay",
                  bg=BG_MID, fg=FG_DIMMER, font=('Helvetica', 8)).pack(side=tk.LEFT, padx=8)
+
+        # ---- Colour mode toggle -----------------------------------------
+        ttk.Separator(tb, orient='vertical').pack(side=tk.LEFT, fill=tk.Y,
+                                                   padx=6, pady=3)
+        tk.Label(tb, text="Colours:", bg=BG_MID,
+                 fg=FG_DIMMER, font=('Helvetica', 8)).pack(side=tk.LEFT)
+        for _val, _lbl in [('spatial', 'Spatial'), ('highcontrast', 'High Contrast')]:
+            tk.Radiobutton(tb, text=_lbl, value=_val,
+                           variable=self._grid_color_mode,
+                           bg=BG_MID, fg=FG_DIM,
+                           selectcolor=BG_LIGHT, activebackground=BG_MID,
+                           font=('Helvetica', 8),
+                           command=self._apply_grid_color_mode
+                           ).pack(side=tk.LEFT, padx=3)
         self._grid_fft_note = tk.Label(tb, text="X=Hz  Y=Amplitude (uV / mV)",
                                         bg=BG_MID, fg=ACCENT, font=('Helvetica', 8))
 
@@ -2008,6 +2024,7 @@ class MushIOGUI:
         self._grid_texts      = {}
         self._clip_texts      = {}   # flat -> Text artist, flashes CLIP! when raw signal saturates
         self._ch_colors       = {}   # flat -> spatial colour-wheel hex string
+        self._ch_colors_hc    = {}   # flat -> high-contrast palette hex string
         self._stim_grid_lines = {}
         self._stim_grid_axes  = {}
         # Reverse maps for click-to-toggle: axes object -> flat index
@@ -2063,7 +2080,8 @@ class MushIOGUI:
                         sp.set_color(BG_LIGHT); sp.set_linewidth(0.4)
                     if flat is not None:
                         nm = ALL_NAMES[flat]
-                        self._ch_colors[flat] = _line_col
+                        self._ch_colors[flat]    = _line_col
+                        self._ch_colors_hc[flat] = COLORS[(pc * 8 + pr) % len(COLORS)]
                         line, = ax.plot([], [], color=_line_col,
                                         linewidth=0.6, rasterized=True)
                         self._grid_lines[flat] = line
@@ -2087,6 +2105,24 @@ class MushIOGUI:
         self._grid_canvas = FigureCanvasTkAgg(self._grid_fig, master=parent)
         self._grid_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._grid_canvas.mpl_connect('button_press_event', self._on_grid_click)
+
+        # Apply initial colour mode (picks up any persisted setting)
+        self._apply_grid_color_mode()
+
+    def _apply_grid_color_mode(self):
+        """Repaint every grid line and label with the currently selected colour scheme."""
+        mode = self._grid_color_mode.get()
+        for flat, line in self._grid_lines.items():
+            if mode == 'highcontrast':
+                col = self._ch_colors_hc.get(flat, FG_DIMMER)
+            else:
+                col = self._ch_colors.get(flat, FG_DIMMER)
+            line.set_color(col)
+            txt = self._grid_texts.get(flat)
+            if txt is not None:
+                txt.set_color(col)
+        if self._grid_canvas:
+            self._grid_canvas.draw_idle()
 
     # ---- Overlay tab -----------------------------------------------------
 
@@ -4866,7 +4902,10 @@ class MushIOGUI:
             color   = ORANGE
         else:
             ch_name = ALL_NAMES[flat]
-            color   = self._ch_colors.get(flat, FG_DIMMER)
+            if self._grid_color_mode.get() == 'highcontrast':
+                color = self._ch_colors_hc.get(flat, FG_DIMMER)
+            else:
+                color = self._ch_colors.get(flat, FG_DIMMER)
 
         win = tk.Toplevel(self.root)
         win.title(f'Zoom  {ch_name}')

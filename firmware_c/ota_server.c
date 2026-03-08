@@ -95,10 +95,11 @@ static void rx_reset(void) { g_rx_head = g_rx_tail = 0; }
 
 typedef enum {
     OTA_IDLE      = 0,
-    OTA_HDR       = 1,   /* waiting for "OTAV1 {size}\r\n" header  */
-    OTA_DATA      = 2,   /* receiving UF2 data bytes                */
-    OTA_DONE      = 3,   /* all data received, metadata written     */
-    OTA_ERROR     = 4,   /* protocol or flash error                 */
+    OTA_HDR       = 1,   /* waiting for "OTAV1 {size}\r\n" header           */
+    OTA_ERASE     = 2,   /* pre-erasing staging sectors (one per poll call) */
+    OTA_DATA      = 3,   /* receiving UF2 data bytes                        */
+    OTA_DONE      = 4,   /* all data received, metadata written             */
+    OTA_ERROR     = 5,   /* protocol or flash error                         */
 } ota_phase_t;
 
 static struct tcp_pcb *g_ota_listen_pcb = NULL;
@@ -109,10 +110,12 @@ static uint32_t    g_ota_expect        = 0;   /* expected UF2 bytes          */
 static uint32_t    g_ota_data_done     = 0;   /* UF2 bytes processed so far  */
 static uint32_t    g_ota_flash_hi      = 0;   /* highest active-area byte written */
 
-/* Sector-level staging state — we erase each staging sector once, on first
- * block that targets it, then program 256-byte pages into it individually. */
-static uint32_t g_ota_cur_sector      = UINT32_MAX; /* staging flash offset (sector-aligned) */
-static bool     g_ota_sector_erased   = false;
+/* Pre-erase state: all staging sectors are erased BEFORE READY is sent,
+ * one sector per ota_server_poll() call so WiFi is serviced between erases.
+ * During OTA_DATA only fast flash_range_program() calls are made (~0.5 ms),
+ * which never cause WiFi interrupts to be starved. */
+static uint32_t g_ota_total_sectors   = 0;   /* sectors to pre-erase          */
+static uint32_t g_ota_erase_idx       = 0;   /* next sector index to erase    */
 
 /* Static metadata buffer used at OTA completion — avoids 4 KB on stack. */
 static ota_meta_t g_ota_meta;
@@ -181,24 +184,7 @@ static bool process_uf2_block(void)
     /* Staging flash offset for this 256-byte page */
     uint32_t staging_page = OTA_STAGE_FLASH_OFFSET + active_offset;
 
-    /* Determine which 4 KB sector this page belongs to */
-    uint32_t sector = staging_page & ~((uint32_t)(FLASH_SECTOR_SIZE - 1u));
-
-    if (sector != g_ota_cur_sector) {
-        /* First block for this sector — erase it */
-        g_ota_cur_sector    = sector;
-        g_ota_sector_erased = false;
-    }
-
-    if (!g_ota_sector_erased) {
-        printf("[OTA] Erase staging sector 0x%06lX\n", (unsigned long)sector);
-        multicore_lockout_start_blocking();
-        flash_range_erase(sector, FLASH_SECTOR_SIZE);
-        multicore_lockout_end_blocking();
-        g_ota_sector_erased = true;
-    }
-
-    /* Program 256-byte page into staging */
+    /* Program 256-byte page into pre-erased staging area (~0.5 ms, WiFi safe) */
     multicore_lockout_start_blocking();
     flash_range_program(staging_page, blk.data, UF2_PAYLOAD);
     multicore_lockout_end_blocking();
@@ -298,12 +284,12 @@ void ota_check_and_apply(void)
 
 static void ota_reset_state(void)
 {
-    g_ota_phase        = OTA_IDLE;
-    g_ota_expect       = 0;
-    g_ota_data_done    = 0;
-    g_ota_flash_hi     = 0;
-    g_ota_cur_sector   = UINT32_MAX;
-    g_ota_sector_erased= false;
+    g_ota_phase         = OTA_IDLE;
+    g_ota_expect        = 0;
+    g_ota_data_done     = 0;
+    g_ota_flash_hi      = 0;
+    g_ota_total_sectors = 0;
+    g_ota_erase_idx     = 0;
     rx_reset();
 }
 
@@ -452,23 +438,67 @@ void ota_server_poll(void)
                       (sz % UF2_BLOCK_SIZE) == 0u &&
                       sz <= (OTA_STAGE_FLASH_OFFSET /* 2 MB */));
 
+        /* Acknowledge header bytes; send READY or ERR */
         cyw43_arch_lwip_begin();
         if (g_ota_conn_pcb) tcp_recved(g_ota_conn_pcb, (u16_t)hdr_len);
-        if (valid) {
-            g_ota_expect    = sz;
-            g_ota_data_done = 0;
-            printf("[OTA] Expecting %lu bytes of UF2 (%lu blocks)\n",
-                   (unsigned long)sz,
-                   (unsigned long)(sz / UF2_BLOCK_SIZE));
-            ota_send("READY");
-            g_ota_phase = OTA_DATA;
-        } else {
+        if (!valid) {
             printf("[OTA] Bad header / invalid size %lu\n", (unsigned long)sz);
             ota_send("ERR bad header");
             g_ota_phase = OTA_ERROR;
         }
         cyw43_arch_lwip_end();
 
+        if (valid) {
+            g_ota_expect       = sz;
+            g_ota_data_done    = 0;
+            /* Worst-case sector count: UF2 payload density = 256/512 bytes.
+             * +1 sector margin for non-contiguous block layouts. */
+            g_ota_total_sectors = ((sz / 2u) + FLASH_SECTOR_SIZE - 1u)
+                                  / FLASH_SECTOR_SIZE + 1u;
+            g_ota_erase_idx    = 0;
+            printf("[OTA] Expecting %lu bytes (%lu blocks). "
+                   "Pre-erasing %lu staging sectors before READY...\n",
+                   (unsigned long)sz,
+                   (unsigned long)(sz / UF2_BLOCK_SIZE),
+                   (unsigned long)g_ota_total_sectors);
+            g_ota_phase = OTA_ERASE;   /* erase before sending READY */
+        }
+
+        return;
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* Phase ERASE: pre-erase one staging sector per poll call               */
+    /*                                                                       */
+    /* flash_range_erase() disables interrupts for ~40 ms — long enough to  */
+    /* starve the CYW43 WiFi SPI IRQ if called during data streaming.        */
+    /* By pre-erasing here (before READY is sent) the PC is idle so brief   */
+    /* WiFi outages are harmless.  OTA_DATA then uses only the fast          */
+    /* flash_range_program() (~0.5 ms) which is WiFi-safe.                  */
+    /* --------------------------------------------------------------------- */
+
+    if (g_ota_phase == OTA_ERASE) {
+        if (g_ota_erase_idx < g_ota_total_sectors) {
+            uint32_t off = OTA_STAGE_FLASH_OFFSET +
+                           g_ota_erase_idx * FLASH_SECTOR_SIZE;
+            multicore_lockout_start_blocking();
+            flash_range_erase(off, FLASH_SECTOR_SIZE);
+            multicore_lockout_end_blocking();
+            g_ota_erase_idx++;
+            if ((g_ota_erase_idx % 8u) == 0u ||
+                g_ota_erase_idx == g_ota_total_sectors) {
+                printf("[OTA] Pre-erase %lu/%lu\n",
+                       (unsigned long)g_ota_erase_idx,
+                       (unsigned long)g_ota_total_sectors);
+            }
+        } else {
+            /* All sectors erased — tell the client we are ready */
+            printf("[OTA] Pre-erase complete. Sending READY.\n");
+            cyw43_arch_lwip_begin();
+            ota_send("READY");
+            cyw43_arch_lwip_end();
+            g_ota_phase = OTA_DATA;
+        }
         return;
     }
 

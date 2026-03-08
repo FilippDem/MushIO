@@ -2110,7 +2110,7 @@ class MushIOGUI:
         self._apply_grid_color_mode()
 
     def _apply_grid_color_mode(self):
-        """Repaint every grid line and label with the currently selected colour scheme."""
+        """Repaint every grid line, label, and spine with the currently selected colour scheme."""
         mode = self._grid_color_mode.get()
         for flat, line in self._grid_lines.items():
             if mode == 'highcontrast':
@@ -2121,6 +2121,21 @@ class MushIOGUI:
             txt = self._grid_texts.get(flat)
             if txt is not None:
                 txt.set_color(col)
+            # Also repaint subplot spine borders to match the colour scheme.
+            ax = self._grid_axes.get(flat)
+            if ax is not None:
+                is_sel = flat in self._selected_elec
+                if mode == 'highcontrast':
+                    # HC: spine only coloured when channel is selected
+                    sp_col = col if is_sel else BG_LIGHT
+                else:
+                    # Spatial: spine always shows the channel's hue;
+                    # selection indicated by linewidth only
+                    sp_col = col
+                lw = 1.0 if is_sel else 0.4
+                for sp in ax.spines.values():
+                    sp.set_color(sp_col)
+                    sp.set_linewidth(lw)
         if self._grid_canvas:
             self._grid_canvas.draw_idle()
 
@@ -4843,10 +4858,14 @@ class MushIOGUI:
 
     def _update_electrode_btn_colors(self):
         needs_draw = False
+        mode = self._grid_color_mode.get()
         for (c, r), btn in self._elec_btns.items():
             flat = ELEC_GRID.get((c, r))
             if flat in self._selected_elec:
-                col = COLORS[(c * 8 + r) % len(COLORS)]
+                if mode == 'highcontrast':
+                    col = COLORS[(c * 8 + r) % len(COLORS)]
+                else:
+                    col = self._ch_colors.get(flat, FG_DIMMER)
                 btn.config(bg=col, fg=BG_DARK, font=('Consolas', 7, 'bold'))
                 # Highlight the matching grid axes
                 ax = self._grid_axes.get(flat)
@@ -4858,8 +4877,12 @@ class MushIOGUI:
                 btn.config(bg=BG_LIGHT, fg=FG_DIM, font=('Consolas', 7))
                 ax = self._grid_axes.get(flat)
                 if ax is not None:
+                    if mode == 'spatial':
+                        sp_col = self._ch_colors.get(flat, BG_LIGHT)
+                    else:
+                        sp_col = BG_LIGHT
                     for sp in ax.spines.values():
-                        sp.set_color(BG_LIGHT); sp.set_linewidth(0.4)
+                        sp.set_color(sp_col); sp.set_linewidth(0.4)
                     needs_draw = True
         if needs_draw and hasattr(self, '_grid_canvas') and self._grid_canvas:
             self._grid_canvas.draw_idle()

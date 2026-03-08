@@ -1350,6 +1350,9 @@ class MushIOGUI:
 
     def _finalize_ui(self):
         """Draw all matplotlib canvases after the window is rendered."""
+        # Force Tkinter to process all pending geometry/style requests so
+        # ttk.LabelFrame interiors and comboboxes don't flash white on startup.
+        self.root.update_idletasks()
         if self._grid_canvas:
             self._grid_canvas.draw_idle()
         if self._overlay_canvas:
@@ -1362,6 +1365,8 @@ class MushIOGUI:
         if self._exp_desc_loaded and hasattr(self, '_exp_desc_txt'):
             self._exp_desc_txt.delete('1.0', tk.END)
             self._exp_desc_txt.insert('1.0', self._exp_desc_loaded)
+        # Second pass — force a full render after canvases have been drawn
+        self.root.update_idletasks()
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -2136,6 +2141,8 @@ class MushIOGUI:
                 for sp in ax.spines.values():
                     sp.set_color(sp_col)
                     sp.set_linewidth(lw)
+        # Sync the tkinter electrode-button colours in the Physical Layout panel
+        self._update_electrode_btn_colors()
         if self._grid_canvas:
             self._grid_canvas.draw_idle()
 
@@ -3596,11 +3603,27 @@ class MushIOGUI:
         try:
             # ---------------------------------------------------------- #
             # 1. Locate build tools                                        #
+            # Augment PATH with scoop-installed tools so cmake/ninja are  #
+            # found even when the GUI was not launched from a scoop shell. #
             # ---------------------------------------------------------- #
-            cmake    = shutil.which('cmake')
-            ninja    = shutil.which('ninja')
-            make_    = shutil.which('make')
-            picotool = shutil.which('picotool')
+            import os as _os
+            _u = _os.path.expandvars('%USERPROFILE%')
+            _scoop = _os.path.join(_u, 'scoop', 'apps')
+            _extra = [
+                _os.path.join(_scoop, 'cmake',             'current', 'bin'),
+                _os.path.join(_scoop, 'ninja',             'current'),
+                _os.path.join(_scoop, 'gcc-arm-none-eabi', 'current', 'bin'),
+                _os.path.join(_scoop, 'mingw',             'current', 'bin'),
+            ]
+            _env = dict(_os.environ)
+            _env['PATH'] = ';'.join(p for p in _extra if _os.path.isdir(p)) \
+                           + ';' + _env.get('PATH', '')
+            _env.setdefault('PICO_SDK_PATH', r'C:\pico\pico-sdk')
+
+            cmake    = shutil.which('cmake',    path=_env['PATH'])
+            ninja    = shutil.which('ninja',    path=_env['PATH'])
+            make_    = shutil.which('make',     path=_env['PATH'])
+            picotool = shutil.which('picotool', path=_env['PATH'])
 
             if not cmake:
                 _log("ERROR: cmake not found.  Install CMake and add it to PATH.")
@@ -3663,7 +3686,7 @@ class MushIOGUI:
             # cached builds (< 1 s); only changed source files are recompiled.
             _log(f"cmake configure: {' '.join(cmake_gen)}")
             os.makedirs(build_dir, exist_ok=True)
-            r = subprocess.run(cmake_gen, cwd=build_dir,
+            r = subprocess.run(cmake_gen, cwd=build_dir, env=_env,
                                capture_output=True, text=True, timeout=180)
             for ln in (r.stdout + r.stderr).splitlines():
                 _log(f"  {ln}")
@@ -3677,7 +3700,7 @@ class MushIOGUI:
             # 4. Build                                                     #
             # ---------------------------------------------------------- #
             _log(f"Building: {' '.join(builder_cmd)} ...")
-            r = subprocess.run(builder_cmd, cwd=build_dir,
+            r = subprocess.run(builder_cmd, cwd=build_dir, env=_env,
                                capture_output=True, text=True, timeout=300)
             for ln in (r.stdout + r.stderr).splitlines():
                 if ln.strip():
@@ -3801,14 +3824,16 @@ class MushIOGUI:
                 if picotool:
                     _log("Flash method: Auto — attempting picotool load --force ...")
                     r = subprocess.run([picotool, 'load', uf2, '--force'],
-                                       capture_output=True, text=True, timeout=60)
+                                       capture_output=True, text=True,
+                                       timeout=60, env=_env)
                     for ln in (r.stdout + r.stderr).splitlines():
                         if ln.strip():
                             _log(f"  {ln}")
                     if r.returncode == 0:
                         _log("picotool flash OK.  Rebooting ...")
                         subprocess.run([picotool, 'reboot'],
-                                       capture_output=True, text=True, timeout=10)
+                                       capture_output=True, text=True,
+                                       timeout=10, env=_env)
                         flashed = True
                     else:
                         _log("picotool failed — falling back to BOOTSEL drive copy ...")

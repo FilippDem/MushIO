@@ -5195,8 +5195,16 @@ class MushIOGUI:
                                          self._bp_order_var.get())
 
                 is_sel = flat in self._selected_elec
-                color  = COLORS[(col*8+row) % len(COLORS)] if is_sel else FG_DIMMER
-                lw     = 0.9 if is_sel else 0.4
+                _cmode = self._grid_color_mode.get()
+                if _cmode == 'highcontrast':
+                    # High-contrast: selected channels get vivid COLORS palette,
+                    # unselected channels dim to FG_DIMMER (original behaviour)
+                    color = COLORS[(col*8+row) % len(COLORS)] if is_sel else FG_DIMMER
+                else:
+                    # Spatial: channel colour is always the spatial hue — selection
+                    # is indicated only by linewidth, so the colour wheel stays visible
+                    color = self._ch_colors.get(flat, FG_DIMMER)
+                lw = 0.9 if is_sel else 0.4
 
                 if fft_mode:
                     freq, mag = compute_fft(arr, fps_stable)
@@ -5226,7 +5234,11 @@ class MushIOGUI:
                         ax.set_ylim(-uv_half, uv_half)
 
                 line.set_color(color); line.set_linewidth(lw)
-                if txt: txt.set_color(color)
+                if txt:
+                    # Label always tracks the waveform colour; in spatial mode
+                    # this is the spatial hue, in high-contrast mode it follows
+                    # selection state (dim when unselected, vivid when selected)
+                    txt.set_color(color)
 
         # -- STIM outer ring -- show programmed output only when channel is active --
         for name, flat in STIM_BY_NAME:

@@ -33,6 +33,7 @@
 #include "hardware/watchdog.h"
 
 #include "lwip/tcp.h"
+#include "lwip/udp.h"
 #include "lwip/netif.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/err.h"
@@ -57,6 +58,25 @@ ring_t g_ring;
  * ========================================================================= */
 
 static volatile uint32_t g_sent_frames  = 0;
+
+/* Non-blocking benchmark: set by CMD callback, sampled in main loop */
+static volatile bool        g_benchmark_req = false;
+static volatile uint32_t    g_benchmark_f0  = 0;
+static volatile uint32_t    g_benchmark_t0  = 0;
+static struct tcp_pcb      *g_benchmark_pcb = NULL;
+
+/* =========================================================================
+ * Mutable host IP  (default from config.h; updatable via 'set_host' CMD)
+ * ========================================================================= */
+
+static char g_host_ip[48] = HOST_IP;
+
+/* =========================================================================
+ * UDP discovery beacon  (port 9003)
+ * ========================================================================= */
+
+static struct udp_pcb *g_beacon_pcb  = NULL;
+static uint32_t        g_beacon_last = 0;
 
 /* Scan period for Core 1.  Set to DEMO_SCAN_PERIOD_US on boot.
  * Updated at runtime by the 'set_fps <hz>' CMD command.
@@ -154,8 +174,10 @@ static err_t data_tcp_recv_cb(void *arg, struct tcp_pcb *tpcb,
 {
     (void)arg; (void)tpcb; (void)err;
     if (p == NULL) {
-        /* Remote host closed the connection. */
-        printf("[DATA] Host closed connection.\n");
+        /* Remote host closed the connection — close our end to free the PCB.
+         * Without tcp_close() here the PCB stays in CLOSE_WAIT forever and
+         * exhausts MEMP_NUM_TCP_PCB, blocking the OTA server from accepting. */
+        tcp_close(tpcb);
         g_data_connected = false;
         g_data_pcb       = NULL;
         return ERR_OK;
@@ -173,7 +195,7 @@ static err_t data_tcp_connected_cb(void *arg, struct tcp_pcb *tpcb, err_t err)
         printf("[DATA] Connect failed: %d\n", (int)err);
         g_data_connected = false;
     } else {
-        printf("[DATA] Connected to %s:%d\n", HOST_IP, HOST_PORT);
+        printf("[DATA] Connected to %s:%d\n", g_host_ip, HOST_PORT);
         g_data_connected = true;
     }
     g_data_pending = false;
@@ -193,7 +215,7 @@ static bool data_tcp_connect(void)
         return false;
     }
 
-    printf("[DATA] Connecting to %s:%d ...\n", HOST_IP, HOST_PORT);
+    printf("[DATA] Connecting to %s:%d ...\n", g_host_ip, HOST_PORT);
 
     cyw43_arch_lwip_begin();
 
@@ -216,11 +238,11 @@ static bool data_tcp_connect(void)
     tcp_nagle_disable(g_data_pcb);
 
     ip_addr_t host_addr;
-    if (!ip4addr_aton(HOST_IP, &host_addr)) {
+    if (!ip4addr_aton(g_host_ip, &host_addr)) {
         tcp_close(g_data_pcb);
         g_data_pcb = NULL;
         cyw43_arch_lwip_end();
-        printf("[DATA] Invalid HOST_IP\n");
+        printf("[DATA] Invalid HOST_IP: %s\n", g_host_ip);
         return false;
     }
 
@@ -382,16 +404,40 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
                      (unsigned long)g_scan_period_us);
         }
 
+    } else if (strncasecmp(cmd, "set_host", 8) == 0) {
+        /* set_host <ip>  — change the host IP the Pico streams data to.
+         * Takes effect on next reconnect (closes current data socket). */
+        const char *arg = cmd + 8;
+        while (*arg == ' ') arg++;
+        if (*arg == '\0') {
+            cmd_send(pcb, "host_ip=%s", g_host_ip);
+        } else {
+            /* Validate it parses as an IPv4 address */
+            ip_addr_t test;
+            if (!ip4addr_aton(arg, &test)) {
+                cmd_send(pcb, "error: invalid IP '%s'", arg);
+            } else {
+                snprintf(g_host_ip, sizeof(g_host_ip), "%s", arg);
+                cmd_send(pcb, "host_ip=%s (reconnecting)", g_host_ip);
+                /* Force reconnect to the new host */
+                if (g_data_pcb) {
+                    tcp_close(g_data_pcb);
+                    g_data_pcb = NULL;
+                }
+                g_data_connected = false;
+                g_data_pending   = false;
+            }
+        }
+
     } else if (strcasecmp(cmd, "benchmark") == 0) {
-        /* Measure actual streaming FPS over 500 ms.
-         * Release lwIP lock while sleeping so the WiFi IRQ keeps running. */
-        uint32_t f0 = g_sent_frames;
-        cyw43_arch_lwip_end();
-        sleep_ms(500);
-        cyw43_arch_lwip_begin();
-        float fps    = (float)(g_sent_frames - f0) * 2.0f;  /* ×2: 500 ms window */
-        float ms_per = (fps > 0.0f) ? 1000.0f / fps : 0.0f;
-        cmd_send(pcb, "%.1f FPS  (%.1f ms/frame)", (double)fps, (double)ms_per);
+        /* Non-blocking: record baseline in the callback, measure in main loop.
+         * (sleep_ms inside lwIP alarm IRQ held the mutex → do_stream_work starved
+         *  → g_sent_frames never incremented → 0 FPS result.) */
+        g_benchmark_f0  = g_sent_frames;
+        g_benchmark_t0  = to_ms_since_boot(get_absolute_time());
+        g_benchmark_pcb = pcb;
+        g_benchmark_req = true;
+        cmd_send(pcb, "[benchmark] Measuring FPS over 500 ms...");
 
     } else if (strcasecmp(cmd, "read_regs") == 0) {
         /* Return ADS124S08 power-on defaults for all 6 ADCs.
@@ -515,8 +561,8 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
 
     } else if (strcasecmp(cmd, "help") == 0) {
         cmd_send(pcb, "Commands: ping | status | scan_all | benchmark | "
-                      "read_regs | set_fps <hz> | blink_led | "
-                      "test_hardware | ota_reboot | crash_log | help");
+                      "read_regs | set_fps <hz> | set_host <ip> | "
+                      "blink_led | test_hardware | ota_reboot | crash_log | help");
         cmd_send(pcb, "True wireless OTA: connect ota_client.py to port %u", OTA_PORT);
 
     } else if (cmd[0] == '\0') {
@@ -627,6 +673,70 @@ static void cmd_server_init(void)
 
     cyw43_arch_lwip_end();
     printf("[CMD] Listening on port %d\n", CMD_PORT);
+}
+
+/* =========================================================================
+ * =========================================================================
+ * UDP discovery beacon  (port 9003)
+ * =========================================================================
+ * ========================================================================= */
+
+static void beacon_init(void)
+{
+    cyw43_arch_lwip_begin();
+    g_beacon_pcb = udp_new();
+    if (g_beacon_pcb) {
+        /* Bind to any local port (source doesn't matter for broadcast) */
+        udp_bind(g_beacon_pcb, IP_ADDR_ANY, 0);
+    }
+    cyw43_arch_lwip_end();
+    printf("[BEACON] UDP discovery beacon on port %u (every %u ms)\n",
+           (unsigned)BEACON_PORT, (unsigned)BEACON_INTERVAL_MS);
+}
+
+/* Send one UDP broadcast beacon.
+ * Payload is a human-readable, machine-parseable key=value string:
+ *   MUSHIO|ip=<ip>|port=<data_port>|cmd=<cmd_port>|ota=<ota_port>|fw=demo|up=<secs>
+ * Called from the main loop every BEACON_INTERVAL_MS. */
+static void beacon_send(void)
+{
+    if (!g_beacon_pcb) return;
+
+    const struct netif *nif = netif_default;
+    if (!nif || !netif_is_up(nif)) return;
+
+    const char *my_ip = ip4addr_ntoa(netif_ip4_addr(nif));
+    uint32_t up_secs  = to_ms_since_boot(get_absolute_time()) / 1000u;
+
+    char payload[160];
+    int n = snprintf(payload, sizeof(payload),
+                     "MUSHIO|ip=%s|port=%u|cmd=%u|ota=%u|fw=%s|host=%s|up=%lu",
+                     my_ip,
+                     (unsigned)HOST_PORT,
+                     (unsigned)CMD_PORT,
+                     (unsigned)OTA_PORT,
+#ifdef MUSHIO_DEMO
+                     "demo",
+#else
+                     "real",
+#endif
+                     g_host_ip,
+                     (unsigned long)up_secs);
+
+    cyw43_arch_lwip_begin();
+
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)n, PBUF_RAM);
+    if (p) {
+        memcpy(p->payload, payload, (size_t)n);
+        ip_addr_t bcast;
+        /* Broadcast to 255.255.255.255 (subnet broadcast also works,
+         * but global broadcast is simpler and works across subnets). */
+        IP4_ADDR(&bcast, 255, 255, 255, 255);
+        udp_sendto(g_beacon_pcb, p, &bcast, BEACON_PORT);
+        pbuf_free(p);
+    }
+
+    cyw43_arch_lwip_end();
 }
 
 /* =========================================================================
@@ -765,13 +875,19 @@ int main(void)
     ota_server_init();
 
     /* --------------------------------------------------------------------- */
+    /* Phase 6c: UDP discovery beacon (port 9003)                            */
+    /* --------------------------------------------------------------------- */
+
+    beacon_init();
+
+    /* --------------------------------------------------------------------- */
     /* Phase 7: Main loop                                                     */
     /* --------------------------------------------------------------------- */
 
     printf("\n[RUN] Streaming.  Channels: %u  Target: ~%u FPS\n",
            (unsigned)TOTAL_CHANNELS,
            (unsigned)(1000000u / DEMO_SCAN_PERIOD_US));
-    printf("[RUN] Data  → %s:%d\n", HOST_IP, HOST_PORT);
+    printf("[RUN] Data  → %s:%d\n", g_host_ip, HOST_PORT);
     printf("[RUN] CMD   → port %d\n\n", CMD_PORT);
 
     uint32_t last_stats_ms  = to_ms_since_boot(get_absolute_time());
@@ -795,8 +911,30 @@ int main(void)
             /* unreachable */
         }
 
+        /* ---- UDP discovery beacon (every 3 s) ----------------------------- */
+        {
+            uint32_t now_b = to_ms_since_boot(get_absolute_time());
+            if (now_b - g_beacon_last >= BEACON_INTERVAL_MS) {
+                beacon_send();
+                g_beacon_last = now_b;
+            }
+        }
+
         /* ---- Stream: drain ring → TCP ------------------------------------ */
         do_stream_work();
+
+        /* ---- Non-blocking benchmark result (500 ms window) --------------- */
+        if (g_benchmark_req) {
+            uint32_t now_bm = to_ms_since_boot(get_absolute_time());
+            if (now_bm - g_benchmark_t0 >= 500) {
+                float fps    = (float)(g_sent_frames - g_benchmark_f0) * 2.0f;
+                float ms_per = (fps > 0.0f) ? 1000.0f / fps : 0.0f;
+                cyw43_arch_lwip_begin();
+                cmd_send(g_benchmark_pcb, "%.1f FPS  (%.1f ms/frame)", (double)fps, (double)ms_per);
+                cyw43_arch_lwip_end();
+                g_benchmark_req = false;
+            }
+        }
 
         /* ---- Reconnect data TCP if needed -------------------------------- */
         if (!g_data_connected && !g_data_pending) {

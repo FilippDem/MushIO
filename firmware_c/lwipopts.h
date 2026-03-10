@@ -28,6 +28,11 @@
 #define MEMP_NUM_TCP_SEG            96   /* must be >= TCP_SND_QUEUELEN (~90) */
 #define MEMP_NUM_PBUF               64
 #define PBUF_POOL_SIZE              32
+/* Default MEMP_NUM_TCP_PCB is 5 — too few for data+cmd+ota+TIME_WAIT leftovers.
+ * Bug fix: data_tcp_recv_cb now calls tcp_close() on EOF, but keep the pool
+ * large enough to absorb a few TIME_WAIT connections after reconnects. */
+#define MEMP_NUM_TCP_PCB            12
+#define MEMP_NUM_TCP_PCB_LISTEN     4
 
 /* --- TCP ------------------------------------------------------------------- */
 #define LWIP_TCP                    1

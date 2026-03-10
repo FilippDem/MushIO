@@ -2,17 +2,29 @@
  * core1.c — Core 1 entry point: ADC scan loop
  *
  * Core 1 responsibility:
- *   1. Initialise the (demo) ADC subsystem.
- *   2. Tight scan loop at ~200 FPS:
+ *   1. Register as a multicore_lockout victim (so Core 0 can safely park
+ *      Core 1 via multicore_lockout_start_blocking() before flash erase/
+ *      program operations).
+ *   2. Initialise the (demo) ADC subsystem.
+ *   3. Tight scan loop at ~200 FPS:
  *        a. Call demo_adc_scan() — generates synthetic 216-byte data.
  *        b. Pack the full 228-byte frame (header + data + CRC).
  *        c. Push frame into the lockless ring buffer.
  *        d. Sleep for DEMO_SCAN_PERIOD_US to pace frame rate.
- *   3. Never touch WiFi / lwIP — those are Core 0's domain.
+ *   4. Never touch WiFi / lwIP — those are Core 0's domain.
  *
- * The ring buffer's head pointer is the ONLY shared state Core 1 writes.
- * Core 0 reads head and writes tail.  __dmb() barriers in ring.h ensure
- * correct visibility without any spinlock.
+ * Flash safety (OTA)
+ * ------------------
+ * Before calling flash_range_erase() / flash_range_program(), Core 0 calls
+ * multicore_lockout_start_blocking().  This sends an IPI to Core 1 via the
+ * SIO FIFO.  Core 1's lockout handler (multicore_lockout_handler, placed in
+ * SRAM by the SDK) fires, acknowledges the lockout, and spins with
+ * interrupts disabled until Core 0 calls multicore_lockout_end_blocking()
+ * (which it never does — it reboots via watchdog at OTA completion).
+ *
+ * Core 1 must call multicore_lockout_victim_init() before the scan loop so
+ * that the SIO FIFO IRQ handler is registered and Core 0's lockout request
+ * is handled promptly (< 1 ms).
  */
 
 #include <stdio.h>
@@ -38,9 +50,11 @@ void core1_main(void)
 {
     printf("[C1] Core 1 started — ADC scan loop\n");
 
-    /* Register this core as a multicore_lockout victim so that Core 0 can
-     * safely call multicore_lockout_start_blocking() before flash erase /
-     * program operations.  Must be called before the scan loop begins. */
+    /* Register Core 1 as a multicore_lockout victim.
+     * This installs the SIO FIFO IRQ handler (multicore_lockout_handler,
+     * SRAM-resident) so that Core 0 can safely park Core 1 before any flash
+     * erase / program operation during OTA.  Must be called BEFORE the scan
+     * loop to ensure the handler is ready if OTA starts immediately. */
     multicore_lockout_victim_init();
 
     /* Initialise demo ADC (builds sine table using FPU sinf). */

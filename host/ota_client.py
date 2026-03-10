@@ -126,8 +126,11 @@ def ota_flash(uf2_path: str, host: str, ota_port: int, cmd_port: int) -> None:
         print(f"[OTA] Sent: OTAV1 {uf2_size}")
 
         # -- Wait for READY --------------------------------------------------
+        # Pico pre-erases all staging sectors before sending READY.
+        # At ~40-200 ms per sector this can take up to ~30 s; allow 120 s.
 
-        resp = recv_line(sock, timeout=10.0)
+        print("[OTA] Waiting for READY (Pico pre-erasing staging flash)...")
+        resp = recv_line(sock, timeout=120.0)
         print(f"[OTA] Server: {resp}")
         if resp.upper() != "READY":
             print(f"[OTA] Expected READY, got: {resp!r}", file=sys.stderr)

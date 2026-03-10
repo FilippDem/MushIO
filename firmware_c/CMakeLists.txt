@@ -33,6 +33,16 @@ set(PICO_NO_COPRO_DIS 1 CACHE BOOL "Disable coprodis post-build step" FORCE)
 
 pico_sdk_init()
 
+# GCC 15.2.1 on Windows crashes in the linker when the command line contains
+# a bare -g flag (access violation 0xC0000005).  Scrub it from every cmake
+# flag variable that gets forwarded to the link step.
+foreach(_f CMAKE_C_FLAGS CMAKE_CXX_FLAGS CMAKE_EXE_LINKER_FLAGS
+           CMAKE_C_FLAGS_RELEASE CMAKE_CXX_FLAGS_RELEASE
+           CMAKE_C_FLAGS_DEBUG   CMAKE_CXX_FLAGS_DEBUG
+           CMAKE_C_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_RELWITHDEBINFO)
+    string(REGEX REPLACE "(^| )-g( |$)" " " ${_f} "${${_f}}")
+endforeach()
+
 # ---------------------------------------------------------------------------
 # Executable
 # ---------------------------------------------------------------------------
@@ -101,7 +111,13 @@ target_compile_options(mushio_c PRIVATE
     -Wextra
     -Wno-unused-parameter    # lwIP callbacks use void *arg frequently
     -O2                      # optimise for speed
+    -g0                      # override SDK -g; no debug sections → avoids GCC 15.2.1 linker crash
 )
+
+# ARM GCC 15.2.1 linker crashes (0xC0000005) when debug info is present.
+# -g0 above prevents debug sections in .o files; -g0 -s here keeps the
+# linker command clean and strips any residual symbols from the ELF.
+target_link_options(mushio_c PRIVATE -g0 -s)
 
 # ---------------------------------------------------------------------------
 # Print memory usage after linking

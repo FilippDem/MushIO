@@ -12,6 +12,7 @@
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/flash.h"
+#include "hardware/sync.h"
 #include "hardware/watchdog.h"
 
 #include "lwip/tcp.h"
@@ -141,6 +142,65 @@ static void ota_send(const char *fmt, ...)
 }
 
 /* =========================================================================
+ * Core 1 lockout for flash safety
+ *
+ * flash_range_erase() and flash_range_program() disable XIP while they run.
+ * Core 1 must not be executing from XIP flash during that window.
+ *
+ * We use the SDK's multicore_lockout mechanism:
+ *   - Core 1 calls multicore_lockout_victim_init() during its startup
+ *     (see core1.c), registering a SRAM-resident SIO FIFO IRQ handler.
+ *   - Here, Core 0 calls multicore_lockout_start_blocking(), which sends
+ *     an IPI to Core 1.  Core 1's IRQ handler fires in < 1 ms, disables
+ *     Core 1's interrupts, and spins in SRAM until Core 0 releases the lock.
+ *   - Core 0 then performs all flash operations safely.
+ *   - multicore_lockout_end_blocking() is never called — the Pico reboots
+ *     via watchdog at OTA completion, bringing Core 1 back up cleanly.
+ * ========================================================================= */
+
+static bool g_core1_halted = false;
+
+/* OTA diagnostic markers written to watchdog scratch[3].
+ * These survive a WDT reset.  By pre-setting scratch[0]=CRASH_MAGIC before
+ * the first flash operation, the next boot's crash-log check sees a valid
+ * record and does NOT overwrite it, so scratch[3] retains the last marker.
+ *
+ * Read via 'crash_log' CMD after an OTA WDT crash:
+ *   scratch[3] = 0xAA000001  → hung inside multicore_lockout_start_blocking()
+ *   scratch[3] = 0xAA000002  → locked out OK; hung before/at first erase
+ *   scratch[3] = 0xAA01NNNN  → hung inside flash_range_erase(sector NNNN)
+ *   scratch[3] = 0xAA02NNNN  → erased sector NNNN; hung returning to main loop
+ */
+#define OTA_DIAG(val)  do { watchdog_hw->scratch[3] = (val); } while (0)
+
+static void ota_halt_core1(void)
+{
+    if (g_core1_halted) return;
+    printf("[OTA] Locking out Core 1 for flash operations...\n");
+
+    /* Pre-set crash log magic so a WDT fire preserves our progress markers.
+     * The next boot's watchdog_caused_reboot() block sees scratch[0]==CRASH_MAGIC
+     * and skips overwriting, leaving scratch[3] with the last OTA_DIAG value. */
+    watchdog_hw->scratch[0] = 0xDEADBEEFu;   /* CRASH_MAGIC */
+    watchdog_hw->scratch[1] = 0x03u;           /* CRASH_CODE_WDT */
+    watchdog_hw->scratch[2] = to_ms_since_boot(get_absolute_time());
+    OTA_DIAG(0xAA000001u);   /* marker: about to call multicore_lockout_start_blocking */
+
+    watchdog_update();   /* reset WDT before blocking lockout handshake */
+
+    /* multicore_lockout_start_blocking():
+     *   Sends LOCKOUT_MAGIC_START to Core 1 via SIO FIFO.
+     *   Core 1's lockout handler (in SRAM) acknowledges immediately and
+     *   spins with interrupts disabled.
+     *   Typically completes in < 1 ms. */
+    multicore_lockout_start_blocking();
+
+    OTA_DIAG(0xAA000002u);   /* marker: lockout complete, about to start erasing */
+    g_core1_halted = true;
+    printf("[OTA] Core 1 locked out — flash operations safe.\n");
+}
+
+/* =========================================================================
  * process_uf2_block
  *
  * Reads one 512-byte UF2 block from the rx ring buffer and, if it targets
@@ -148,8 +208,8 @@ static void ota_send(const char *fmt, ...)
  * area in flash.
  *
  * Called from ota_server_poll() — main loop context, lwIP lock NOT held.
- * flash_range_erase / flash_range_program are wrapped in multicore lockout
- * to safely pause Core 1 (which executes from flash via XIP).
+ * Core 1 is already halted by ota_halt_core1() before OTA_DATA begins,
+ * so no multicore lockout is required here.
  *
  * Returns true on success, false on UF2 magic / format error.
  * ========================================================================= */
@@ -184,10 +244,11 @@ static bool process_uf2_block(void)
     /* Staging flash offset for this 256-byte page */
     uint32_t staging_page = OTA_STAGE_FLASH_OFFSET + active_offset;
 
-    /* Program 256-byte page into pre-erased staging area (~0.5 ms, WiFi safe) */
-    multicore_lockout_start_blocking();
+    /* Program 256-byte page into pre-erased staging area (~0.5 ms).
+     * Disable interrupts for the XIP-offline window (same reason as erase). */
+    uint32_t saved_irq = save_and_disable_interrupts();
     flash_range_program(staging_page, blk.data, UF2_PAYLOAD);
-    multicore_lockout_end_blocking();
+    restore_interrupts(saved_irq);
 
     /* Track highest byte written (active-area coordinates) */
     uint32_t end = active_offset + UF2_PAYLOAD;
@@ -290,6 +351,7 @@ static void ota_reset_state(void)
     g_ota_flash_hi      = 0;
     g_ota_total_sectors = 0;
     g_ota_erase_idx     = 0;
+    g_core1_halted      = false;
     rx_reset();
 }
 
@@ -478,12 +540,26 @@ void ota_server_poll(void)
     /* --------------------------------------------------------------------- */
 
     if (g_ota_phase == OTA_ERASE) {
+        /* Lock out Core 1 once before the first flash operation.
+         * Core 1 stays locked through all erases, all OTA_DATA programs, and
+         * the final metadata write — the Pico reboots at OTA completion. */
+        if (g_ota_erase_idx == 0) {
+            ota_halt_core1();
+        }
+
         if (g_ota_erase_idx < g_ota_total_sectors) {
             uint32_t off = OTA_STAGE_FLASH_OFFSET +
                            g_ota_erase_idx * FLASH_SECTOR_SIZE;
-            multicore_lockout_start_blocking();
+            OTA_DIAG(0xAA010000u | g_ota_erase_idx);   /* entering erase sector N */
+            /* Disable interrupts during the XIP-offline window.
+             * The CYW43 alarm IRQ fires ~every 50 ms from flash.  If it fires
+             * while flash_range_erase() has XIP offline, a bus fault occurs.
+             * Disabling interrupts for the ~40 ms erase is safe: Core 1 is
+             * already halted by multicore_lockout_start_blocking(). */
+            uint32_t saved_irq = save_and_disable_interrupts();
             flash_range_erase(off, FLASH_SECTOR_SIZE);
-            multicore_lockout_end_blocking();
+            restore_interrupts(saved_irq);
+            OTA_DIAG(0xAA020000u | g_ota_erase_idx);   /* erase sector N done */
             g_ota_erase_idx++;
             if ((g_ota_erase_idx % 8u) == 0u ||
                 g_ota_erase_idx == g_ota_total_sectors) {
@@ -558,13 +634,13 @@ void ota_server_poll(void)
         g_ota_meta.magic      = OTA_META_MAGIC;
         g_ota_meta.image_size = image_size;
 
-        /* Write metadata — needs multicore lockout (Core 1 is running) */
-        multicore_lockout_start_blocking();
+        /* Write metadata — Core 1 is already paused in SRAM, no lockout. */
+        uint32_t saved_meta = save_and_disable_interrupts();
         flash_range_erase(OTA_META_FLASH_OFFSET, FLASH_SECTOR_SIZE);
         flash_range_program(OTA_META_FLASH_OFFSET,
                             (const uint8_t *)&g_ota_meta,
                             FLASH_SECTOR_SIZE);
-        multicore_lockout_end_blocking();
+        restore_interrupts(saved_meta);
 
         printf("[OTA] Metadata written. Sending DONE and rebooting in 2 s...\n");
 

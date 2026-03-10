@@ -16,9 +16,8 @@ Ctrl+D toggles demo mode.
 
 Requirements
 ------------
-    pip install matplotlib numpy
-    pip install opencv-python   # optional -- webcam
-    pip install scipy           # optional -- bandpass filter
+    Run install.bat (Windows) or install.sh (Linux/Mac) — all dependencies
+    are handled automatically; no manual pip install required.
 
 Usage
 -----
@@ -44,8 +43,9 @@ from datetime import datetime
 from matplotlib.gridspec import GridSpec
 
 import matplotlib
+import matplotlib.ticker as mticker
 matplotlib.use('TkAgg')
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 import numpy as np
 
@@ -67,11 +67,6 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
-try:
-    import h5py
-    HAS_H5PY = True
-except ImportError:
-    HAS_H5PY = False
 
 sys.path.insert(0, os.path.dirname(__file__))
 import receiver as rx
@@ -83,6 +78,11 @@ import receiver as rx
 
 BUFFER_SECS  = 20.0
 DISPLAY_SECS = 5.0
+
+# Recovery ring-files: two files alternating so we always keep ≤10 min of raw
+# frames on disk without touching the user's data directory.
+# At ~200 FPS, 5 min = 60 000 frames × 228 B ≈ 13.7 MB per file (27 MB total).
+RECOVERY_MAX_FRAMES_PER_FILE = int(200 * 60 * 5)   # 5 min per file @ 200 FPS
 
 # Datasheet-derived fallback FPS (used until real timestamps accumulate).
 # ADS124S08 @ DR_4000 SPS, sinc3 filter, 6 ADCs on 1 MHz SPI, 12 ch/ADC:
@@ -323,7 +323,16 @@ class DataReceiver(threading.Thread):
         self._last_seq      = None
         self._fps_count     = 0
         self._fps_time      = time.time()
+        self.last_frame_time = 0.0   # wall-clock time of last successfully ingested frame
         self._stop_event    = threading.Event()
+        self._current_conn  = None   # active data socket (set in _process)
+        # --- recovery ring-files ---
+        self._rec_lock       = threading.Lock()
+        self._rec_file       = None   # open file handle for active recovery file
+        self._rec_path_a     = ''
+        self._rec_path_b     = ''
+        self._rec_active     = 'a'    # which file we are currently writing to
+        self._rec_frames     = 0      # frames written to the current active file
         # --- binary rolling log ---
         self._log_lock      = threading.Lock()
         self._log_file      = None
@@ -334,24 +343,24 @@ class DataReceiver(threading.Thread):
         self._log_roll_mins = 60
         self._log_next_roll = None
         self.log_curr_path  = ''
-        # --- HDF5 log (optional; requires h5py) ---
-        self._hdf5_file     = None
-        self._hdf5_ds       = None   # dataset for raw int32 samples (N, 72)
-        self._hdf5_ts_ds    = None   # dataset for timestamps_us (N,)
-        self.hdf5_active    = False
-        self.hdf5_frames    = 0
 
     def run(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(('0.0.0.0', self.port))
+        try:
+            srv.bind(('0.0.0.0', self.port))
+        except OSError as e:
+            print(f"[DATA-RX] FATAL: Cannot bind port {self.port}: {e}")
+            return
         srv.listen(1)
         srv.settimeout(1.0)
+        print(f"[DATA-RX] Listening on 0.0.0.0:{self.port} for Pico data stream")
         while not self._stop_event.is_set():
             try:
                 conn, addr = srv.accept()
             except socket.timeout:
                 continue
+            print(f"[DATA-RX] Pico connected from {addr[0]}:{addr[1]}")
             self.connected      = True
             self.client_ip      = addr[0]
             self.frames_session = 0
@@ -360,7 +369,24 @@ class DataReceiver(threading.Thread):
             self._last_seq      = None
             self._process(conn)
             self.connected = False
+            print(f"[DATA-RX] Pico disconnected. Session: {self.frames_session} frames, {self.bytes_session} bytes")
         srv.close()
+
+    def force_disconnect(self):
+        """Close the active data socket from any thread.
+        Causes _process()'s recv() to raise immediately, breaking the loop.
+        The receiver then falls back to srv.accept() so the Pico can reconnect."""
+        conn = self._current_conn
+        if conn is not None:
+            print("[DATA-RX] force_disconnect() called — closing active socket")
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _process(self, conn):
         # TCP_NODELAY on the host side prompts the OS to ACK incoming data
@@ -371,15 +397,35 @@ class DataReceiver(threading.Thread):
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except Exception:
             pass
-        conn.settimeout(30.0)
+        # Enable TCP keepalive to detect dead connections faster.
+        # Without this, a silently-dead Pico can hold the socket open for
+        # minutes while the OS waits for its default keepalive timeout.
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, 'TCP_KEEPIDLE'):   # Linux
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            elif hasattr(socket, 'SIO_KEEPALIVE_VALS'):   # Windows
+                # struct: (onoff=1, keepalivetime_ms=5000, keepaliveinterval_ms=2000)
+                conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5000, 2000))
+        except Exception:
+            pass
+        conn.settimeout(5.0)    # 5 s (was 10) — Pico streams at ~200 FPS
+        self._current_conn = conn
         buf = bytearray()
+        _log_t = time.time()
+        _last_frame_t = time.time()   # frame-level watchdog
+        _FRAME_WD_SEC = 15.0          # force-close if no valid frames this long
         while not self._stop_event.is_set():
             try:
                 chunk = conn.recv(4096)
                 if not chunk:
+                    print("[DATA-RX] Connection closed by Pico (recv returned empty)")
                     break
                 self.bytes_session += len(chunk)
                 buf.extend(chunk)
+                _got_frame = False
                 while len(buf) >= rx.FRAME_SIZE:
                     pos = rx.MushIOReceiver._find_sync(buf)
                     if pos < 0:
@@ -391,11 +437,30 @@ class DataReceiver(threading.Thread):
                     frame_bytes = bytes(buf[:rx.FRAME_SIZE])
                     buf = buf[rx.FRAME_SIZE:]
                     self._ingest(frame_bytes)
+                    _got_frame = True
+                if _got_frame:
+                    _last_frame_t = time.time()
+                # Frame-level watchdog: bytes arriving but no valid frames
+                # for an extended period means a corrupted / stale stream.
+                elif time.time() - _last_frame_t > _FRAME_WD_SEC:
+                    print(f"[DATA-RX] Frame watchdog: no valid frames for {_FRAME_WD_SEC:.0f}s -- disconnecting")
+                    break
+                # Periodic stats every 5 seconds
+                _now = time.time()
+                if _now - _log_t >= 5.0:
+                    print(f"[DATA-RX] fps={self.fps:.0f}  frames={self.frames_session}  bytes={self.bytes_session}  crc_err={self.crc_errors}  missed={self.missed_session}")
+                    _log_t = _now
             except socket.timeout:
+                print("[DATA-RX] Socket timeout (5s no data) -- disconnecting")
                 break
-            except Exception:
+            except Exception as e:
+                print(f"[DATA-RX] Exception in _process: {e}")
                 break
-        conn.close()
+        self._current_conn = None
+        try:
+            conn.close()
+        except Exception:
+            pass   # already closed by force_disconnect()
 
     def _ingest(self, frame_bytes):
         if self._paused:
@@ -416,13 +481,15 @@ class DataReceiver(threading.Thread):
                 gap = (seq - expected) & 0xFFFF
                 self.missed_frames += gap
                 self.missed_session += gap
-                # Only flush on large gaps (≥ 20 frames = 40 ms at 500 FPS).
-                # At 12 Hz (highest demo frequency) a gap of 21 frames causes
-                # a 180° phase shift — visible signal inversion.  Single-frame
-                # WiFi drops cause ≤ 8.6° error at 12 Hz — completely invisible.
-                # Flushing on every 1-frame drop keeps the buffer too short for
-                # a useful FFT (→ broad triangular peaks, half-filled time view).
-                if gap >= 20:
+                # Only flush on a full uint16 wraparound gap (≥32768).
+                # Smaller gaps are caused by Pico-side ring-buffer drops
+                # (Core 1 seq counter increments even when ring_push fails),
+                # NOT by stale data on the host — so don't clear the display.
+                # A gap ≥ 32768 indicates the Pico seq counter restarted from
+                # 0 while the TCP session stayed open (firmware reset), which
+                # would make buffered data genuinely stale.
+                _flush_threshold = 32768
+                if gap >= _flush_threshold:
                     for buf in self.buffers:
                         buf.clear()
                     self.timestamps.clear()
@@ -431,12 +498,13 @@ class DataReceiver(threading.Thread):
             self.buffers[i].append(s)
         self.timestamps.append(parsed['timestamp_us'])
         now = time.time()
+        self.last_frame_time = now
         dt  = now - self._fps_time
         if dt >= 0.5:
             self.fps        = self._fps_count / dt
             self._fps_count = 0
             self._fps_time  = now
-        # Binary log (valid frames only)
+        # Binary log (valid frames only, user-initiated)
         if self.log_active:
             with self._log_lock:
                 if self._log_next_roll and now >= self._log_next_roll:
@@ -444,17 +512,8 @@ class DataReceiver(threading.Thread):
                 if self._log_file:
                     self._log_file.write(frame_bytes)
                     self.log_frames += 1
-        # HDF5 log (valid frames only)
-        if self.hdf5_active and self._hdf5_file is not None:
-            with self._log_lock:
-                row = np.array(parsed['samples'], dtype=np.int32)
-                ts  = parsed['timestamp_us']
-                n   = self.hdf5_frames
-                self._hdf5_ds.resize(n + 1, axis=0)
-                self._hdf5_ts_ds.resize(n + 1, axis=0)
-                self._hdf5_ds[n]    = row
-                self._hdf5_ts_ds[n] = ts
-                self.hdf5_frames += 1
+        # Recovery ring-file (always-on, small rolling window)
+        self._write_recovery_frame(frame_bytes)
 
     # --- binary rolling log API ---
 
@@ -487,46 +546,97 @@ class DataReceiver(threading.Thread):
                 except Exception: pass
                 self._log_file = None
 
-    # --- HDF5 log API -------------------------------------------------------
+    # --- recovery ring-file API ---
 
-    def start_hdf5_logging(self, data_dir, prefix):
-        """Open an HDF5 file and start appending frames.  Requires h5py."""
-        import h5py  # guarded at call site by HAS_H5PY check
-        with self._log_lock:
-            os.makedirs(data_dir, exist_ok=True)
-            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(data_dir, f"{prefix}_{ts}.h5")
-            f    = h5py.File(path, 'w')
-            # Unlimited chunked dataset: rows = frames, cols = 72 channels
-            self._hdf5_ds    = f.create_dataset(
-                'samples',
-                shape=(0, rx.TOTAL_CHANNELS),
-                maxshape=(None, rx.TOTAL_CHANNELS),
-                dtype=np.int32,
-                chunks=(256, rx.TOTAL_CHANNELS),
-                compression='gzip', compression_opts=1,
-            )
-            self._hdf5_ts_ds = f.create_dataset(
-                'timestamp_us',
-                shape=(0,), maxshape=(None,),
-                dtype=np.uint32,
-                chunks=(256,),
-            )
-            # Store channel names as attribute
-            self._hdf5_ds.attrs['channel_names'] = rx.CHANNEL_NAMES
-            self._hdf5_file  = f
-            self.hdf5_active = True
-            self.hdf5_frames = 0
+    def start_recovery_writer(self, recovery_dir):
+        """Open the recovery writer.  Must be called once after __init__.
+        Picks the *older* of the two ring-files so the newer one's frames
+        survive on disk until overwritten by fresh data."""
+        with self._rec_lock:
+            if self._rec_file is not None:
+                return   # already running
+            self._rec_path_a = os.path.join(recovery_dir, 'mushio_recovery_a.bin')
+            self._rec_path_b = os.path.join(recovery_dir, 'mushio_recovery_b.bin')
+            try:
+                mtime_a = os.path.getmtime(self._rec_path_a) \
+                          if os.path.exists(self._rec_path_a) else 0.0
+                mtime_b = os.path.getmtime(self._rec_path_b) \
+                          if os.path.exists(self._rec_path_b) else 0.0
+                # Write to whichever is older — preserve the more recent one
+                self._rec_active = 'a' if mtime_a <= mtime_b else 'b'
+            except Exception:
+                self._rec_active = 'a'
+            self._open_rec_file()
 
-    def stop_hdf5_logging(self):
-        with self._log_lock:
-            self.hdf5_active = False
-            if self._hdf5_file is not None:
-                try: self._hdf5_file.close()
+    def _open_rec_file(self):
+        """Truncate and open the active recovery file.  Call with _rec_lock held."""
+        path = self._rec_path_a if self._rec_active == 'a' else self._rec_path_b
+        try:
+            if self._rec_file:
+                try: self._rec_file.close()
                 except Exception: pass
-                self._hdf5_file  = None
-                self._hdf5_ds    = None
-                self._hdf5_ts_ds = None
+            self._rec_file   = open(path, 'wb')   # 'wb' truncates
+            self._rec_frames = 0
+            print(f"[RECOVERY] Writing to {os.path.basename(path)}")
+        except Exception as e:
+            print(f"[RECOVERY] Cannot open {path}: {e}")
+            self._rec_file = None
+
+    def _write_recovery_frame(self, frame_bytes):
+        """Append one raw frame to the recovery ring-file; rotate when full.
+        Called from _ingest() — never holds _log_lock."""
+        with self._rec_lock:
+            if self._rec_file is None:
+                return
+            try:
+                self._rec_file.write(frame_bytes)
+                self._rec_frames += 1
+                if self._rec_frames >= RECOVERY_MAX_FRAMES_PER_FILE:
+                    # Switch to the other file (overwrites it)
+                    self._rec_active = 'b' if self._rec_active == 'a' else 'a'
+                    self._open_rec_file()
+            except Exception as e:
+                print(f"[RECOVERY] Write error: {e}")
+                self._rec_file = None
+
+    def preload_from_recovery(self):
+        """Read recovery ring-files (oldest first) and populate channel buffers.
+        Call *before* start_recovery_writer so the files are not yet truncated.
+        Returns the number of frames loaded."""
+        paths = [p for p in (self._rec_path_a, self._rec_path_b)
+                 if p and os.path.exists(p)]
+        if not paths:
+            return 0
+        # Sort oldest first so the deque naturally ends with the most recent data
+        paths.sort(key=os.path.getmtime)
+        total = 0
+        for path in paths:
+            try:
+                with open(path, 'rb') as f:
+                    data = f.read()
+                offset = 0
+                while offset + rx.FRAME_SIZE <= len(data):
+                    frame_bytes = bytes(data[offset: offset + rx.FRAME_SIZE])
+                    offset += rx.FRAME_SIZE
+                    parsed = rx.parse_frame(frame_bytes)
+                    if parsed and parsed['crc_valid']:
+                        for i, s in enumerate(parsed['samples']):
+                            if i < len(self.buffers):
+                                self.buffers[i].append(s)
+                        self.timestamps.append(parsed['timestamp_us'])
+                        total += 1
+            except Exception as e:
+                print(f"[RECOVERY] Error reading {os.path.basename(path)}: {e}")
+        if total:
+            print(f"[RECOVERY] Preloaded {total:,} frames from recovery files")
+        return total
+
+    def stop_recovery_writer(self):
+        with self._rec_lock:
+            if self._rec_file:
+                try: self._rec_file.close()
+                except Exception: pass
+                self._rec_file = None
 
     def stop(self):
         self._stop_event.set()
@@ -1002,12 +1112,19 @@ class WebcamCapture(threading.Thread):
 
     def _do_capture(self):
         try:
-            cap = cv2.VideoCapture(self.cam_index)
+            cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(self.cam_index)
             if not cap.isOpened():
                 self.last_error = f"Cannot open camera {self.cam_index}"; return
-            ret, frame = cap.read()
+            time.sleep(0.5)
+            ret, frame = False, None
+            for _ in range(15):
+                r, f = cap.read()
+                if r and f is not None:
+                    ret, frame = True, f
             cap.release()
-            if ret:
+            if ret and frame is not None:
                 ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
                 path = os.path.join(self.output_dir, f"mushio_capture_{ts}.jpg")
                 cv2.imwrite(path, frame)
@@ -1022,6 +1139,101 @@ class WebcamCapture(threading.Thread):
 
     def stop(self):
         self._stop.set()
+
+
+# =============================================================================
+# UDP Discovery Beacon Listener
+# =============================================================================
+
+class BeaconListener(threading.Thread):
+    """Listen for MushIO UDP discovery beacons on port 9003.
+
+    The Pico broadcasts a beacon every ~3 s containing its IP, ports, and
+    firmware type.  This thread receives those beacons and tracks all
+    discovered Picos so the GUI can present a selector when multiple boards
+    are on the network.
+    """
+
+    BEACON_PORT  = 9003
+    STALE_SECS   = 30.0   # drop entries not seen for this long
+    ACTIVE_SECS  = 15.0   # consider a Pico "active" if seen within this window
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.pico_ip    = None   # last discovered Pico IP (backward compat)
+        self.pico_info  = {}     # last parsed beacon fields (backward compat)
+        self.last_seen  = 0.0    # time.time() of last beacon (backward compat)
+        self.discovered = {}     # {ip: {'info': {fields}, 'last_seen': float}}
+        self._stop_event = threading.Event()
+
+    # ------------------------------------------------------------------
+    def get_active(self):
+        """Return list of (ip, info_dict) for Picos seen recently, sorted by IP."""
+        now = time.time()
+        return sorted(
+            [(ip, d['info']) for ip, d in self.discovered.items()
+             if now - d['last_seen'] < self.ACTIVE_SECS],
+            key=lambda x: x[0])
+
+    # ------------------------------------------------------------------
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(('', self.BEACON_PORT))
+        except OSError as e:
+            print(f"[BEACON] Cannot bind UDP port {self.BEACON_PORT}: {e}")
+            return
+        sock.settimeout(2.0)
+
+        while not self._stop_event.is_set():
+            try:
+                data, addr = sock.recvfrom(512)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            try:
+                text = data.decode('utf-8', errors='replace')
+            except Exception:
+                continue
+
+            if not text.startswith('MUSHIO|'):
+                continue
+
+            # Parse key=value fields: MUSHIO|ip=x|port=y|cmd=z|...
+            fields = {}
+            for part in text.split('|')[1:]:
+                if '=' in part:
+                    k, v = part.split('=', 1)
+                    fields[k] = v
+
+            ip = fields.get('ip')
+            if ip:
+                now = time.time()
+                is_new = ip not in self.discovered
+                # Update per-Pico entry
+                self.discovered[ip] = {'info': fields, 'last_seen': now}
+                # Backward-compat single-Pico attrs (always latest beacon)
+                self.pico_ip   = ip
+                self.pico_info = fields
+                self.last_seen = now
+                # Prune stale entries
+                self.discovered = {
+                    k: v for k, v in self.discovered.items()
+                    if now - v['last_seen'] < self.STALE_SECS}
+                if is_new:
+                    n = len(self.discovered)
+                    print(f"[BEACON] Discovered Pico at {ip}"
+                          f" (fw={fields.get('fw','?')},"
+                          f" up={fields.get('up','?')}s)"
+                          f" -- {n} Pico{'s' if n > 1 else ''} on network")
+
+        sock.close()
+
+    def stop(self):
+        self._stop_event.set()
 
 
 # =============================================================================
@@ -1090,6 +1302,7 @@ class MushIOGUI:
         self._wf_canvas      = None
         self._wf_axes        = []
         self._wf_stim_ax     = None
+        self._wf_prev_artists = []   # artists removed at start of each waterfall frame
         self._wf_fft_btn     = None
         # PGA gain (ADS124S08 PGA: 1,2,4,8,16,32).  Total gain = PGA x AFE_GAIN(11)
         self._pga_gain       = tk.IntVar(value=1)
@@ -1136,10 +1349,11 @@ class MushIOGUI:
         self._stim_grid_lines = {}
         self._stim_grid_axes  = {}
 
-        self._overlay_fig     = None
-        self._overlay_canvas  = None
-        self._overlay_axes    = []
-        self._stim_overlay_ax = None
+        self._overlay_fig          = None
+        self._overlay_canvas       = None
+        self._overlay_axes         = []
+        self._stim_overlay_ax      = None
+        self._overlay_prev_artists = []   # artists to remove at start of next frame
 
         self._heatmap_fig      = None
         self._heatmap_ax       = None
@@ -1181,6 +1395,7 @@ class MushIOGUI:
         self._stim_upload_status  = tk.StringVar(value="Not uploaded")
         self._stim_fig    = None
         self._stim_ax     = None
+        self._stim_line   = None   # persistent waveform line — avoids ax.cla() per keystroke
         self._stim_canvas = None
 
         # ---- settings ------------------------------------------------------
@@ -1188,14 +1403,16 @@ class MushIOGUI:
         self._data_dir_var  = tk.StringVar(value=_s.get('data_dir',  'data'))
         self._log_prefix_var = tk.StringVar(value=_s.get('log_prefix', 'mushio'))
         self._log_roll_var  = tk.StringVar(value=_s.get('log_roll', '1 hour'))
-        self._cam_dir_var   = tk.StringVar(value=_s.get('cam_dir',   'captures'))
+        # Webcam captures go into the same data directory — no separate cam_dir.
+        # Trace keeps the webcam output_dir in sync whenever data_dir changes.
+        self._data_dir_var.trace_add('write', self._on_data_dir_changed)
         self._log_active        = False
-        self._auto_log_started  = False   # True once auto-log fired for this connection
+        self._auto_log_started  = False   # unused — logging is manual-only
         self._cmd_auto_next_try = 0.0     # time.time() after which CMD auto-connect may fire
+        self._beacon_combo_ctr  = 0       # modulo counter for Pico dropdown refresh
         self._log_status_var = tk.StringVar(value='Not recording')
         self._log_file_var   = tk.StringVar(value='')
         self._settings_status = tk.StringVar(value='')
-        self._hdf5_enabled_var  = tk.BooleanVar(value=False)
         # Hardware test / OTA status
         self._hw_test_status_var = tk.StringVar(value='')
         self._ota_status_var     = tk.StringVar(value='')
@@ -1314,23 +1531,37 @@ class MushIOGUI:
         self._term_out    = None
         self._term_buffer = []   # (text, tag) pairs buffered before terminal exists
 
-        self._cam_enable_var   = tk.BooleanVar(value=False)
-        self._cam_idx_var      = tk.IntVar(value=0)
-        self._cam_interval_var = tk.IntVar(value=10)
+        self._cam_enable_var   = tk.BooleanVar(value=_s.get('cam_enable', False))
+        self._cam_idx_var      = tk.IntVar(value=_s.get('cam_index', 0))
+        self._cam_interval_var = tk.IntVar(value=_s.get('cam_interval', 10))
         self._cam_status_var   = tk.StringVar(value="Disabled")
         self._cam_preview_labels = []           # all preview label widgets (sidebar + Settings tab)
         self._cam_preview_photo = None          # keep PIL ref to avoid GC
         self._cam_preview_interval_var = tk.IntVar(value=10)   # auto-refresh minutes
 
+        # Review tab state
+        self._review_bin_files  = []
+        self._review_img_files  = []
+        self._review_img_index  = 0
+        self._review_photo      = None   # PIL PhotoImage — keep ref to avoid GC
+        self._review_dataset    = None   # last parsed dataset dict
+
         # Build UI
         self._build_ui()
 
         # Start background services
+        print(f"[INIT] MushIO GUI starting ({'DEMO' if self._demo_mode else 'LIVE'} mode)")
+        print(f"[INIT] Data port: {self.data_port}  CMD: {self.cmd_host}:{self.cmd_port}")
         self._start_receiver()
         self._start_cmd_client()
 
+        # UDP beacon listener for Pico auto-discovery
+        self._beacon = BeaconListener()
+        self._beacon.start()
+        print("[INIT] Beacon listener started on UDP port 9003")
+
         self._webcam = WebcamCapture(
-            output_dir=self._cam_dir_var.get(),
+            output_dir=self._data_dir_var.get(),
             interval_s=self._cam_interval_var.get() * 60,
             cam_index=self._cam_idx_var.get(),
         )
@@ -1367,6 +1598,9 @@ class MushIOGUI:
             self._exp_desc_txt.insert('1.0', self._exp_desc_loaded)
         # Second pass — force a full render after canvases have been drawn
         self.root.update_idletasks()
+        # Auto-enable webcam if it was enabled last session
+        if self._cam_enable_var.get():
+            self._on_cam_enable()
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -1469,11 +1703,13 @@ class MushIOGUI:
 
         cc = tk.Frame(bar, bg=BG_MID)
         cc.pack(fill=tk.X, pady=1)
-        tk.Label(cc, text="Command  Pico IP:", bg=BG_MID, fg=FG_DIM).pack(side=tk.LEFT)
+        tk.Label(cc, text="Command  Pico:", bg=BG_MID, fg=FG_DIM).pack(side=tk.LEFT)
         self._cmd_host_var = tk.StringVar(value=self.cmd_host or "")
-        tk.Entry(cc, textvariable=self._cmd_host_var, width=15,
-                 bg=BG_LIGHT, fg=FG_MAIN, insertbackground=FG_MAIN,
-                 relief=tk.FLAT).pack(side=tk.LEFT, padx=4)
+        self._cmd_host_combo = ttk.Combobox(
+            cc, textvariable=self._cmd_host_var, width=28,
+            state='normal')                       # editable so user can type manual IP
+        self._cmd_host_combo.pack(side=tk.LEFT, padx=4)
+        self._cmd_host_combo.bind('<<ComboboxSelected>>', self._on_pico_selected)
         tk.Label(cc, text="port:", bg=BG_MID, fg=FG_DIM).pack(side=tk.LEFT)
         self._cmd_port_var = tk.StringVar(value=str(self.cmd_port))
         tk.Entry(cc, textvariable=self._cmd_port_var, width=6,
@@ -1525,12 +1761,6 @@ class MushIOGUI:
         """Compact camera preview pane in the left sidebar."""
         frame = ttk.LabelFrame(parent, text="Camera Preview", padding=4)
         frame.pack(fill=tk.X, padx=4, pady=3)
-
-        if not HAS_CV2 and not HAS_PIL:
-            tk.Label(frame, text="pip install opencv-python  to enable",
-                     bg=BG_DARK, fg=FG_DIM, font=('Helvetica', 7),
-                     wraplength=220).pack(anchor=tk.W)
-            return
 
         # Preview image label
         _lbl_sidebar = tk.Label(
@@ -1744,12 +1974,6 @@ class MushIOGUI:
         ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=4)
 
         # ---- Bandpass filter --------------------------------------------
-        if not HAS_SCIPY:
-            tk.Label(frame, text="Bandpass: install scipy to enable\n(pip install scipy)",
-                     bg=BG_DARK, fg=FG_DIM, font=('Helvetica', 8),
-                     justify=tk.LEFT).pack(anchor=tk.W)
-            return
-
         _tt(ttk.Checkbutton(frame, text="Enable bandpass",
                             variable=self._bp_enabled),
             "Apply a Butterworth bandpass filter before display.\n"
@@ -1906,6 +2130,19 @@ class MushIOGUI:
                   command=lambda: self._send_cmd("blink_led 5")
                   ).pack(fill=tk.X, pady=(4, 1))
 
+        # Hardware self-test — sends 'test_hardware' CMD
+        hw_sep = ttk.Separator(frame, orient=tk.HORIZONTAL)
+        hw_sep.pack(fill=tk.X, pady=(8, 4))
+        ttk.Button(frame, text="Run Hardware Test",
+                   command=self._run_hardware_test).pack(fill=tk.X, pady=1)
+        tk.Label(frame,
+                 text="Checks ADC IDs, DRDY lines, ring buffer, WiFi RSSI",
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7)
+                 ).pack(anchor=tk.W, padx=4)
+        tk.Label(frame, textvariable=self._hw_test_status_var,
+                 bg=BG_DARK, fg=FG_DIM, font=('Consolas', 8), anchor=tk.W
+                 ).pack(fill=tk.X, pady=1)
+
     def _toggle_stream_pause(self):
         """Pause or resume data ingestion for self-test operations."""
         paused = not self._stream_paused_var.get()
@@ -1922,12 +2159,6 @@ class MushIOGUI:
     def _build_webcam_section(self, parent):
         frame = ttk.LabelFrame(parent, text="Webcam Capture", padding=6)
         frame.pack(fill=tk.X, padx=4, pady=3)
-
-        if not HAS_CV2:
-            tk.Label(frame, text="pip install opencv-python to enable",
-                     bg=BG_DARK, fg=FG_DIM, font=('Helvetica', 8),
-                     wraplength=200).pack(anchor=tk.W)
-            return
 
         ttk.Checkbutton(frame, text="Enable periodic capture",
                          variable=self._cam_enable_var,
@@ -1958,6 +2189,7 @@ class MushIOGUI:
         ('heatmap',      '  Heatmap  ',            '_build_heatmap_tab'),
         ('stim',         '  STIM Ctrl  ',          '_build_stim_waveform_tab'),
         ('settings',     '  Experiment Settings  ','_build_settings_tab'),
+        ('review',       '  Review Data  ',        '_build_review_tab'),
         ('regs',         '  ADC Regs  ',           '_build_regs_tab'),
         ('selftest',     '  Self-Test  ',          '_build_selftest_tab'),
         ('programming',  '  Programming  ',        '_build_programming_tab'),
@@ -2013,7 +2245,7 @@ class MushIOGUI:
                            font=('Helvetica', 8),
                            command=self._apply_grid_color_mode
                            ).pack(side=tk.LEFT, padx=3)
-        self._grid_fft_note = tk.Label(tb, text="X=Hz  Y=Amplitude (uV / mV)",
+        self._grid_fft_note = tk.Label(tb, text="X=Hz  Y=Amplitude (µV)",
                                         bg=BG_MID, fg=ACCENT, font=('Helvetica', 8))
 
         # 10x10 GridSpec: outer ring (row/col 0 and 9) = STIM/AGND, inner (1-8) = electrodes
@@ -2118,26 +2350,25 @@ class MushIOGUI:
         """Repaint every grid line, label, and spine with the currently selected colour scheme."""
         mode = self._grid_color_mode.get()
         for flat, line in self._grid_lines.items():
+            is_sel = flat in self._selected_elec
             if mode == 'highcontrast':
-                col = self._ch_colors_hc.get(flat, FG_DIMMER)
+                col = self._ch_colors_hc.get(flat, FG_DIMMER) if is_sel else FG_DIMMER
             else:
-                col = self._ch_colors.get(flat, FG_DIMMER)
+                col = self._ch_colors.get(flat, FG_DIMMER) if is_sel else FG_DIMMER
             line.set_color(col)
             txt = self._grid_texts.get(flat)
             if txt is not None:
                 txt.set_color(col)
-            # Also repaint subplot spine borders to match the colour scheme.
             ax = self._grid_axes.get(flat)
             if ax is not None:
-                is_sel = flat in self._selected_elec
                 if mode == 'highcontrast':
-                    # HC: spine only coloured when channel is selected
-                    sp_col = col if is_sel else BG_LIGHT
+                    # Outline is always the channel's HC colour — only the
+                    # waveform goes grey when unselected.
+                    sp_col = self._ch_colors_hc.get(flat, BG_LIGHT)
+                    lw     = 1.0 if is_sel else 0.8
                 else:
-                    # Spatial: spine always shows the channel's hue;
-                    # selection indicated by linewidth only
-                    sp_col = col
-                lw = 1.0 if is_sel else 0.4
+                    sp_col = col if is_sel else BG_LIGHT
+                    lw     = 1.0 if is_sel else 0.4
                 for sp in ax.spines.values():
                     sp.set_color(sp_col)
                     sp.set_linewidth(lw)
@@ -2558,7 +2789,10 @@ class MushIOGUI:
                 sp.set_color(BG_LIGHT)
             self._stim_ax.set_xlabel("Time (s)", color=FG_DIM, fontsize=9)
             self._stim_ax.set_ylabel("Current (uA)", color=FG_DIM, fontsize=9)
-            self._stim_fig.tight_layout(pad=1.8)
+            # Pre-create persistent line + zero-line; update via set_data to avoid ax.cla()
+            self._stim_line, = self._stim_ax.plot([], [], color=ORANGE, linewidth=1.5)
+            self._stim_ax.axhline(0, color=FG_DIMMER, linewidth=0.5, linestyle='--')
+            self._stim_fig.tight_layout(pad=1.8)   # called once at build, not per keystroke
         else:
             # 2 rows x 4 cols for all 8 channels
             self._stim_fig = Figure(figsize=(9, 5), dpi=88, facecolor=BG_MID)
@@ -2786,24 +3020,18 @@ class MushIOGUI:
             self._stim_update_preview_single()
 
     def _stim_update_preview_single(self):
-        """Draw the current editor waveform into the single-channel axes."""
-        if self._stim_ax is None:
+        """Update the single-channel STIM preview using a persistent line (no ax.cla)."""
+        if self._stim_ax is None or self._stim_line is None:
             return
         t, y = self._stim_generate_waveform()
         wtype = self._stim_edit_type.get()
         ch    = self._stim_edit_ch_var.get()
-        self._stim_ax.cla()
-        self._stim_ax.set_facecolor(BG_MID)
-        self._stim_ax.tick_params(colors=FG_DIM, labelsize=8)
-        for sp in self._stim_ax.spines.values():
-            sp.set_color(BG_LIGHT)
-        self._stim_ax.plot(t, y, color=ORANGE, linewidth=1.5)
-        self._stim_ax.axhline(0, color=FG_DIMMER, linewidth=0.5, linestyle='--')
-        self._stim_ax.set_xlabel("Time (s)",      color=FG_DIM, fontsize=9)
-        self._stim_ax.set_ylabel("Current (uA)", color=FG_DIM, fontsize=9)
+        # Update data in place — no axis clear, no layout recalculation
+        self._stim_line.set_data(t, y)
+        self._stim_ax.relim()
+        self._stim_ax.autoscale_view()
         self._stim_ax.set_title(f"{ch}  —  {wtype} Preview  ({len(y)} samples)",
                                  color=FG_MAIN, fontsize=9)
-        self._stim_fig.tight_layout(pad=1.8)
         if self._stim_canvas:
             self._stim_canvas.draw_idle()
 
@@ -3051,15 +3279,6 @@ class MushIOGUI:
                  text="~45 KB/s at 200 FPS  \u00b7  164 MB/hr  \u00b7  3.9 GB/day  \u00b7  27 GB/week",
                  bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7)).pack(anchor=tk.W, pady=(2, 6))
 
-        rh5 = tk.Frame(log_frame, bg=BG_DARK)
-        rh5.pack(fill=tk.X, pady=2)
-        _h5_state = tk.NORMAL if HAS_H5PY else tk.DISABLED
-        _h5_txt   = "Also log to HDF5 (.h5) — chunked, gzip-compressed, channel-labelled" \
-                    if HAS_H5PY else \
-                    "HDF5 logging (pip install h5py to enable)"
-        ttk.Checkbutton(rh5, text=_h5_txt,
-                        variable=self._hdf5_enabled_var,
-                        state=_h5_state).pack(side=tk.LEFT)
 
         bf = tk.Frame(log_frame, bg=BG_DARK)
         bf.pack(fill=tk.X, pady=4)
@@ -3088,98 +3307,52 @@ class MushIOGUI:
                  font=('Consolas', 8), anchor=tk.W).pack(side=tk.LEFT)
 
         # =====================================================================
-        # --- Hardware self-test ---
-        # =====================================================================
-        hw_frame = ttk.LabelFrame(pad, text="Hardware Self-Test", padding=8)
-        hw_frame.pack(fill=tk.X, padx=12, pady=4)
-
-        hw_row = tk.Frame(hw_frame, bg=BG_DARK)
-        hw_row.pack(fill=tk.X, pady=2)
-        ttk.Button(hw_row, text="Run Hardware Test",
-                   command=self._run_hardware_test).pack(side=tk.LEFT, padx=2)
-        tk.Label(hw_row,
-                 text="Sends 'test_hardware' CMD — checks ADC IDs, DRDY lines, ring buffer, WiFi RSSI",
-                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7)).pack(side=tk.LEFT, padx=8)
-
-        hw_st = tk.Frame(hw_frame, bg=BG_DARK)
-        hw_st.pack(fill=tk.X, pady=1)
-        tk.Label(hw_st, textvariable=self._hw_test_status_var,
-                 bg=BG_DARK, fg=FG_DIM, font=('Consolas', 8), anchor=tk.W
-                 ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # =====================================================================
-        # --- OTA firmware update ---
-        # =====================================================================
-        ota_frame = ttk.LabelFrame(pad, text="OTA Firmware Update", padding=8)
-        ota_frame.pack(fill=tk.X, padx=12, pady=4)
-
-        ota_row = tk.Frame(ota_frame, bg=BG_DARK)
-        ota_row.pack(fill=tk.X, pady=2)
-        ttk.Button(ota_row, text="OTA Flash\u2026",
-                   command=self._ota_flash).pack(side=tk.LEFT, padx=2)
-        tk.Label(ota_row,
-                 text="Browse for .uf2, reboot Pico into BOOTSEL, copy file automatically",
-                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7)).pack(side=tk.LEFT, padx=8)
-
-        ota_st = tk.Frame(ota_frame, bg=BG_DARK)
-        ota_st.pack(fill=tk.X, pady=1)
-        tk.Label(ota_st, textvariable=self._ota_status_var,
-                 bg=BG_DARK, fg=FG_DIM, font=('Consolas', 8), anchor=tk.W
-                 ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # =====================================================================
         # --- Webcam preview + periodic capture settings ---
         # =====================================================================
-        cam_frame = ttk.LabelFrame(pad, text="Webcam  —  Live Preview & Periodic Capture",
+        cam_frame = ttk.LabelFrame(pad, text="Webcam Capture",
                                     padding=8)
         cam_frame.pack(fill=tk.X, padx=12, pady=4)
 
-        if not HAS_CV2 and not HAS_PIL:
-            tk.Label(cam_frame,
-                     text="pip install opencv-python  to enable webcam features",
-                     bg=BG_DARK, fg=FG_DIM, font=('Helvetica', 8)).pack(anchor=tk.W)
-        else:
-            # Settings row
-            cfg_row = tk.Frame(cam_frame, bg=BG_DARK)
-            cfg_row.pack(fill=tk.X, pady=2)
-            tk.Label(cfg_row, text="Camera idx:", bg=BG_DARK, fg=FG_DIM).pack(side=tk.LEFT)
-            ttk.Spinbox(cfg_row, textvariable=self._cam_idx_var,
-                        from_=0, to=9, width=3).pack(side=tk.LEFT, padx=4)
-            tk.Label(cfg_row, text="  Capture every (min):", bg=BG_DARK, fg=FG_DIM
-                     ).pack(side=tk.LEFT, padx=(12, 0))
-            ttk.Spinbox(cfg_row, textvariable=self._cam_interval_var,
-                        from_=1, to=1440, width=5).pack(side=tk.LEFT, padx=4)
+        # Settings row
+        cfg_row = tk.Frame(cam_frame, bg=BG_DARK)
+        cfg_row.pack(fill=tk.X, pady=2)
+        tk.Label(cfg_row, text="Camera idx:", bg=BG_DARK, fg=FG_DIM).pack(side=tk.LEFT)
+        ttk.Spinbox(cfg_row, textvariable=self._cam_idx_var,
+                    from_=0, to=9, width=3).pack(side=tk.LEFT, padx=4)
+        tk.Label(cfg_row, text="  Capture every (min):", bg=BG_DARK, fg=FG_DIM
+                 ).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Spinbox(cfg_row, textvariable=self._cam_interval_var,
+                    from_=1, to=1440, width=5).pack(side=tk.LEFT, padx=4)
 
-            en_row = tk.Frame(cam_frame, bg=BG_DARK)
-            en_row.pack(fill=tk.X, pady=2)
-            ttk.Checkbutton(en_row, text="Enable periodic file capture",
-                             variable=self._cam_enable_var,
-                             command=self._on_cam_enable).pack(side=tk.LEFT)
-            ttk.Button(en_row, text="Capture Now",
-                       command=self._cam_capture_now).pack(side=tk.LEFT, padx=12)
-            tk.Label(en_row, textvariable=self._cam_status_var,
-                     bg=BG_DARK, fg=FG_DIM, font=('Helvetica', 7)).pack(side=tk.LEFT)
+        en_row = tk.Frame(cam_frame, bg=BG_DARK)
+        en_row.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(en_row, text="Enable periodic file capture",
+                         variable=self._cam_enable_var,
+                         command=self._on_cam_enable).pack(side=tk.LEFT)
+        ttk.Button(en_row, text="Capture Now",
+                   command=self._cam_capture_now).pack(side=tk.LEFT, padx=12)
+        tk.Label(en_row, textvariable=self._cam_status_var,
+                 bg=BG_DARK, fg=FG_DIM, font=('Helvetica', 7)).pack(side=tk.LEFT)
 
-            _dir_row(cam_frame, "Captures directory:",
-                     self._cam_dir_var,
-                     self._browse_cam_dir,
-                     lambda: self._open_dir(self._cam_dir_var.get()))
+        tk.Label(cam_frame,
+                 text="Images saved to the Data directory above.",
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7)).pack(anchor=tk.W, pady=(0, 4))
 
-            # Preview image
-            prev_lbl_row = tk.Frame(cam_frame, bg=BG_DARK)
-            prev_lbl_row.pack(fill=tk.X, pady=(6, 2))
-            tk.Label(prev_lbl_row, text="Preview:", bg=BG_DARK, fg=FG_DIM).pack(side=tk.LEFT)
-            tk.Label(prev_lbl_row, textvariable=self._cam_status_var,
-                     bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7)).pack(side=tk.LEFT, padx=8)
-            ttk.Button(prev_lbl_row, text="Refresh Preview",
-                       command=self._cam_refresh_preview).pack(side=tk.LEFT, padx=8)
+        # Preview image
+        prev_lbl_row = tk.Frame(cam_frame, bg=BG_DARK)
+        prev_lbl_row.pack(fill=tk.X, pady=(6, 2))
+        tk.Label(prev_lbl_row, text="Preview:", bg=BG_DARK, fg=FG_DIM).pack(side=tk.LEFT)
+        tk.Label(prev_lbl_row, textvariable=self._cam_status_var,
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7)).pack(side=tk.LEFT, padx=8)
+        ttk.Button(prev_lbl_row, text="Refresh Preview",
+                   command=self._cam_refresh_preview).pack(side=tk.LEFT, padx=8)
 
-            _lbl_settings = tk.Label(cam_frame, bg='#0d0d14',
-                                     text="No preview yet  —  click Refresh Preview",
-                                     fg=FG_DIMMER, font=('Helvetica', 8),
-                                     width=48, height=10)
-            _lbl_settings.pack(anchor=tk.W, pady=4)
-            self._cam_preview_labels.append(_lbl_settings)
+        _lbl_settings = tk.Label(cam_frame, bg='#0d0d14',
+                                 text="No preview yet  —  click Refresh Preview",
+                                 fg=FG_DIMMER, font=('Helvetica', 8),
+                                 width=48, height=10)
+        _lbl_settings.pack(anchor=tk.W, pady=4)
+        self._cam_preview_labels.append(_lbl_settings)
 
         # =====================================================================
         # --- Save defaults ---
@@ -3899,7 +4072,8 @@ class MushIOGUI:
             return
 
         # Pico not yet connected — try the CMD port if user entered Pico IP
-        pico_ip = self._cmd_host_var.get().strip()
+        _raw_ip = self._cmd_host_var.get().strip()
+        pico_ip = _raw_ip.split()[0] if _raw_ip else ''
         if not pico_ip:
             if time.time() < self._fw_conn_deadline:
                 msg = (f"Waiting for Pico data connection on port {self.data_port} ...")
@@ -4112,25 +4286,20 @@ class MushIOGUI:
         roll_key = self._log_roll_var.get()
         roll_min = LOG_ROLL_OPTIONS.get(roll_key, 60)
         self._receiver.start_logging(data_dir, prefix, roll_min)
-        if HAS_H5PY and self._hdf5_enabled_var.get():
-            try:
-                self._receiver.start_hdf5_logging(data_dir, prefix)
-            except Exception as e:
-                self._log_status_var.set(f"HDF5 open failed: {e}")
         self._log_active = True
-        self._rec_btn.config(text="  \u25a0 Stop Recording  ",
-                              bg='#3a1a1a', fg=RED,
-                              activebackground=RED)
+        if hasattr(self, '_rec_btn'):
+            self._rec_btn.config(text="  \u25a0 Stop Recording  ",
+                                  bg='#3a1a1a', fg=RED,
+                                  activebackground=RED)
         self._log_status_var.set("Starting...")
 
     def _stop_recording(self):
         self._receiver.stop_logging()
-        if self._receiver.hdf5_active:
-            self._receiver.stop_hdf5_logging()
         self._log_active = False
-        self._rec_btn.config(text="  \u25b6 Start Recording  ",
-                              bg='#1a3a1a', fg=GREEN,
-                              activebackground=GREEN)
+        if hasattr(self, '_rec_btn'):
+            self._rec_btn.config(text="  \u25b6 Start Recording  ",
+                                  bg='#1a3a1a', fg=GREEN,
+                                  activebackground=GREEN)
         self._log_status_var.set("Not recording")
         self._log_file_var.set('')
 
@@ -4155,23 +4324,25 @@ class MushIOGUI:
                     f"● REC  {frames:,} frames  {size_mb:.1f} MB"
                     + (f"  next roll in {roll_str}" if roll_str else ""))
                 self._log_file_var.set(fname)
-                self._rec_status_lbl.config(fg=GREEN)
+                if hasattr(self, '_rec_status_lbl'):
+                    self._rec_status_lbl.config(fg=GREEN)
         self.root.after(2000, self._poll_recording_status)
 
     def _browse_data_dir(self):
         d = filedialog.askdirectory(title="Select data directory",
                                      initialdir=self._data_dir_var.get())
         if d:
-            self._data_dir_var.set(d)
+            self._data_dir_var.set(d)   # trace fires _on_data_dir_changed
 
-    def _browse_cam_dir(self):
-        d = filedialog.askdirectory(title="Select captures directory",
-                                     initialdir=self._cam_dir_var.get())
-        if d:
-            self._cam_dir_var.set(d)
-            if self._webcam:
-                self._webcam.output_dir = d
+    def _on_data_dir_changed(self, *_):
+        """Keep webcam output_dir in sync with the data directory."""
+        d = self._data_dir_var.get().strip() or 'data'
+        if self._webcam:
+            self._webcam.output_dir = d
+            try:
                 os.makedirs(d, exist_ok=True)
+            except Exception:
+                pass
 
     def _open_dir(self, path):
         path = os.path.abspath(path)
@@ -4198,7 +4369,9 @@ class MushIOGUI:
             'data_dir':            self._data_dir_var.get(),
             'log_prefix':          self._log_prefix_var.get(),
             'log_roll':            self._log_roll_var.get(),
-            'cam_dir':             self._cam_dir_var.get(),
+            'cam_enable':          self._cam_enable_var.get(),
+            'cam_index':           self._cam_idx_var.get(),
+            'cam_interval':        self._cam_interval_var.get(),
             'board_id':            self._board_id_var.get(),
             'exp_name':            self._exp_name_var.get(),
             'species_common':      self._species_common_var.get(),
@@ -4253,7 +4426,6 @@ class MushIOGUI:
                 'data_dir':   self._data_dir_var.get(),
                 'log_prefix': self._log_prefix_var.get(),
                 'log_roll':   self._log_roll_var.get(),
-                'cam_dir':    self._cam_dir_var.get(),
             },
         }
 
@@ -4301,7 +4473,8 @@ class MushIOGUI:
         if 'data_dir'   in log: self._data_dir_var.set(log['data_dir'])
         if 'log_prefix' in log: self._log_prefix_var.set(log['log_prefix'])
         if 'log_roll'   in log: self._log_roll_var.set(log['log_roll'])
-        if 'cam_dir'    in log: self._cam_dir_var.set(log['cam_dir'])
+        # 'cam_dir' in old configs is intentionally ignored — webcam now
+        # uses the data directory automatically.
 
     def _save_config(self):
         path = filedialog.asksaveasfilename(
@@ -4557,6 +4730,607 @@ class MushIOGUI:
             if key in self._reg_vars:
                 self._reg_vars[key].set(f'0x{val:02X}')
 
+    # ---- Review Data tab -------------------------------------------------
+
+    def _build_review_tab(self, parent):
+        """Browse a folder of .bin data files and camera images for QC review."""
+        # ---- toolbar row 1: folder -----------------------------------------
+        tb1 = tk.Frame(parent, bg=BG_MID, pady=3)
+        tb1.pack(fill=tk.X, padx=4)
+        tk.Label(tb1, text="Folder:", bg=BG_MID, fg=FG_DIM).pack(side=tk.LEFT, padx=(6, 2))
+        self._review_dir_var = tk.StringVar(value=self._data_dir_var.get())
+        tk.Entry(tb1, textvariable=self._review_dir_var, width=56,
+                 bg=BG_LIGHT, fg=FG_MAIN, insertbackground=FG_MAIN,
+                 relief=tk.FLAT).pack(side=tk.LEFT, padx=4)
+        ttk.Button(tb1, text="Browse", command=self._review_browse).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tb1, text="Scan",   command=self._review_scan).pack(side=tk.LEFT, padx=2)
+        self._review_stats_var = tk.StringVar(value='')
+        tk.Label(tb1, textvariable=self._review_stats_var,
+                 bg=BG_MID, fg=FG_DIM, font=('Helvetica', 8)).pack(side=tk.LEFT, padx=12)
+
+        # ---- toolbar row 2: load + display options -------------------------
+        tb2 = tk.Frame(parent, bg=BG_MID, pady=2)
+        tb2.pack(fill=tk.X, padx=4)
+        ttk.Button(tb2, text="Load Selected",
+                   command=self._review_load_selected).pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Button(tb2, text="Load All (Continuous)",
+                   command=self._review_load_all).pack(side=tk.LEFT, padx=2)
+        tk.Frame(tb2, bg=BG_LIGHT, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
+        tk.Label(tb2, text="Channels:", bg=BG_MID, fg=FG_DIM,
+                 font=('Helvetica', 8)).pack(side=tk.LEFT, padx=2)
+        self._review_ch_mode = tk.StringVar(value='all64')
+        for _txt, _val in [("All 64", 'all64'), ("Grid Selection", 'grid_sel')]:
+            tk.Radiobutton(tb2, text=_txt, variable=self._review_ch_mode, value=_val,
+                           bg=BG_MID, fg=FG_DIM, selectcolor=BG_DARK,
+                           activebackground=BG_MID, font=('Helvetica', 8),
+                           command=self._review_rerender).pack(side=tk.LEFT, padx=2)
+        tk.Frame(tb2, bg=BG_LIGHT, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
+        tk.Label(tb2, text="Display:", bg=BG_MID, fg=FG_DIM,
+                 font=('Helvetica', 8)).pack(side=tk.LEFT, padx=2)
+        self._review_disp_mode = tk.StringVar(value='grid')
+        for _txt, _val in [("Grid", 'grid'), ("Stacked", 'stacked')]:
+            tk.Radiobutton(tb2, text=_txt, variable=self._review_disp_mode, value=_val,
+                           bg=BG_MID, fg=FG_DIM, selectcolor=BG_DARK,
+                           activebackground=BG_MID, font=('Helvetica', 8),
+                           command=self._review_rerender).pack(side=tk.LEFT, padx=2)
+        tk.Frame(tb2, bg=BG_LIGHT, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
+        tk.Label(tb2, text="Colors:", bg=BG_MID, fg=FG_DIM,
+                 font=('Helvetica', 8)).pack(side=tk.LEFT, padx=2)
+        self._review_color_mode = tk.StringVar(value='spatial')
+        for _txt, _val in [("Mono", 'mono'), ("Spatial", 'spatial'), ("High Contrast", 'highcontrast')]:
+            tk.Radiobutton(tb2, text=_txt, variable=self._review_color_mode, value=_val,
+                           bg=BG_MID, fg=FG_DIM, selectcolor=BG_DARK,
+                           activebackground=BG_MID, font=('Helvetica', 8),
+                           command=self._review_rerender).pack(side=tk.LEFT, padx=2)
+
+        # ---- progress / info bar -------------------------------------------
+        self._review_progress_var = tk.StringVar(value='')
+        tk.Label(parent, textvariable=self._review_progress_var,
+                 bg=BG_DARK, fg=FG_DIM, font=('Consolas', 7),
+                 anchor=tk.W).pack(fill=tk.X, padx=8, pady=(0, 1))
+
+        # ---- paned area ----------------------------------------------------
+        pane = tk.PanedWindow(parent, orient=tk.HORIZONTAL,
+                              bg=BG_DARK, sashwidth=5, sashrelief=tk.FLAT)
+        pane.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
+        # -- Left: file lists --
+        left = tk.Frame(pane, bg=BG_DARK)
+        pane.add(left, minsize=160, width=240)
+
+        bin_frame = ttk.LabelFrame(left, text="Data files (.bin)", padding=4)
+        bin_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        bin_sb = ttk.Scrollbar(bin_frame)
+        bin_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._review_bin_lb = tk.Listbox(
+            bin_frame, bg=BG_LIGHT, fg=FG_MAIN, selectbackground=ACCENT,
+            selectforeground=BG_DARK, yscrollcommand=bin_sb.set,
+            font=('Consolas', 8), activestyle='none', relief=tk.FLAT,
+            selectmode=tk.EXTENDED)
+        self._review_bin_lb.pack(fill=tk.BOTH, expand=True)
+        bin_sb.config(command=self._review_bin_lb.yview)
+        self._review_bin_lb.bind('<Double-Button-1>', lambda _e: self._review_load_selected())
+        self._review_bin_lb.bind('<Return>',          lambda _e: self._review_load_selected())
+
+        img_frame = ttk.LabelFrame(left, text="Image files", padding=4)
+        img_frame.pack(fill=tk.BOTH, expand=True)
+        img_sb = ttk.Scrollbar(img_frame)
+        img_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._review_img_lb = tk.Listbox(
+            img_frame, bg=BG_LIGHT, fg=FG_MAIN, selectbackground=ACCENT,
+            selectforeground=BG_DARK, yscrollcommand=img_sb.set,
+            font=('Consolas', 8), activestyle='none', relief=tk.FLAT)
+        self._review_img_lb.pack(fill=tk.BOTH, expand=True)
+        img_sb.config(command=self._review_img_lb.yview)
+        self._review_img_lb.bind('<<ListboxSelect>>', self._review_on_img_select)
+
+        # -- Right: preview notebook --
+        right = tk.Frame(pane, bg=BG_DARK)
+        pane.add(right, minsize=400)
+
+        rnb = ttk.Notebook(right)
+        rnb.pack(fill=tk.BOTH, expand=True)
+
+        # Waveform tab
+        wave_tab = tk.Frame(rnb, bg=BG_DARK)
+        rnb.add(wave_tab, text='  Waveform  ')
+
+        wave_top = tk.Frame(wave_tab, bg=BG_DARK)
+        wave_top.pack(fill=tk.BOTH, expand=True)
+        self._review_fig = Figure(figsize=(9, 6), dpi=80, facecolor=BG_DARK)
+        self._review_canvas = FigureCanvasTkAgg(self._review_fig, master=wave_top)
+        self._review_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        # Event connections — survive figure.clear(), so connect once here
+        self._review_ax_map = {}   # ax → ch_i; repopulated by _review_render
+        self._review_canvas.mpl_connect('scroll_event',       self._review_on_scroll)
+        self._review_canvas.mpl_connect('button_press_event', self._on_review_click)
+
+        wave_tb_frame = tk.Frame(wave_tab, bg=BG_MID)
+        wave_tb_frame.pack(fill=tk.X)
+        toolbar = NavigationToolbar2Tk(self._review_canvas, wave_tb_frame, pack_toolbar=False)
+        toolbar.config(background=BG_MID)
+        for _w in toolbar.winfo_children():
+            try:
+                _w.config(background=BG_MID)
+            except Exception:
+                pass
+        toolbar.pack(side=tk.LEFT)
+
+        self._review_fig.text(
+            0.5, 0.5, 'Scan a folder, then Load Selected or Load All (Continuous)',
+            ha='center', va='center', color=FG_DIMMER, fontsize=11)
+        self._review_canvas.draw_idle()
+
+        # Image preview tab
+        img_tab = tk.Frame(rnb, bg=BG_DARK)
+        rnb.add(img_tab, text='  Images  ')
+        self._review_img_label = tk.Label(img_tab, bg='#0d0d14',
+                                          text='Scan a folder to browse images',
+                                          fg=FG_DIMMER, font=('Helvetica', 10))
+        self._review_img_label.pack(fill=tk.BOTH, expand=True)
+        img_nav = tk.Frame(img_tab, bg=BG_DARK)
+        img_nav.pack(fill=tk.X, pady=4)
+        ttk.Button(img_nav, text='< Prev',
+                   command=self._review_img_prev).pack(side=tk.LEFT, padx=6)
+        self._review_img_name_var = tk.StringVar(value='')
+        tk.Label(img_nav, textvariable=self._review_img_name_var,
+                 bg=BG_DARK, fg=FG_DIM, font=('Consolas', 8)).pack(side=tk.LEFT, expand=True)
+        ttk.Button(img_nav, text='Next >',
+                   command=self._review_img_next).pack(side=tk.RIGHT, padx=6)
+
+    def _review_browse(self):
+        d = filedialog.askdirectory(title='Select data folder',
+                                    initialdir=self._review_dir_var.get() or '.')
+        if d:
+            self._review_dir_var.set(d)
+            self._review_scan()
+
+    def _review_scan(self):
+        folder = self._review_dir_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            self._review_stats_var.set('Folder not found')
+            return
+        all_files = sorted(os.listdir(folder))
+        self._review_bin_files = [os.path.join(folder, f) for f in all_files
+                                   if f.lower().endswith('.bin')]
+        self._review_img_files = [os.path.join(folder, f) for f in all_files
+                                   if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        self._review_bin_lb.delete(0, tk.END)
+        for p in self._review_bin_files:
+            self._review_bin_lb.insert(tk.END, os.path.basename(p))
+        self._review_img_lb.delete(0, tk.END)
+        for p in self._review_img_files:
+            self._review_img_lb.insert(tk.END, os.path.basename(p))
+        total_size = sum(os.path.getsize(p) for p in self._review_bin_files) / (1024 ** 2)
+        self._review_stats_var.set(
+            f'{len(self._review_bin_files)} data file(s)   '
+            f'{len(self._review_img_files)} image(s)   '
+            f'{total_size:.1f} MB data')
+
+    def _review_load_selected(self):
+        """Load currently selected file(s) from the bin listbox."""
+        sel = self._review_bin_lb.curselection()
+        if not sel:
+            return
+        paths = [self._review_bin_files[i] for i in sel]
+        label = os.path.basename(paths[0]) if len(paths) == 1 else f'{len(paths)} files'
+        self._review_load_paths(paths, label)
+
+    def _review_load_all(self):
+        """Load all scanned .bin files as one continuous dataset."""
+        if not self._review_bin_files:
+            self._review_stats_var.set('No files — scan a folder first')
+            return
+        self._review_load_paths(
+            self._review_bin_files,
+            f'All {len(self._review_bin_files)} files (continuous)')
+
+    def _review_load_paths(self, paths, label):
+        """Kick off background parse of given paths, then render on completion."""
+        self._review_progress_var.set(f'Loading {label}...')
+        self._review_fig.clear()
+        self._review_canvas.draw_idle()
+
+        def _worker():
+            def _status(msg):
+                self.root.after(0, lambda m=msg: self._review_progress_var.set(m))
+            result = self._review_parse_numpy(paths, status_cb=_status)
+            self.root.after(0, lambda: self._review_on_loaded(result, label))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _review_on_loaded(self, result, label):
+        """Called on main thread when background parse completes."""
+        self._review_dataset = result
+        if 'error' in result:
+            msg = result['error']
+            self._review_progress_var.set(f'Error: {msg}')
+            self._review_fig.clear()
+            self._review_fig.text(0.5, 0.5, msg,
+                                  ha='center', va='center', color=RED, fontsize=12)
+            self._review_canvas.draw_idle()
+            return
+        n_tot  = result['total_frames']
+        dur_s  = result['dur_s']
+        fps    = result['fps']
+        n_f    = result['n_files']
+        n_plot = result['n']
+        self._review_progress_var.set(
+            f'{label}   {n_tot:,} frames   {dur_s:.1f}s   {fps:.0f} FPS   '
+            f'{n_f} file(s)   {n_plot:,} plot points')
+        self._review_render()
+
+    def _review_parse_numpy(self, paths, status_cb=None):
+        """Fast multi-file numpy parser. Returns dataset dict or {'error': str}."""
+        FSIZE    = 228
+        HDR      = 10
+        TOTAL_CH = 72
+        MAX_PLOT = 5000   # total display points across all loaded files
+
+        all_ts:      list = []
+        all_samps:   list = []
+        file_breaks: list = []   # frame index of first frame from each file
+
+        for fi, path in enumerate(paths):
+            if status_cb:
+                status_cb(f'Reading {os.path.basename(path)} ({fi + 1}/{len(paths)})...')
+            try:
+                raw = np.fromfile(path, dtype=np.uint8)
+            except Exception:
+                continue
+            if len(raw) < FSIZE:
+                continue
+            # Sync word is 0x55 0xAA (little-endian 0xAA55)
+            cands = np.where((raw[:-1] == 0x55) & (raw[1:] == 0xAA))[0]
+            if len(cands) == 0:
+                continue
+            start = int(cands[0])
+            n_fr  = (len(raw) - start) // FSIZE
+            if n_fr == 0:
+                continue
+            fdata = raw[start: start + n_fr * FSIZE].reshape(n_fr, FSIZE)
+            # Validate sync at every frame position
+            ok    = (fdata[:, 0] == 0x55) & (fdata[:, 1] == 0xAA)
+            fdata = fdata[ok]
+            if len(fdata) == 0:
+                continue
+            # Timestamps: uint32 little-endian, bytes 2-5
+            ts = (fdata[:, 2].astype(np.uint64)
+                  | (fdata[:, 3].astype(np.uint64) << 8)
+                  | (fdata[:, 4].astype(np.uint64) << 16)
+                  | (fdata[:, 5].astype(np.uint64) << 24))
+            # 24-bit big-endian signed samples: bytes HDR..HDR+TOTAL_CH*3
+            sb    = fdata[:, HDR: HDR + TOTAL_CH * 3].reshape(len(fdata), TOTAL_CH, 3)
+            raw_v = ((sb[:, :, 0].astype(np.int32) << 16)
+                     | (sb[:, :, 1].astype(np.int32) << 8)
+                     | sb[:, :, 2].astype(np.int32))
+            raw_v = np.where(raw_v >= 0x800000, raw_v - 0x1000000, raw_v)
+            file_breaks.append(len(all_ts))
+            all_ts.append(ts)
+            all_samps.append(raw_v)
+
+        if not all_ts:
+            return {'error': 'No valid frames found in the selected file(s)'}
+
+        if status_cb:
+            status_cb('Computing time axis...')
+
+        ts_all = np.concatenate(all_ts).astype(np.uint64)
+        N      = len(ts_all)
+        # Monotonic time: wrap-safe uint32 µs diff
+        dt       = np.empty(N, dtype=np.float64)
+        dt[0]    = 0.0
+        dt[1:]   = ((ts_all[1:] - ts_all[:-1]) % (2 ** 32)).astype(np.float64) / 1e6
+        t_sec    = np.cumsum(dt)
+        dur_s    = float(t_sec[-1]) if N > 1 else 0.0
+        fps_est  = N / dur_s if dur_s > 0 else 0.0
+
+        samps_all = np.concatenate(all_samps, axis=0)   # (N, 72) int32
+        step      = max(1, N // MAX_PLOT)
+        idx       = np.arange(0, N, step)
+
+        STIM_IDX = {32, 33, 34, 35, 44, 45, 46, 47}
+        rec_chs  = [i for i in range(TOTAL_CH) if i not in STIM_IDX]
+        SCALE    = 5.08 / (11.0 * (2 ** 23)) * 1e6   # raw int32 → µV
+
+        t_plot    = t_sec[idx]
+        samp_plot = samps_all[idx].astype(np.float64) * SCALE   # (n_plot, 72) µV
+        # File boundary times for vertical marker lines (skip index 0 = start of dataset)
+        break_times = [float(t_sec[fb]) for fb in file_breaks if 0 < fb < N]
+
+        return {
+            'n':            len(idx),
+            'total_frames': N,
+            'n_files':      len(paths),
+            'file_breaks':  file_breaks,
+            'break_times':  break_times,
+            't_plot':       t_plot,
+            'samp_plot':    samp_plot,
+            'rec_chs':      rec_chs,
+            'fps':          fps_est,
+            'dur_s':        dur_s,
+        }
+
+    def _review_render(self):
+        """Render loaded dataset onto the review canvas. Must be called on the main thread."""
+        ds = self._review_dataset
+        if ds is None or 'error' in ds:
+            return
+
+        _CH_MAP = [
+            ["ELEC02","ELEC23","ELEC22","ELEC12","ELEC11","ELEC21","ELEC20","ELEC01",
+             "ELEC00","ELEC10","ELEC03","ELEC13"],
+            ["ELEC26","ELEC16","ELEC25","ELEC15","ELEC24","ELEC05","ELEC04","ELEC14",
+             "ELEC17","ELEC07","ELEC06","ELEC27"],
+            ["ELEC41","ELEC31","ELEC30","ELEC40","ELEC43","ELEC33","ELEC32","ELEC42",
+             "STIM_1","STIM_0","STIM_7","STIM_6"],
+            ["ELEC45","ELEC35","ELEC34","ELEC44","ELEC47","ELEC37","ELEC36","ELEC46",
+             "STIM_3","STIM_2","STIM_5","STIM_4"],
+            ["ELEC71","ELEC50","ELEC60","ELEC70","ELEC62","ELEC52","ELEC51","ELEC61",
+             "ELEC73","ELEC63","ELEC53","ELEC72"],
+            ["ELEC75","ELEC54","ELEC64","ELEC74","ELEC66","ELEC56","ELEC55","ELEC65",
+             "ELEC67","ELEC77","ELEC76","ELEC57"],
+        ]
+        _CH_NAMES = [name for row in _CH_MAP for name in row]
+
+        ch_mode    = getattr(self, '_review_ch_mode',    None)
+        disp       = getattr(self, '_review_disp_mode',  None)
+        col_mode_v = getattr(self, '_review_color_mode', None)
+        mode       = ch_mode.get()    if ch_mode    else 'all64'
+        is_grid    = (disp.get()      if disp       else 'grid') == 'grid'
+        color_mode = col_mode_v.get() if col_mode_v else 'spatial'
+
+        def _get_ch_color(ci):
+            if color_mode == 'spatial':
+                return self._ch_colors.get(ci, '#89b4fa')
+            if color_mode == 'highcontrast':
+                return self._ch_colors_hc.get(ci, '#89b4fa')
+            return '#89b4fa'   # mono
+
+        all_rec = ds['rec_chs']
+        if mode == 'grid_sel' and hasattr(self, '_selected_channels'):
+            sel_set  = {_CH_NAMES[i] for i in all_rec if _CH_NAMES[i] in self._selected_channels}
+            plot_chs = [i for i in all_rec if _CH_NAMES[i] in sel_set] or all_rec
+        else:
+            plot_chs = all_rec
+
+        t    = ds['t_plot']
+        samp = ds['samp_plot']   # (n_plot, 72) float64 µV
+        brk  = ds.get('break_times', [])
+
+        self._review_fig.clear()
+        self._review_fig.patch.set_facecolor(BG_DARK)
+        self._review_ax_map = {}   # reset click map
+
+        if is_grid:
+            n_ch = len(plot_chs)
+            cols = 8
+            rows = max(1, (n_ch + cols - 1) // cols)
+            axes = self._review_fig.subplots(rows, cols, sharex=True, sharey=False,
+                                              squeeze=False)
+            self._review_fig.subplots_adjust(
+                left=0.01, right=0.99, top=0.99, bottom=0.04,
+                hspace=0.55, wspace=0.12)
+            for pi, ch_i in enumerate(plot_chs):
+                r, c = divmod(pi, cols)
+                ax   = axes[r, c]
+                col  = _get_ch_color(ch_i)
+                sp_col = col if color_mode != 'mono' else BG_LIGHT
+                ax.set_facecolor(BG_MID)
+                for sp in ax.spines.values():
+                    sp.set_edgecolor(sp_col)
+                ax.plot(t, samp[:, ch_i], color=col, linewidth=0.4)
+                ax.set_title(_CH_NAMES[ch_i], color=col, fontsize=4.5, pad=1)
+                ax.tick_params(colors=FG_DIM, labelsize=3.5, length=2, pad=1)
+                ax.tick_params(axis='y', left=False, labelleft=False)
+                ax.grid(True, color=BG_LIGHT, linewidth=0.3, alpha=0.5)
+                if r < rows - 1:
+                    ax.tick_params(axis='x', bottom=False, labelbottom=False)
+                elif c == 0:
+                    ax.set_xlabel('s', color=FG_DIM, fontsize=4)
+                for bt in brk:
+                    ax.axvline(bt, color='#f38ba8', linewidth=0.6, alpha=0.7)
+                self._review_ax_map[ax] = ch_i
+            for spare in range(len(plot_chs), rows * cols):
+                axes[spare // cols, spare % cols].set_visible(False)
+        else:
+            ax = self._review_fig.add_subplot(111)
+            ax.set_facecolor(BG_MID)
+            self._review_fig.subplots_adjust(left=0.12, right=0.99, top=0.99, bottom=0.05)
+            for sp in ax.spines.values():
+                sp.set_edgecolor(BG_LIGHT)
+            n_ch = len(plot_chs)
+            # Robust offset: median of per-channel p95-p5 range
+            p5  = np.percentile(samp[:, plot_chs], 5,  axis=0)
+            p95 = np.percentile(samp[:, plot_chs], 95, axis=0)
+            offset = max(float(np.median(p95 - p5)) * 2.0, 50.0)
+            ytick_pos, ytick_lbl = [], []
+            for pi, ch_i in enumerate(plot_chs):
+                y_off = (n_ch - 1 - pi) * offset
+                ax.plot(t, samp[:, ch_i] + y_off, linewidth=0.4,
+                        color=_get_ch_color(ch_i))
+                ytick_pos.append(y_off)
+                ytick_lbl.append(_CH_NAMES[ch_i])
+            ax.set_yticks(ytick_pos)
+            ax.set_yticklabels(ytick_lbl, fontsize=5, color=FG_DIM)
+            ax.tick_params(axis='x', colors=FG_DIM, labelsize=6)
+            ax.set_xlabel('s', color=FG_DIM, fontsize=8)
+            ax.grid(True, axis='x', color=BG_LIGHT, linewidth=0.3, alpha=0.5)
+            for bt in brk:
+                ax.axvline(bt, color='#f38ba8', linewidth=0.8, alpha=0.8, linestyle='--')
+
+        self._review_canvas.draw_idle()
+
+    def _review_rerender(self):
+        """Re-render when channel/display mode radio changes."""
+        self._review_render()
+
+    def _review_on_scroll(self, event):
+        """Scroll wheel / trackpad pinch — zoom the shared X axis around the cursor."""
+        if event.inaxes is None:
+            return
+        factor = 0.80 if event.button == 'up' else 1.0 / 0.80
+        ax = event.inaxes
+        xmin, xmax = ax.get_xlim()
+        xc = event.xdata if event.xdata is not None else (xmin + xmax) / 2
+        ax.set_xlim(xc + (xmin - xc) * factor,
+                    xc + (xmax - xc) * factor)
+        self._review_canvas.draw_idle()
+
+    def _on_review_click(self, event):
+        """Double-click a subplot in Grid mode to open a single-channel zoom popup."""
+        if not event.dblclick or event.inaxes is None:
+            return
+        ch_i = getattr(self, '_review_ax_map', {}).get(event.inaxes)
+        if ch_i is not None and self._review_dataset is not None:
+            self._open_review_zoom(ch_i)
+
+    def _open_review_zoom(self, ch_i):
+        """Open a resizable popup with a full single-channel waveform + zoom tools."""
+        ds = self._review_dataset
+        if ds is None or 'error' in ds:
+            return
+
+        _CH_MAP = [
+            ["ELEC02","ELEC23","ELEC22","ELEC12","ELEC11","ELEC21","ELEC20","ELEC01",
+             "ELEC00","ELEC10","ELEC03","ELEC13"],
+            ["ELEC26","ELEC16","ELEC25","ELEC15","ELEC24","ELEC05","ELEC04","ELEC14",
+             "ELEC17","ELEC07","ELEC06","ELEC27"],
+            ["ELEC41","ELEC31","ELEC30","ELEC40","ELEC43","ELEC33","ELEC32","ELEC42",
+             "STIM_1","STIM_0","STIM_7","STIM_6"],
+            ["ELEC45","ELEC35","ELEC34","ELEC44","ELEC47","ELEC37","ELEC36","ELEC46",
+             "STIM_3","STIM_2","STIM_5","STIM_4"],
+            ["ELEC71","ELEC50","ELEC60","ELEC70","ELEC62","ELEC52","ELEC51","ELEC61",
+             "ELEC73","ELEC63","ELEC53","ELEC72"],
+            ["ELEC75","ELEC54","ELEC64","ELEC74","ELEC66","ELEC56","ELEC55","ELEC65",
+             "ELEC67","ELEC77","ELEC76","ELEC57"],
+        ]
+        _CH_NAMES = [name for row in _CH_MAP for name in row]
+        name = _CH_NAMES[ch_i]
+
+        # Re-use existing popup for the same channel; replace if different
+        _attr = '_review_zoom_state'
+        existing = getattr(self, _attr, None)
+        if existing is not None:
+            try:
+                if existing.get('ch_i') == ch_i:
+                    existing['win'].lift()
+                    return
+                existing['win'].destroy()
+            except Exception:
+                pass
+        setattr(self, _attr, None)
+
+        win = tk.Toplevel(self.root)
+        win.title(f'Review — {name}')
+        win.configure(bg=BG_DARK)
+        win.geometry('960x420')
+        win.resizable(True, True)
+
+        fig = Figure(figsize=(10, 4), dpi=90, facecolor=BG_DARK)
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        tb_frame = tk.Frame(win, bg=BG_MID)
+        tb_frame.pack(fill=tk.X)
+        ptb = NavigationToolbar2Tk(canvas, tb_frame, pack_toolbar=False)
+        ptb.config(background=BG_MID)
+        for _w in ptb.winfo_children():
+            try:
+                _w.config(background=BG_MID)
+            except Exception:
+                pass
+        ptb.pack(side=tk.LEFT)
+
+        # Scroll zoom for the popup
+        def _pop_scroll(ev):
+            if ev.inaxes is None:
+                return
+            fac = 0.80 if ev.button == 'up' else 1.0 / 0.80
+            a = ev.inaxes
+            x0, x1 = a.get_xlim()
+            xc = ev.xdata if ev.xdata is not None else (x0 + x1) / 2
+            a.set_xlim(xc + (x0 - xc) * fac, xc + (x1 - xc) * fac)
+            canvas.draw_idle()
+        canvas.mpl_connect('scroll_event', _pop_scroll)
+
+        # Channel color
+        col_mode_v = getattr(self, '_review_color_mode', None)
+        color_mode = col_mode_v.get() if col_mode_v else 'spatial'
+        if color_mode == 'spatial':
+            col = self._ch_colors.get(ch_i, '#89b4fa')
+        elif color_mode == 'highcontrast':
+            col = self._ch_colors_hc.get(ch_i, '#89b4fa')
+        else:
+            col = '#89b4fa'
+
+        ax = fig.add_subplot(111)
+        ax.set_facecolor(BG_MID)
+        sp_col = col if color_mode != 'mono' else BG_LIGHT
+        for sp in ax.spines.values():
+            sp.set_edgecolor(sp_col)
+
+        t    = ds['t_plot']
+        samp = ds['samp_plot']
+        brk  = ds.get('break_times', [])
+        ax.plot(t, samp[:, ch_i], color=col, linewidth=0.7)
+        for bt in brk:
+            ax.axvline(bt, color='#f38ba8', linewidth=0.8, alpha=0.7, linestyle='--')
+        ax.tick_params(colors=FG_DIM, labelsize=7)
+        ax.set_xlabel('Time (s)', color=FG_DIM, fontsize=8)
+        ax.set_ylabel('µV', color=FG_DIM, fontsize=8)
+        ax.set_title(name, color=col, fontsize=10)
+        ax.grid(True, color=BG_LIGHT, linewidth=0.3, alpha=0.5)
+        fig.subplots_adjust(left=0.07, right=0.99, top=0.93, bottom=0.12)
+        canvas.draw_idle()
+
+        n_f = ds['n_files']
+        info_txt = (f'{name}   {len(t):,} plot points   '
+                    f'{ds["dur_s"]:.1f}s   {ds["fps"]:.0f} FPS   {n_f} file(s)')
+        tk.Label(win, text=info_txt, bg=BG_DARK, fg=FG_DIM,
+                 font=('Consolas', 7), anchor=tk.W).pack(fill=tk.X, padx=6, pady=(0, 2))
+
+        state = {'ch_i': ch_i, 'win': win}
+        setattr(self, _attr, state)
+        win.bind('<Escape>', lambda _e: win.destroy())
+        win.protocol('WM_DELETE_WINDOW',
+                     lambda: (win.destroy(), setattr(self, _attr, None)))
+
+    def _review_on_img_select(self, _event=None):
+        sel = self._review_img_lb.curselection()
+        if not sel:
+            return
+        self._review_show_image(sel[0])
+
+    def _review_show_image(self, index):
+        if not self._review_img_files:
+            return
+        index = max(0, min(index, len(self._review_img_files) - 1))
+        self._review_img_index = index
+        path = self._review_img_files[index]
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(path)
+            img.thumbnail((900, 540), Image.LANCZOS)
+            self._review_photo = ImageTk.PhotoImage(img)
+            self._review_img_label.config(image=self._review_photo, text='',
+                                          width=img.width, height=img.height)
+        except Exception as e:
+            self._review_img_label.config(image='', text=f'Error loading image: {e}')
+        fname   = os.path.basename(path)
+        size_kb = os.path.getsize(path) / 1024
+        self._review_img_name_var.set(
+            f'{index + 1} / {len(self._review_img_files)}   {fname}   ({size_kb:.0f} KB)')
+        self._review_img_lb.selection_clear(0, tk.END)
+        self._review_img_lb.selection_set(index)
+        self._review_img_lb.see(index)
+
+    def _review_img_prev(self):
+        self._review_show_image(self._review_img_index - 1)
+
+    def _review_img_next(self):
+        self._review_show_image(self._review_img_index + 1)
+
     # ---- Self-Test tab ---------------------------------------------------
 
     def _build_selftest_tab(self, parent):
@@ -4754,6 +5528,26 @@ class MushIOGUI:
                                         wraplength=700, justify=tk.LEFT)
         self._fw_status_lbl.pack(anchor=tk.W, pady=4)
 
+        # ---- OTA Firmware Update ---------------------------------------------
+        ota_frame = ttk.LabelFrame(pad, text="OTA Firmware Update  (wireless)",
+                                   padding=8)
+        ota_frame.pack(fill=tk.X, padx=12, pady=(4, 4))
+
+        ota_row = tk.Frame(ota_frame, bg=BG_DARK)
+        ota_row.pack(fill=tk.X, pady=2)
+        tk.Button(ota_row, text="  OTA Flash...  ",
+                  bg='#1a2a0a', fg=GREEN,
+                  activebackground=GREEN, activeforeground=BG_DARK,
+                  font=('Consolas', 10, 'bold'), pady=6, relief=tk.FLAT,
+                  command=self._ota_flash).pack(side=tk.LEFT, padx=2)
+        tk.Label(ota_row,
+                 text="Browse for .uf2, send to Pico over WiFi (TCP port 9002)",
+                 bg=BG_DARK, fg=FG_DIMMER, font=_FLd).pack(side=tk.LEFT, padx=8)
+
+        tk.Label(ota_frame, textvariable=self._ota_status_var,
+                 bg=BG_DARK, fg=FG_DIM, font=('Consolas', 9), anchor=tk.W
+                 ).pack(fill=tk.X, pady=1)
+
         # ---- Serial Monitor ----------------------------------------------
         sm_frame = ttk.LabelFrame(pad,
             text="Pico Serial Monitor  (USB)",
@@ -4902,12 +5696,16 @@ class MushIOGUI:
                 btn.config(bg=BG_LIGHT, fg=FG_DIM, font=('Consolas', 7))
                 ax = self._grid_axes.get(flat)
                 if ax is not None:
-                    if mode == 'spatial':
+                    if mode == 'highcontrast':
+                        # Outline always shows the channel's HC colour so every
+                        # cell is identifiable; only the waveform goes grey.
+                        sp_col = self._ch_colors_hc.get(flat, BG_LIGHT)
+                        sp_lw  = 0.8
+                    else:  # spatial
                         sp_col = self._ch_colors.get(flat, BG_LIGHT)
-                    else:
-                        sp_col = BG_LIGHT
+                        sp_lw  = 0.4
                     for sp in ax.spines.values():
-                        sp.set_color(sp_col); sp.set_linewidth(0.4)
+                        sp.set_color(sp_col); sp.set_linewidth(sp_lw)
                     needs_draw = True
         if needs_draw and hasattr(self, '_grid_canvas') and self._grid_canvas:
             self._grid_canvas.draw_idle()
@@ -5126,12 +5924,12 @@ class MushIOGUI:
         ts  = self._receiver.timestamps
         fps = ASSUMED_FPS
         if len(ts) >= 20:
-            ts_sub = list(ts)[-500:]
-            dt_us  = ts_sub[-1] - ts_sub[0]
-            if dt_us < 0:           # uint32 wraparound at ~71 min
+            n      = min(len(ts), 500)
+            dt_us  = ts[-1] - ts[-n]   # O(1) deque end; avoids full list copy
+            if dt_us < 0:              # uint32 wraparound at ~71 min
                 dt_us += 2**32
             if dt_us > 0:
-                fps = max(1.0, (len(ts_sub) - 1) / (dt_us * 1e-6))
+                fps = max(1.0, (n - 1) / (dt_us * 1e-6))
         # Snap fps to nearest 5 Hz so n_samp is stable across minor timing jitter.
         # Prevents FFT window from changing by 1-10 samples each render frame,
         # which would otherwise cause the leakage pattern to oscillate.
@@ -5171,14 +5969,9 @@ class MushIOGUI:
         return max(25.0, round(nyq / 25) * 25)
 
     @staticmethod
-    def _smart_uv_label(ylim):
-        """Return 'µV', 'mV', or 'V' depending on the y-axis range (in µV).
-        Only changes the label text — data values are never rescaled."""
-        abs_max = max(abs(ylim[0]), abs(ylim[1]))
-        if abs_max >= 1_000_000:
-            return 'V'
-        if abs_max >= 1_000:
-            return 'mV'
+    def _smart_uv_label(ylim=None):
+        """Always return 'µV' — data values are in µV on every axis.
+        Accepts (and ignores) *ylim* so existing call-sites need no change."""
         return 'µV'
 
     # ---- grid ------------------------------------------------------------
@@ -5187,10 +5980,23 @@ class MushIOGUI:
         self._update_grid()
 
     def _update_grid(self):
-        interval = 1000 // GRID_FPS
-        if self._active_tab != 'grid' or not (self._receiver and self._receiver.connected):
-            self.root.after(interval, self._update_grid)
+        # Skip render if wrong tab or no receiver at all.
+        # Do NOT gate on .connected — keep rendering buffered data during
+        # brief TCP reconnects (≈1 s gap) so the display doesn't blank.
+        if self._active_tab != 'grid' or not self._receiver:
+            self.root.after(1000 // GRID_FPS, self._update_grid)
             return
+        # If we've never received any data, pause render to avoid empty draw.
+        if self._receiver.last_frame_time == 0.0:
+            self.root.after(1000 // GRID_FPS, self._update_grid)
+            return
+
+        # Scale interval by selected channel count — many channels take longer to draw.
+        n_sel = len(self._selected_elec)
+        interval = 1000 // GRID_FPS if n_sel <= 32 else 1000 // max(8, GRID_FPS // 2)
+
+        # Schedule BEFORE render so exceptions can never kill the loop.
+        self.root.after(interval, self._update_grid)
 
         win_secs   = self._display_secs.get()
         fft_mode   = self._fft_mode.get()
@@ -5201,6 +6007,16 @@ class MushIOGUI:
 
         self._autoscale_ctr = (self._autoscale_ctr + 1) % 5
         do_auto = auto_sc and (self._autoscale_ctr == 0)
+
+        # Hoist per-frame constants and Tk var reads outside the 64-channel loop.
+        # Each .get() call enters the Tcl interpreter; reading 64× per frame wastes time.
+        bp_on    = self._bp_enabled.get()
+        bp_low   = self._bp_low.get()
+        bp_high  = self._bp_high.get()
+        bp_order = self._bp_order_var.get()
+        _cmode   = self._grid_color_mode.get()
+        _CLIP    = int(FS * 0.97)   # 97% of full scale = ADC saturation (constant)
+        _n_fft   = self._get_n_fft(fps_stable) if fft_mode else 0  # hoist out of 64-ch loop
 
         # -- Electrode subplots --
         for row in range(8):
@@ -5213,16 +6029,20 @@ class MushIOGUI:
                 if line is None: continue
 
                 # Time-domain display uses the screen window (n_samp).
-                # FFT uses a larger buffer window (_get_n_fft) so df is small
+                # FFT uses a larger buffer window (_n_fft) so df is small
                 # enough to place every signal frequency on an exact FFT bin,
                 # eliminating the "two-state" spectral-leakage oscillation.
                 raw = self._receiver.get_channel(flat, n_samp)
 
+                # Convert raw deque → numpy int32 once; reuse for clip detection
+                # and (in time mode) for the displayed waveform.
+                arr_int = np.array(raw, dtype=np.int32)
+
                 # Clipping detection: if raw signal saturates ADC AND bandpass is on,
                 # the filtered trace looks clean but DC clipping is hidden — warn user.
-                bp_on      = self._bp_enabled.get()
-                CLIP_THR   = int(FS * 0.97)   # 97 % of full scale = saturation
-                is_clipping = bool(raw) and max(abs(v) for v in raw) >= CLIP_THR
+                # Use numpy max — avoids a 2500-iteration pure-Python loop × 64 channels.
+                is_clipping = (arr_int.size > 0 and
+                               int(np.max(np.abs(arr_int))) >= _CLIP)
                 clip_txt    = self._clip_texts.get(flat)
                 if clip_txt is not None:
                     if is_clipping and bp_on:
@@ -5231,27 +6051,20 @@ class MushIOGUI:
                         clip_txt.set_visible(False)
 
                 if fft_mode:
-                    raw_fft = self._receiver.get_channel(flat,
-                                                         self._get_n_fft(fps_stable))
+                    raw_fft = self._receiver.get_channel(flat, _n_fft)
                     arr = np.array(raw_fft, dtype=float) / FS * VREF / total_gain * 1e6
                 else:
-                    arr = np.array(raw, dtype=float) / FS * VREF / total_gain * 1e6
+                    arr = arr_int.astype(float) / FS * VREF / total_gain * 1e6
 
                 if bp_on:
-                    arr = bandpass_filter(arr, self._bp_low.get(),
-                                         self._bp_high.get(), fps_stable,
-                                         self._bp_order_var.get())
+                    arr = bandpass_filter(arr, bp_low, bp_high, fps_stable, bp_order)
 
                 is_sel = flat in self._selected_elec
-                _cmode = self._grid_color_mode.get()
                 if _cmode == 'highcontrast':
-                    # High-contrast: selected channels get vivid COLORS palette,
-                    # unselected channels dim to FG_DIMMER (original behaviour)
                     color = COLORS[(col*8+row) % len(COLORS)] if is_sel else FG_DIMMER
                 else:
-                    # Spatial: channel colour is always the spatial hue — selection
-                    # is indicated only by linewidth, so the colour wheel stays visible
-                    color = self._ch_colors.get(flat, FG_DIMMER)
+                    # Spatial: show spatial hue when selected, grey when not
+                    color = self._ch_colors.get(flat, FG_DIMMER) if is_sel else FG_DIMMER
                 lw = 0.9 if is_sel else 0.4
 
                 if fft_mode:
@@ -5314,7 +6127,6 @@ class MushIOGUI:
                     ax.set_ylim(mn - pad, mx + pad)
 
         self._grid_canvas.draw_idle()
-        self.root.after(interval, self._update_grid)
 
     # ---- overlay ---------------------------------------------------------
 
@@ -5322,10 +6134,32 @@ class MushIOGUI:
         self._update_overlay()
 
     def _update_overlay(self):
-        interval  = 1000 // OVERLAY_FPS
-        if self._active_tab != 'overlay':
-            self.root.after(interval, self._update_overlay)
+        # Guard: axes not yet built or briefly cleared by _rebuild_overlay_axes
+        if not self._overlay_axes or self._stim_overlay_ax is None:
+            self.root.after(40, self._update_overlay)
             return
+
+        if self._active_tab != 'overlay':
+            self.root.after(40, self._update_overlay)
+            return
+
+        # Guard: receiver not initialised yet
+        if not self._receiver:
+            self.root.after(40, self._update_overlay)
+            return
+
+        # Scale interval by channel count — many channels take longer to draw.
+        # Prevents the main thread from being fully saturated at 25 FPS.
+        n_ch_total = len(self._selected_elec)
+        if n_ch_total <= 16:
+            interval = 1000 // OVERLAY_FPS   # ~40 ms default
+        elif n_ch_total <= 32:
+            interval = 60                    # ~17 FPS
+        else:
+            interval = 100                   # 10 FPS for dense channel sets
+
+        # Schedule BEFORE render so exceptions can never kill the loop.
+        self.root.after(interval, self._update_overlay)
 
         elec_ch    = sorted(self._selected_elec)
         n_panels   = self._overlay_panels.get()
@@ -5335,8 +6169,28 @@ class MushIOGUI:
         offset     = 0          # Overlay: channels always overlap (offset=0)
         win_secs   = self._display_secs.get()
         connected  = self._receiver and self._receiver.connected
+        # Show buffered data during brief TCP reconnects (≈1 s gap).
+        # Only blank after 5 s of no data or if we've never connected.
+        _has_data  = (self._receiver and self._receiver.last_frame_time > 0.0 and
+                      time.time() - self._receiver.last_frame_time < 5.0)
         total_gain = self._pga_gain.get() * GAIN
         fps_est, fps_stable, n_samp = self._get_fps_nsamp(win_secs)
+
+        # Remove previous frame's per-frame artists — replaces ax.cla() per render.
+        # Axis base style (facecolor, tick colours, spine colours) is set once in
+        # _rebuild_overlay_axes and persists; only data artists need clearing.
+        for _a in self._overlay_prev_artists:
+            try:
+                _a.remove()
+            except Exception:
+                pass
+        self._overlay_prev_artists.clear()
+
+        # Hoist Tk var reads outside every loop — each .get() enters the Tcl interpreter.
+        bp_on    = self._bp_enabled.get()
+        bp_low   = self._bp_low.get()
+        bp_high  = self._bp_high.get()
+        bp_order = self._bp_order_var.get()
 
         # Distribute electrode channels across panels
         n_ch = len(elec_ch)
@@ -5348,25 +6202,29 @@ class MushIOGUI:
 
         # -- Electrode panels --
         for p_idx, (ax, ch_list) in enumerate(zip(self._overlay_axes, panel_channels)):
-            ax.cla()
-            ax.set_facecolor(BG_MID)
-            ax.tick_params(colors=FG_DIMMER, labelsize=7)
-            for sp in ax.spines.values():
-                sp.set_color(BG_LIGHT); sp.set_linewidth(0.6)
-
-            if not connected:
-                ax.text(0.5, 0.5, 'Waiting for Pico connection',
+            # Axis base style set once at _rebuild_overlay_axes — not re-applied each frame.
+            if not connected and not _has_data:
+                _t = ax.text(0.5, 0.5, 'Waiting for Pico connection',
                         transform=ax.transAxes, ha='center', va='center',
                         color=FG_DIM, fontsize=9)
+                self._overlay_prev_artists.append(_t)
                 continue
+            if not connected and _has_data:
+                # Briefly reconnecting — show buffered data with indicator
+                _t = ax.text(0.01, 0.99, 'Reconnecting...',
+                        transform=ax.transAxes, ha='left', va='top',
+                        color=FG_DIM, fontsize=7)
+                self._overlay_prev_artists.append(_t)
             if not ch_list:
-                ax.text(0.5, 0.5, 'No channels selected\n(use electrode grid)',
+                _t = ax.text(0.5, 0.5, 'No channels selected\n(use electrode grid)',
                         transform=ax.transAxes, ha='center', va='center',
                         color=FG_DIM, fontsize=9, multialignment='center')
+                self._overlay_prev_artists.append(_t)
                 continue
 
             ch_medians = []   # per-channel median (uV), for robust center
             ch_mads    = []   # per-channel MAD (uV), for robust range
+            ch_fft_max = 0.0  # track FFT peak for auto-scale (replaces ax.cla auto-range)
             _n_fft = self._get_n_fft(fps_stable)
             for ch_i, flat in enumerate(ch_list):
                 # FFT: use larger buffer (10 s) → df = 0.1 Hz → exact bins.
@@ -5374,20 +6232,16 @@ class MushIOGUI:
                 raw = self._receiver.get_channel(
                     flat, _n_fft if fft_mode else n_samp)
                 arr = np.array(raw, dtype=float) / FS * VREF / total_gain * 1e6  # uV
-                if self._bp_enabled.get():
-                    arr = bandpass_filter(arr, self._bp_low.get(),
-                                         self._bp_high.get(), fps_stable,
-                                         self._bp_order_var.get())
+                if bp_on:
+                    arr = bandpass_filter(arr, bp_low, bp_high, fps_stable, bp_order)
                 color = COLORS[ch_i % len(COLORS)]
                 label = ALL_NAMES[flat]
                 if fft_mode:
                     freq, mag = compute_fft(arr, fps_stable)
                     shifted = mag + ch_i * abs(offset)
-                    ax.plot(freq, shifted, color=color, linewidth=0.8, label=label)
-                    ax.set_xlabel('Frequency (Hz)', fontsize=7, color=FG_DIM)
-                    ax.set_ylabel(f'Amplitude ({self._smart_uv_label(ax.get_ylim())})',
-                                  fontsize=7, color=FG_DIM)
-                    ax.set_xlim(0, self._fft_xlim(fps_stable))
+                    _ln, = ax.plot(freq, shifted, color=color, linewidth=0.8, label=label)
+                    self._overlay_prev_artists.append(_ln)
+                    ch_fft_max = max(ch_fft_max, float(shifted.max()) if shifted.size else 0.0)
                 else:
                     med = float(np.median(arr))
                     # When auto-scaling, mean-centre each trace so large DC
@@ -5398,44 +6252,65 @@ class MushIOGUI:
                     win_actual = len(arr) / fps_stable if fps_stable > 0 else win_secs
                     t_disp   = np.linspace(-win_actual, 0, len(arr_disp))
                     shifted = arr_disp + ch_i * offset
-                    ax.plot(t_disp, shifted, color=color, linewidth=0.8, label=label)
-                    ax.set_xlabel('Time (s)', fontsize=7, color=FG_DIM)
-                    _lbl = self._smart_uv_label(ax.get_ylim())
-                    ax.set_ylabel(f'{_lbl} (AC)' if auto_sc else _lbl,
-                                  fontsize=7, color=FG_DIM)
-                    ax.set_xlim(-win_secs, 0)
+                    _ln, = ax.plot(t_disp, shifted, color=color, linewidth=0.8, label=label)
+                    self._overlay_prev_artists.append(_ln)
                     arr_ac = arr - med   # AC component for scale regardless of mode
                     mad = float(np.median(np.abs(arr_ac))) * 1.4826
                     ch_medians.append(0.0 if auto_sc else med)
                     ch_mads.append(mad)
-                ax.tick_params(colors=FG_DIMMER, labelsize=7)
 
-            # Y-axis scaling (offset=0 in overlay, so no stacking contribution)
+            # Axis labels / limits — set once per panel, not per channel.
+            if fft_mode:
+                ax.set_xlabel('Frequency (Hz)', fontsize=7, color=FG_DIM)
+                ax.set_ylabel(f'Amplitude ({self._smart_uv_label(ax.get_ylim())})',
+                              fontsize=7, color=FG_DIM)
+                ax.set_xlim(0, self._fft_xlim(fps_stable))
+            else:
+                ax.set_xlabel('Time (s)', fontsize=7, color=FG_DIM)
+                _lbl = self._smart_uv_label(ax.get_ylim())
+                ax.set_ylabel(f'{_lbl} (AC)' if auto_sc else _lbl,
+                              fontsize=7, color=FG_DIM)
+                ax.set_xlim(-win_secs, 0)
+
+            # Y-axis scaling (offset=0 in overlay, so no stacking contribution).
+            # Must be explicit every frame — without ax.cla() limits persist and
+            # never tighten on their own.
             if not auto_sc:
                 ax.set_ylim(0 if fft_mode else -uv_half, uv_half)
-            elif ch_medians and not fft_mode:
+            elif fft_mode:
+                ax.set_ylim(0, max(ch_fft_max * 1.2, 1.0))
+            elif ch_medians:
                 # MAD auto-scale: channels are mean-centred, so center≈0.
                 # median(ch_mads)*4 gives ~4σ headroom; floor at 10 µV.
                 span = max(float(np.median(ch_mads)) * 4.0, 10.0)
                 ax.set_ylim(-span, span)
 
             if ch_list:
-                ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1.0),
-                          borderaxespad=0, fontsize=6, ncol=1,
-                          facecolor=BG_LIGHT, edgecolor=BG_LIGHT,
-                          labelcolor=FG_MAIN, framealpha=0.85, handlelength=1.2)
+                if len(ch_list) <= 12:
+                    # Full per-channel legend outside axes
+                    _leg = ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1.0),
+                              borderaxespad=0, fontsize=6, ncol=1,
+                              facecolor=BG_LIGHT, edgecolor=BG_LIGHT,
+                              labelcolor=FG_MAIN, framealpha=0.85, handlelength=1.2)
+                    self._overlay_prev_artists.append(_leg)
+                else:
+                    # Too many channels for legend — show count to keep render fast
+                    _t = ax.text(1.02, 0.99, f'{len(ch_list)} ch',
+                            transform=ax.transAxes, ha='left', va='top',
+                            fontsize=7, color=FG_DIM)
+                    self._overlay_prev_artists.append(_t)
 
         # -- STIM panel (only visible when at least one STIM channel is active) --
         any_stim_active = any(
             self._stim_ch_configs.get(f, {}).get('type', 'Off') != 'Off'
             for _, f in STIM_BY_NAME)
         stim_ax = self._stim_overlay_ax
-        stim_ax.cla()
+        # No stim_ax.cla() — per-frame artists removed above via _overlay_prev_artists.
         if any_stim_active:
             stim_ax.set_facecolor(STIM_BG)
             stim_ax.tick_params(colors=ORANGE, labelsize=7)
             for sp in stim_ax.spines.values():
-                sp.set_color(ORANGE); sp.set_linewidth(0.9)
+                sp.set_color(ORANGE); sp.set_linewidth(0.9); sp.set_visible(True)
             stim_ax.set_title("STIM Monitor  (uA)", color=ORANGE, fontsize=7, pad=2)
 
             for i, (name, flat) in enumerate(STIM_BY_NAME):
@@ -5446,30 +6321,37 @@ class MushIOGUI:
                 color = COLORS[i % len(COLORS)]
                 if fft_mode:
                     freq, mag = compute_fft(arr, fps_stable)
-                    stim_ax.plot(freq, mag, color=color, linewidth=0.8, label=name)
-                    stim_ax.set_xlim(0, self._fft_xlim(fps_stable))
-                    stim_ax.set_xlabel('Frequency (Hz)', fontsize=7, color=ORANGE)
+                    _ln, = stim_ax.plot(freq, mag, color=color, linewidth=0.8, label=name)
+                    self._overlay_prev_artists.append(_ln)
                 else:
-                    stim_ax.plot(t_prog, arr, color=color, linewidth=0.8, label=name)
-                    stim_ax.set_xlim(-win_secs, 0)
-                    stim_ax.set_xlabel('Time (s)', fontsize=7, color=ORANGE)
+                    _ln, = stim_ax.plot(t_prog, arr, color=color, linewidth=0.8, label=name)
+                    self._overlay_prev_artists.append(_ln)
+            # Axis labels / limits — set once after the STIM loop, not per channel.
+            if fft_mode:
+                stim_ax.set_xlim(0, self._fft_xlim(fps_stable))
+                stim_ax.set_xlabel('Frequency (Hz)', fontsize=7, color=ORANGE)
+            else:
+                stim_ax.set_xlim(-win_secs, 0)
+                stim_ax.set_xlabel('Time (s)', fontsize=7, color=ORANGE)
             stim_ax.set_ylabel('uA', fontsize=9, color=ORANGE)
-            stim_ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1.0),
+            _leg = stim_ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1.0),
                            borderaxespad=0, fontsize=6, ncol=1,
                            facecolor=STIM_BG, edgecolor=ORANGE,
                            labelcolor=FG_MAIN, framealpha=0.85, handlelength=1.2)
+            self._overlay_prev_artists.append(_leg)
         else:
             stim_ax.set_facecolor(BG_MID)
+            stim_ax.set_title("", pad=2)   # clear title when transitioning from active
             stim_ax.tick_params(left=False, bottom=False,
                                 labelleft=False, labelbottom=False)
             for sp in stim_ax.spines.values():
                 sp.set_visible(False)
-            stim_ax.text(0.5, 0.5, 'No STIM channels active',
+            _t = stim_ax.text(0.5, 0.5, 'No STIM channels active',
                          transform=stim_ax.transAxes,
                          ha='center', va='center', fontsize=8, color=FG_DIMMER)
+            self._overlay_prev_artists.append(_t)
 
         self._overlay_canvas.draw_idle()
-        self.root.after(interval, self._update_overlay)
 
     # ---- waterfall -------------------------------------------------------
 
@@ -5494,65 +6376,91 @@ class MushIOGUI:
         win_secs   = self._display_secs.get()
         connected  = self._receiver and self._receiver.connected
         total_gain = self._pga_gain.get() * GAIN
+
+        # Guard: receiver not yet initialised — _get_fps_nsamp would crash.
+        if not self._receiver:
+            self.root.after(interval, self._update_waterfall)
+            return
         fps_est, fps_stable, n_samp = self._get_fps_nsamp(win_secs)
 
-        ax.cla()
-        ax.set_facecolor(BG_MID)
-        ax.tick_params(colors=FG_DIMMER, labelsize=7)
-        for sp in ax.spines.values():
-            sp.set_color(BG_LIGHT); sp.set_linewidth(0.6)
+        # Remove previous frame's per-frame artists — replaces ax.cla() per render.
+        # Axis base style (facecolor, tick colours, spine colours) is set once in
+        # _rebuild_waterfall_axes and persists; only data artists need clearing.
+        for _a in self._wf_prev_artists:
+            try:
+                _a.remove()
+            except Exception:
+                pass
+        self._wf_prev_artists.clear()
+        # Reset y-tick locator to auto in case per-channel labels were set last frame.
+        ax.yaxis.set_major_locator(mticker.AutoLocator())
+        ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
 
         if not connected:
-            ax.text(0.5, 0.5, 'Waiting for Pico connection',
+            _t = ax.text(0.5, 0.5, 'Waiting for Pico connection',
                     transform=ax.transAxes, ha='center', va='center',
                     color=FG_DIM, fontsize=11)
+            self._wf_prev_artists.append(_t)
             self._wf_canvas.draw_idle()
             self.root.after(interval, self._update_waterfall)
             return
         if not elec_ch:
-            ax.text(0.5, 0.5, 'No channels selected\n(click electrodes in Grid Layout)',
+            _t = ax.text(0.5, 0.5, 'No channels selected\n(click electrodes in Grid Layout)',
                     transform=ax.transAxes, ha='center', va='center',
                     color=FG_DIM, fontsize=11, multialignment='center')
+            self._wf_prev_artists.append(_t)
             self._wf_canvas.draw_idle()
             self.root.after(interval, self._update_waterfall)
             return
 
-        ch_mads = []
+        ch_mads    = []
+        ch_fft_max = 0.0   # track FFT peak for auto-scale (replaces ax.cla auto-range)
+        bp_on    = self._bp_enabled.get()
+        bp_low   = self._bp_low.get()
+        bp_high  = self._bp_high.get()
+        bp_order = self._bp_order_var.get()
 
         _n_fft = self._get_n_fft(fps_stable)
         for ch_i, flat in enumerate(elec_ch):
             raw = self._receiver.get_channel(
                 flat, _n_fft if fft_mode else n_samp)
             arr = np.array(raw, dtype=float) / FS * VREF / total_gain * 1e6
-            if self._bp_enabled.get():
-                arr = bandpass_filter(arr, self._bp_low.get(),
-                                      self._bp_high.get(), fps_stable,
-                                      self._bp_order_var.get())
+            if bp_on:
+                arr = bandpass_filter(arr, bp_low, bp_high, fps_stable, bp_order)
             color = COLORS[ch_i % len(COLORS)]
             med   = float(np.median(arr))
             if fft_mode:
                 freq, mag = compute_fft(arr, fps_stable)
                 shifted = mag + ch_i * abs(offset)
-                ax.plot(freq, shifted, color=color, linewidth=0.8,
+                _ln, = ax.plot(freq, shifted, color=color, linewidth=0.8,
                         label=ALL_NAMES[flat])
+                self._wf_prev_artists.append(_ln)
+                ch_fft_max = max(ch_fft_max, float(shifted.max()) if shifted.size else 0.0)
             else:
                 # Always mean-centre so offset controls visual separation only
                 arr_dec  = display_decimate(arr - med)
                 win_actual = len(arr) / fps_stable if fps_stable > 0 else win_secs
                 t_dec    = np.linspace(-win_actual, 0, len(arr_dec))
                 shifted  = arr_dec + ch_i * offset
-                ax.plot(t_dec, shifted, color=color, linewidth=0.8)
+                _ln, = ax.plot(t_dec, shifted, color=color, linewidth=0.8)
+                self._wf_prev_artists.append(_ln)
                 arr_ac = arr - med
                 ch_mads.append(float(np.median(np.abs(arr_ac))) * 1.4826)
 
         if fft_mode:
+            ax.set_xlim(0, self._fft_xlim(fps_stable))
+            # Y-limits must be explicit — without ax.cla() they persist and never tighten.
+            if not auto_sc:
+                ax.set_ylim(0, uv_half)
+            else:
+                ax.set_ylim(0, max(ch_fft_max * 1.2, 1.0))
             ax.set_xlabel('Frequency (Hz)', fontsize=8, color=FG_DIM)
             ax.set_ylabel(f'Amplitude ({self._smart_uv_label(ax.get_ylim())})',
                           fontsize=8, color=FG_DIM)
-            ax.set_xlim(0, self._fft_xlim(fps_stable))
-            ax.legend(loc='upper right', fontsize=6, ncol=2,
+            _leg = ax.legend(loc='upper right', fontsize=6, ncol=2,
                       facecolor=BG_LIGHT, edgecolor=BG_LIGHT,
                       labelcolor=FG_MAIN, framealpha=0.85, handlelength=1.2)
+            self._wf_prev_artists.append(_leg)
         else:
             ax.set_xlabel('Time (s)', fontsize=8, color=FG_DIM)
             ax.set_ylabel(f'{self._smart_uv_label(ax.get_ylim())} (AC)',
@@ -5580,11 +6488,13 @@ class MushIOGUI:
             # Per-channel amplitude scale bar — vertical line ± half µV
             # anchored at channel-0 baseline (y=0), left edge of the plot.
             _sb_x = -win_secs + win_secs * 0.015
-            ax.plot([_sb_x, _sb_x], [-half, half],
+            _sb_ln, = ax.plot([_sb_x, _sb_x], [-half, half],
                     color=FG_DIM, lw=2, solid_capstyle='butt', clip_on=True)
+            self._wf_prev_artists.append(_sb_ln)
             _lbl = f'±{half:.0f} µV' if half < 1000 else f'±{half/1000:.1f} mV'
-            ax.text(_sb_x + win_secs * 0.015, 0,
+            _sb_t = ax.text(_sb_x + win_secs * 0.015, 0,
                     _lbl, color=FG_DIM, fontsize=7, va='center', ha='left')
+            self._wf_prev_artists.append(_sb_t)
 
         self._wf_canvas.draw_idle()
         self.root.after(interval, self._update_waterfall)
@@ -5606,6 +6516,10 @@ class MushIOGUI:
         fps_est, fps_stable, n_samp = self._get_fps_nsamp(win_secs)
         total_gain = self._pga_gain.get() * GAIN
         heat       = np.zeros((10, 10))
+        # Hoist bp var reads outside the 64-channel nested loop.
+        bp_low     = self._bp_low.get()
+        bp_high    = self._bp_high.get()
+        bp_order   = self._bp_order_var.get()
 
         for row in range(8):
             for col in range(8):
@@ -5617,9 +6531,7 @@ class MushIOGUI:
                 if metric == "RMS":
                     heat[row+1, col+1] = float(np.sqrt(np.mean(arr**2)))
                 elif metric == "Bandpass-RMS":
-                    filt = bandpass_filter(arr, self._bp_low.get(),
-                                          self._bp_high.get(), fps_stable,
-                                          self._bp_order_var.get())
+                    filt = bandpass_filter(arr, bp_low, bp_high, fps_stable, bp_order)
                     heat[row+1, col+1] = float(np.sqrt(np.mean(filt**2)))
                 elif metric == "Peak":
                     heat[row+1, col+1] = float(np.max(np.abs(arr)))
@@ -5669,12 +6581,45 @@ class MushIOGUI:
         # ASSUMED_FPS is no longer used here; buf_size is rate-agnostic.
         buf_size = int(BUFFER_SECS * 1000)
         self._receiver = DataReceiver(self.data_port, buf_size)
+        # Recovery ring-files live next to gui.py so they never pollute the
+        # user's data directory and are found automatically on restart.
+        _rec_dir = os.path.dirname(os.path.abspath(__file__))
+        self._receiver._rec_path_a = os.path.join(_rec_dir, 'mushio_recovery_a.bin')
+        self._receiver._rec_path_b = os.path.join(_rec_dir, 'mushio_recovery_b.bin')
+        # Preload recovery data in a background thread so it never delays startup.
+        # start_recovery_writer() is called AFTER preload completes to avoid a
+        # race where the writer truncates a file the reader is still scanning.
+        # _write_recovery_frame() safely no-ops while _rec_file is None.
+        def _bg_preload():
+            n = self._receiver.preload_from_recovery()
+            if n:
+                print(f"[GUI] Recovery preload: {n:,} frames restored to display buffers")
+            self._receiver.start_recovery_writer(_rec_dir)
+        threading.Thread(target=_bg_preload, daemon=True).start()
         self._receiver.start()
 
     def _start_cmd_client(self):
         self._cmd_client = CommandClient(
             self.cmd_host or '', self.cmd_port, self._cmd_rx_q)
         self._cmd_client.start()
+
+    def _on_pico_selected(self, event=None):
+        """Handle user picking a Pico from the discovery dropdown."""
+        raw = self._cmd_host_var.get().strip()
+        ip  = raw.split()[0] if raw else ''
+        if not ip:
+            return
+        # Set the var to just the IP (strip the display suffix)
+        self._cmd_host_var.set(ip)
+        # Auto-fill port from that Pico's beacon data if available
+        if hasattr(self, '_beacon'):
+            entry = self._beacon.discovered.get(ip)
+            if entry:
+                cmd_port = entry['info'].get('cmd', '')
+                if cmd_port:
+                    self._cmd_port_var.set(cmd_port)
+        # Connect immediately
+        self._connect_cmd()
 
     def _connect_cmd(self):
         if self._demo_mode:
@@ -5687,6 +6632,8 @@ class MushIOGUI:
             self._cmd_status_lbl.config(text="Not connected")
             return
         host = self._cmd_host_var.get().strip()
+        # Strip any display suffix (e.g. "192.168.1.42  (up 2m)")
+        host = host.split()[0] if host else ''
         try:
             port = int(self._cmd_port_var.get())
         except ValueError:
@@ -5766,11 +6713,12 @@ class MushIOGUI:
                     f" ({self._webcam.capture_count} total)")
         self.root.after(4000, self._poll_webcam)
 
-    def _cam_grab_frame(self):
+    def _cam_grab_frame(self, cam_idx=0):
         """Return a PIL Image from the camera, or None on failure.
 
-        In demo mode a synthetic image is generated with PIL so no real
-        camera or opencv install is required.
+        cam_idx must be read from the Tk IntVar on the MAIN thread before
+        calling this — it is safe to call from a background thread with the
+        pre-captured integer value.
         """
         if self._demo_mode:
             try:
@@ -5794,7 +6742,7 @@ class MushIOGUI:
                 draw.text((10, 10),       "DEMO  |  CAMERA PREVIEW", fill=(255, 140, 0))
                 draw.text((10, 28),       ts,                         fill=(160, 160, 200))
                 draw.text((10, H - 22),
-                          f"MushIO V1.0  |  cam idx {self._cam_idx_var.get()}",
+                          f"MushIO V1.0  |  cam idx {cam_idx}",
                           fill=(70, 70, 100))
                 return img
             except ImportError:
@@ -5804,10 +6752,22 @@ class MushIOGUI:
             return None
         try:
             import cv2
-            cap = cv2.VideoCapture(self._cam_idx_var.get())
-            ok, frame = cap.read()
+            cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                # Retry without DirectShow backend
+                cap = cv2.VideoCapture(cam_idx)
+            if not cap.isOpened():
+                return None
+            # Give the driver time to initialise (auto-exposure, USB enum).
+            time.sleep(0.5)
+            # Discard several warm-up frames; keep the last good one.
+            ok, frame = False, None
+            for _ in range(15):
+                ret, f = cap.read()
+                if ret and f is not None:
+                    ok, frame = True, f
             cap.release()
-            if not ok:
+            if not ok or frame is None:
                 return None
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             from PIL import Image
@@ -5816,23 +6776,28 @@ class MushIOGUI:
             return None
 
     def _cam_take_and_preview(self):
-        """Grab a frame, show it in the left-panel preview, and optionally save it."""
-        img = self._cam_grab_frame()
-        if img is None:
-            self._cam_status_var.set("Camera open failed")
-            return
-        self._cam_update_preview_label(img)
-        # Also save to disk if periodic capture is enabled
-        if self._cam_enable_var.get() and self._webcam:
-            self._webcam.capture_now()
-        self._cam_status_var.set("Image captured")
+        """Grab a frame in a background thread so the Tk main loop is never blocked."""
+        self._cam_status_var.set("Capturing...")
+        # Read Tk vars on main thread — not safe to call .get() from a worker thread.
+        cam_idx   = self._cam_idx_var.get()
+        save_after = self._cam_enable_var.get() and bool(self._webcam)
+        def _worker():
+            img = self._cam_grab_frame(cam_idx)
+            if img is None:
+                self.root.after(0, lambda: self._cam_status_var.set("Camera open failed"))
+                return
+            if save_after:
+                self._webcam.capture_now()
+            self.root.after(0, lambda: self._cam_update_preview_label(img))
+            self.root.after(0, lambda: self._cam_status_var.set("Image captured"))
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _cam_update_preview_label(self, img):
-        """Resize PIL image and push it to all preview label widgets."""
+        """Resize PIL image and push it to all preview label widgets (call from main thread)."""
         if not self._cam_preview_labels:
             return
         try:
-            from PIL import ImageTk
+            from PIL import Image, ImageTk
             target_w = 230
             w, h = img.size
             img_small = img.resize((target_w, int(h * target_w / w)),
@@ -5842,11 +6807,11 @@ class MushIOGUI:
             for lbl in self._cam_preview_labels:
                 try:
                     lbl.config(image=self._cam_preview_photo, text='',
-                               width=target_w, height=img_small.height)
+                               width=img_small.width, height=img_small.height)
                 except tk.TclError:
                     pass   # label destroyed (tab not yet shown, etc.)
         except ImportError:
-            self._cam_status_var.set("pip install Pillow for preview")
+            self._cam_status_var.set("Camera library unavailable")
         except Exception as exc:
             self._cam_status_var.set(f"Preview error: {exc}")
 
@@ -5854,9 +6819,16 @@ class MushIOGUI:
         """Auto-refresh the left-panel preview at the user-specified interval."""
         if (not HAS_CV2 and not HAS_PIL) or not self._cam_preview_labels:
             return
-        img = self._cam_grab_frame()
-        if img is not None:
-            self._cam_update_preview_label(img)
+        # Read Tk var here (main thread) before handing off to worker.
+        cam_idx = self._cam_idx_var.get()
+        def _worker():
+            img = self._cam_grab_frame(cam_idx)
+            if img is not None:
+                try:
+                    self.root.after(0, lambda i=img: self._cam_update_preview_label(i))
+                except RuntimeError:
+                    pass   # mainloop not yet running — skip preview update
+        threading.Thread(target=_worker, daemon=True).start()
         # Reschedule (interval in minutes, minimum 1)
         try:
             mins = max(1, self._cam_preview_interval_var.get())
@@ -5967,12 +6939,57 @@ class MushIOGUI:
     # ==========================================================================
 
     def _poll_status(self):
+        if not hasattr(self, '_poll_status_count'):
+            self._poll_status_count = 0
+            self._poll_last_connected = None
+        self._poll_status_count += 1
+
         if self._receiver:
             r = self._receiver
-            dot_color = GREEN if r.connected else FG_DIMMER
+            # Log connection state changes
+            conn_state = r.connected
+            if conn_state != self._poll_last_connected:
+                if conn_state:
+                    print(f"[STATUS] Data stream CONNECTED from {r.client_ip}")
+                else:
+                    print(f"[STATUS] Data stream DISCONNECTED")
+                self._poll_last_connected = conn_state
+            # Periodic heartbeat every 10s (20 polls at 500ms)
+            if self._poll_status_count % 20 == 0:
+                beacon_info = ""
+                if hasattr(self, '_beacon') and self._beacon.pico_ip:
+                    age = time.time() - self._beacon.last_seen
+                    beacon_info = f"  beacon={self._beacon.pico_ip} ({age:.0f}s ago)"
+                cmd_info = ""
+                if hasattr(self, '_cmd_client') and self._cmd_client:
+                    cmd_info = f"  cmd={'connected' if self._cmd_client.connected else 'disconnected'}"
+                print(f"[STATUS] data={'streaming' if r.connected else 'waiting'}  fps={r.fps:.0f}  frames={r.frames_total}{beacon_info}{cmd_info}")
+            if r.connected:
+                data_age = (time.time() - r.last_frame_time
+                            if r.last_frame_time > 0.0 else None)
+                if data_age is not None and data_age > 2.0:
+                    # TCP connected but no frames arriving — show gap duration.
+                    if data_age < 60:
+                        age_str = f"{data_age:.0f}s"
+                    else:
+                        age_str = f"{int(data_age // 60)}m {int(data_age % 60)}s"
+                    dot_color = ORANGE
+                    lbl_text  = f"DATA GAP ({age_str}) — {r.client_ip}"
+                    # Active recovery: if gap persists beyond the socket recv
+                    # timeout (5 s), kill the stuck socket now.  This handles
+                    # the case where the Pico's TCP stack trickles bytes (or
+                    # OS keepalives arrive) preventing the recv() timeout from
+                    # ever firing, while no valid frames are decoded.
+                    if data_age > 5.0:
+                        r.force_disconnect()
+                else:
+                    dot_color = GREEN
+                    lbl_text  = f"Streaming from {r.client_ip}"
+            else:
+                dot_color = FG_DIMMER
+                lbl_text  = "Waiting for Pico..."
             self._data_status_dot.config(fg=dot_color)
-            self._data_status_lbl.config(
-                text=f"Streaming from {r.client_ip}" if r.connected else "Waiting for Pico...")
+            self._data_status_lbl.config(text=lbl_text)
             fps_str = f"{r.fps:.1f}" if r.fps > 0 else "--"
             self._stat_vars['fps'    ].set(f"FPS: {fps_str}")
             self._stat_vars['frames' ].set(f"Frames: {r.frames_total}")
@@ -5980,17 +6997,8 @@ class MushIOGUI:
             self._stat_vars['missed' ].set(f"Missed: {r.missed_session}")
             self._stat_vars['session'].set(f"Session: {r.frames_session}")
 
-            # Auto-start binary logging when a live Pico connects.
-            # This ensures every received frame is written to disk immediately,
-            # protecting data even if the GUI is closed unexpectedly.
-            # Only triggers once per connection event; demo mode is excluded.
-            if r.connected and not self._demo_mode:
-                if not self._auto_log_started:
-                    self._auto_log_started = True
-                    if not self._log_active:
-                        self._start_recording()
-            elif not r.connected:
-                self._auto_log_started  = False  # reset so next connect auto-starts
+            if not r.connected:
+                self._auto_log_started  = False
                 self._cmd_auto_next_try = 0.0    # allow immediate auto-connect on next data link
                 # Clear any streaming pause so next connection starts unpaused
                 if self._stream_paused_var.get():
@@ -6000,28 +7008,76 @@ class MushIOGUI:
                         self._pause_btn.config(text="  Pause Streaming  ",
                                                bg=BG_LIGHT, fg=FG_MAIN)
 
-            # Auto-detect Pico IP from the data connection and wire up CMD channel.
-            # When the Pico connects on port 9000 its source IP is stored in
-            # r.client_ip.  We use that to:
-            #   1. Pre-fill the "Command Pico IP" entry (if the user left it blank)
-            #   2. Auto-connect the CMD client so ping/status/blink-LED just work
+            # ---- Multi-Pico discovery & dropdown refresh ----
             pico_ip = r.client_ip
+            has_beacon = (not self._demo_mode and hasattr(self, '_beacon'))
+
+            # Refresh Pico selector dropdown every ~3 s (6 × 500 ms poll ticks).
+            if has_beacon:
+                self._beacon_combo_ctr = (self._beacon_combo_ctr + 1) % 6
+                if self._beacon_combo_ctr == 0:
+                    active = self._beacon.get_active()
+                    display_vals = []
+                    for ip, info in active:
+                        up_s = info.get('up', '')
+                        if up_s:
+                            try:
+                                secs = int(up_s)
+                                m, s = divmod(secs, 60)
+                                up_str = f"{m}m {s:02d}s" if m else f"{s}s"
+                            except ValueError:
+                                up_str = up_s + 's'
+                        else:
+                            up_str = '?'
+                        fw = info.get('fw', '?')
+                        display_vals.append(f"{ip}  (fw:{fw}  up:{up_str})")
+                    if hasattr(self, '_cmd_host_combo'):
+                        self._cmd_host_combo['values'] = display_vals
+
+            # Auto-detect Pico IP from the data connection.
             if (r.connected and pico_ip and pico_ip != "demo"
+                    and not self._demo_mode):
+                if not self._cmd_host_var.get().strip():
+                    self._cmd_host_var.set(pico_ip)
+
+            # Fallback: use UDP beacon discovery if data stream isn't connected.
+            # Count active Picos to decide auto-connect policy.
+            n_discovered = 0
+            if has_beacon and self._beacon.pico_ip and \
+                    time.time() - self._beacon.last_seen < 10.0:
+                active = self._beacon.get_active()
+                n_discovered = len(active)
+                if n_discovered == 1:
+                    # Single Pico: auto-fill if field is empty (backward compat).
+                    beacon_ip = active[0][0]
+                    if not self._cmd_host_var.get().strip():
+                        self._cmd_host_var.set(beacon_ip)
+                    if not pico_ip or pico_ip == "demo" or not r.connected:
+                        pico_ip = beacon_ip
+                elif n_discovered > 1:
+                    # Multiple Picos: don't auto-fill -- let user pick from dropdown.
+                    # Still provide a pico_ip for auto-connect if user already chose one.
+                    cur = self._cmd_host_var.get().strip().split()[0] if \
+                          self._cmd_host_var.get().strip() else ''
+                    if cur and any(ip == cur for ip, _ in active):
+                        pico_ip = cur
+                    else:
+                        pico_ip = None   # suppress auto-connect until user picks
+
+            # Auto-connect CMD channel if not already connected.
+            if (pico_ip and pico_ip != "demo"
                     and not self._demo_mode
                     and hasattr(self, '_cmd_client') and self._cmd_client
                     and not self._cmd_client.connected
                     and time.time() >= self._cmd_auto_next_try):
-                # Fill field only if the user hasn't typed something already
-                if not self._cmd_host_var.get().strip():
-                    self._cmd_host_var.set(pico_ip)
                 try:
                     cmd_port = int(self._fw_cmd_port.get())
                 except (ValueError, AttributeError):
                     cmd_port = 9001
                 self._cmd_client.set_host(pico_ip, cmd_port)
-                self._cmd_auto_next_try = time.time() + 10.0  # back-off: retry at most every 10 s
+                self._cmd_auto_next_try = time.time() + 10.0
                 self._term_append(
-                    f"[CMD] Auto-detected Pico at {pico_ip} — connecting CMD channel...\n",
+                    f"[CMD] Auto-detected Pico at {pico_ip} -- connecting CMD channel...\n",
                     'info')
 
         self.root.after(500, self._poll_status)
@@ -6035,9 +7091,13 @@ class MushIOGUI:
             self._stop_recording()
         if self._demo_injector: self._demo_injector.stop()
         if self._webcam:        self._webcam.stop()
+        if hasattr(self, '_beacon') and self._beacon:
+            self._beacon.stop()
         if hasattr(self, '_cmd_client') and self._cmd_client:
             self._cmd_client.stop()
-        if self._receiver: self._receiver.stop()
+        if self._receiver:
+            self._receiver.stop_recovery_writer()
+            self._receiver.stop()
         self.root.destroy()
 
 
@@ -6062,7 +7122,11 @@ def main():
                     cmd_host=args.cmd_host,
                     cmd_port=args.cmd_port)
 
-    root.deiconify()  # show complete window all at once
+    root.update_idletasks()  # flush Tk geometry before showing
+    root.deiconify()         # make window visible
+    root.update()            # pump Win32 message queue (WM_PAINT) so all TTK
+                             # widgets and the scrollable left panel render
+                             # completely before the mainloop takes over
 
     if args.demo:
         root.after(200, app._start_demo)

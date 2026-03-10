@@ -12,7 +12,9 @@ build/
 
 # ── Host runtime files ────────────────────────────────────────────────────────
 host/settings.json        # per-machine paths; user generates on first run
+host/mushio_recovery_*.bin  # rolling recovery buffers (regenerated each session)
 data/                     # raw binary recording output (can be very large)
+firmware_c/data/          # firmware-side recorded data
 captures/                 # webcam captures
 
 # ── Firmware C build artefacts ────────────────────────────────────────────────

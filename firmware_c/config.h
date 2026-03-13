@@ -94,14 +94,16 @@
  * S=16 had 0% loss in 2/5 trials and max single-frame gaps otherwise.
  *
  * History is a circular buffer (O(1) insert via write index, no memmove).
- * History buffer: (R-1)×S = 64 entries × 228 B = 14,592 B.
+ * Spacing is runtime-configurable via 'set_spacing' CMD command.
+ * History buffer statically sized for max spacing (29 KB).
  * Bandwidth: 5 × 228 × 500 = 570 KB/s ≈ 4.6 Mbps (~23% of usable WiFi).
  * ========================================================================= */
 
 #define DATA_UDP_PORT           9004u
 #define UDP_REDUNDANCY          5u
-#define UDP_SPACING             16u
-#define UDP_HISTORY_SIZE        ((UDP_REDUNDANCY - 1u) * UDP_SPACING)  /* 64 */
+#define UDP_SPACING_DEFAULT     16u     /* runtime-adjustable via set_spacing CMD */
+#define UDP_SPACING_MAX         32u     /* max allowed value (sizes the static array) */
+#define UDP_HISTORY_MAX         ((UDP_REDUNDANCY - 1u) * UDP_SPACING_MAX)  /* 128 */
 
 /* =========================================================================
  * Reconnect  (TCP CMD fallback, legacy data path)

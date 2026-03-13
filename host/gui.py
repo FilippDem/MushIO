@@ -86,10 +86,10 @@ import receiver as rx
 BUFFER_SECS  = 20.0
 DISPLAY_SECS = 5.0
 
-# Recovery ring-files: two files alternating so we always keep ≤10 min of raw
+# Recovery ring-files: two files alternating so we always keep ≤20 min of raw
 # frames on disk without touching the user's data directory.
-# At ~200 FPS, 5 min = 60 000 frames × 228 B ≈ 13.7 MB per file (27 MB total).
-RECOVERY_MAX_FRAMES_PER_FILE = int(200 * 60 * 5)   # 5 min per file @ 200 FPS
+# At 500 FPS, 300 000 frames × 228 B ≈ 68 MB per file (137 MB total, ~10 min each).
+RECOVERY_MAX_FRAMES_PER_FILE = 300_000   # ~10 min per file @ 500 FPS
 
 # Datasheet-derived fallback FPS (used until real timestamps accumulate).
 # ADS124S08 @ DR_4000 SPS, sinc3 filter, 6 ADCs on 1 MHz SPI, 12 ch/ADC:
@@ -497,11 +497,11 @@ class _GridDataThread(threading.Thread):
 class DataReceiver(threading.Thread):
     # UDP datagram = UDP_REDUNDANCY frames; each frame is rx.FRAME_SIZE bytes.
     UDP_REDUNDANCY = 5
-    UDP_SPACING    = 4
+    UDP_SPACING    = 16
     # Dedup window: must cover the full spread of staggered copies.
-    # With R=5, S=4 the oldest copy is (R-1)*S = 16 packets behind the newest.
+    # With R=5, S=16 the oldest copy is (R-1)*S = 64 packets behind the newest.
     # Use 2× that for safety margin against reordering.
-    _DEDUP_WINDOW  = 2 * (UDP_REDUNDANCY - 1) * UDP_SPACING  # 32
+    _DEDUP_WINDOW  = 2 * (UDP_REDUNDANCY - 1) * UDP_SPACING  # 128
 
     def __init__(self, port, buf_size):
         super().__init__(daemon=True)
@@ -553,8 +553,10 @@ class DataReceiver(threading.Thread):
         self._h5_buf_samp       = []   # list of (72,) sample tuples
         self._h5_buf_ts         = []   # list of uint32 timestamps
         self._h5_buf_seq        = []   # list of uint16 sequence numbers
-        self._h5_flush_interval = 500  # frames between flushes (~1 s at 500 SPS)
+        self._h5_flush_interval = 100  # frames between flushes (~200 ms at 500 SPS)
         self._h5_config         = None # config snapshot dict for file metadata
+        self._h5_gap_events     = []   # list of (frame_idx, expected_seq, actual_seq, gap_size, wall_clock)
+        self._pending_gap       = None # set by _ingest on gap detection, consumed under _log_lock
 
     def run(self):
         """Main receiver loop — UDP on port self.port (default 9004).
@@ -593,6 +595,7 @@ class DataReceiver(threading.Thread):
                 if self.connected and time.time() - self.last_frame_time > 5.0:
                     print(f"[DATA-RX] No UDP data for 5s — marking disconnected")
                     self.connected = False
+                    self._flush_on_disconnect()
                 continue
             except Exception as e:
                 if not self._stop_event.is_set():
@@ -625,6 +628,7 @@ class DataReceiver(threading.Thread):
                       f"missed={self.missed_session}  dedup={self.dedup_hits}")
                 _log_t = _now
 
+        self._flush_on_disconnect()
         self._udp_sock = None
         sock.close()
 
@@ -694,6 +698,7 @@ class DataReceiver(threading.Thread):
                     return
                 self.missed_frames += gap
                 self.missed_session += gap
+                self._pending_gap = (expected, seq, gap)  # picked up under _log_lock below
         self._last_seq = seq
         for i, s in enumerate(parsed['samples']):
             self.buffers[i].append(s)
@@ -709,6 +714,17 @@ class DataReceiver(threading.Thread):
         if self.log_active:
             with self._log_lock:
                 if self._h5_file is not None:
+                    # Record gap event (set by gap detection above, consumed here under lock)
+                    if self._pending_gap is not None:
+                        exp_s, act_s, gap_sz = self._pending_gap
+                        self._pending_gap = None
+                        self._h5_gap_events.append((
+                            float(self.log_frames),  # frame_index in HDF5
+                            float(exp_s),            # expected_seq
+                            float(act_s),            # actual_seq
+                            float(gap_sz),           # gap_size (missed frames)
+                            now,                     # wall_clock (Unix timestamp)
+                        ))
                     # HDF5 path: buffer parsed data, flush periodically
                     self._h5_buf_samp.append(list(parsed['samples']))
                     self._h5_buf_ts.append(parsed['timestamp_us'])
@@ -784,6 +800,11 @@ class DataReceiver(threading.Thread):
                           chunks=(500,), dtype=np.uint32)
         dg.create_dataset('seq',           shape=(0,), maxshape=(None,),
                           chunks=(500,), dtype=np.uint16)
+        # --- gap events: records every detected sequence gap ---
+        # Columns: frame_index (in samples dataset), expected_seq, actual_seq,
+        #          gap_size (missed frames), wall_clock (Unix timestamp float)
+        dg.create_dataset('gap_events',    shape=(0, 5), maxshape=(None, 5),
+                          chunks=(100, 5), dtype=np.float64)
         # --- channel info ---
         dt_str = h5py.string_dtype()
         f.create_dataset('channels',      data=rx.CHANNEL_NAMES,     dtype=dt_str)
@@ -815,24 +836,34 @@ class DataReceiver(threading.Thread):
 
     def _h5_flush(self):
         """Append buffered frames to HDF5 datasets.  Must be called with
-        _log_lock held.  No-op if buffer is empty."""
-        if not self._h5_buf_samp or self._h5_file is None:
+        _log_lock held.  No-op if both buffers are empty."""
+        if self._h5_file is None:
             return
-        n = len(self._h5_buf_samp)
-        samp_arr = np.array(self._h5_buf_samp, dtype=np.int32)   # (n, 72)
-        ts_arr   = np.array(self._h5_buf_ts,   dtype=np.uint32)  # (n,)
-        seq_arr  = np.array(self._h5_buf_seq,  dtype=np.uint16)  # (n,)
-        ds_s = self._h5_file['data/samples']
-        ds_t = self._h5_file['data/timestamps_us']
-        ds_q = self._h5_file['data/seq']
-        old  = ds_s.shape[0]
-        ds_s.resize(old + n, axis=0);  ds_s[old:] = samp_arr
-        ds_t.resize(old + n, axis=0);  ds_t[old:] = ts_arr
-        ds_q.resize(old + n, axis=0);  ds_q[old:] = seq_arr
+        # Flush sample data
+        if self._h5_buf_samp:
+            n = len(self._h5_buf_samp)
+            samp_arr = np.array(self._h5_buf_samp, dtype=np.int32)   # (n, 72)
+            ts_arr   = np.array(self._h5_buf_ts,   dtype=np.uint32)  # (n,)
+            seq_arr  = np.array(self._h5_buf_seq,  dtype=np.uint16)  # (n,)
+            ds_s = self._h5_file['data/samples']
+            ds_t = self._h5_file['data/timestamps_us']
+            ds_q = self._h5_file['data/seq']
+            old  = ds_s.shape[0]
+            ds_s.resize(old + n, axis=0);  ds_s[old:] = samp_arr
+            ds_t.resize(old + n, axis=0);  ds_t[old:] = ts_arr
+            ds_q.resize(old + n, axis=0);  ds_q[old:] = seq_arr
+            self._h5_buf_samp.clear()
+            self._h5_buf_ts.clear()
+            self._h5_buf_seq.clear()
+        # Flush gap events
+        if self._h5_gap_events:
+            gap_arr = np.array(self._h5_gap_events, dtype=np.float64)
+            ds_g = self._h5_file['data/gap_events']
+            old_g = ds_g.shape[0]
+            ds_g.resize(old_g + len(gap_arr), axis=0)
+            ds_g[old_g:] = gap_arr
+            self._h5_gap_events.clear()
         self._h5_file.flush()
-        self._h5_buf_samp.clear()
-        self._h5_buf_ts.clear()
-        self._h5_buf_seq.clear()
 
     def stop_logging(self):
         with self._log_lock:
@@ -850,6 +881,18 @@ class DataReceiver(threading.Thread):
                 try: self._log_file.close()
                 except Exception: pass
                 self._log_file = None
+
+    def _flush_on_disconnect(self):
+        """Flush any buffered HDF5 data immediately when connection drops.
+        Prevents losing up to flush_interval frames on disconnect."""
+        with self._log_lock:
+            if self._h5_file is not None and self._h5_buf_samp:
+                n = len(self._h5_buf_samp)
+                try:
+                    self._h5_flush()
+                    print(f"[DATA-RX] Flushed {n} buffered frames on disconnect")
+                except Exception as e:
+                    print(f"[DATA-RX] Flush-on-disconnect error: {e}")
 
     # --- recovery ring-file API ---
 
@@ -1679,7 +1722,9 @@ class MushIOGUI:
         # Trace keeps the webcam output_dir in sync whenever data_dir changes.
         self._data_dir_var.trace_add('write', self._on_data_dir_changed)
         self._log_active        = False
-        self._auto_log_started  = False   # unused — logging is manual-only
+        self._auto_log_started  = False   # set True when auto-record fires on Pico connect
+        self._auto_log_disc_time = 0.0    # time.time() when disconnect detected (grace period)
+        self._AUTO_LOG_GRACE_S   = 60.0   # keep recording open this long across disconnects
         self._cmd_auto_next_try = 0.0     # time.time() after which CMD auto-connect may fire
         self._beacon_combo_ctr  = 0       # modulo counter for Pico dropdown refresh
         self._log_status_var = tk.StringVar(value='Not recording')
@@ -7603,11 +7648,23 @@ class MushIOGUI:
             if r.connected and not self._demo_mode:
                 if not self._auto_log_started:
                     self._auto_log_started = True
+                    self._auto_log_disc_time = 0.0
                     if not self._log_active:
                         self._start_recording()
 
             if not r.connected:
-                self._auto_log_started  = False
+                _now = time.time()
+                if self._auto_log_started and self._auto_log_disc_time == 0.0:
+                    # Just disconnected — start grace period, keep recording open
+                    self._auto_log_disc_time = _now
+                if self._auto_log_started and self._auto_log_disc_time > 0.0:
+                    if _now - self._auto_log_disc_time > self._AUTO_LOG_GRACE_S:
+                        # Grace period expired — stop recording, reset auto-log
+                        self._auto_log_started = False
+                        self._auto_log_disc_time = 0.0
+                        if self._log_active:
+                            print(f"[AUTO-REC] Grace period ({self._AUTO_LOG_GRACE_S}s) expired — stopping recording")
+                            self._stop_recording()
                 self._cmd_auto_next_try = 0.0    # allow immediate auto-connect on next data link
                 # Clear any streaming pause so next connection starts unpaused
                 if self._stream_paused_var.get():

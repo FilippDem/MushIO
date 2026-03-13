@@ -323,17 +323,22 @@ static ip_addr_t       g_data_udp_dest;      /* resolved host IP */
 static bool            g_data_udp_ready = false;
 
 /* Spaced staggered redundancy — circular history buffer.
- * Stores the last UDP_HISTORY_SIZE frames (= (R-1)×S).
- * Each datagram picks the new frame + copies at intervals of UDP_SPACING:
- *   Example (R=5, S=4):  [N, N-4, N-8, N-12, N-16]
+ * Spacing is runtime-configurable via 'set_spacing' CMD command.
+ * Array is statically sized for the maximum spacing (UDP_HISTORY_MAX = 128).
+ * Only g_udp_hist_size entries are logically used at any time.
+ *
+ * Each datagram picks the new frame + copies at intervals of g_udp_spacing:
+ *   Example (R=5, S=16):  [N, N-16, N-32, N-48, N-64]
  * Total payload = UDP_REDUNDANCY × FRAME_SIZE = 5 × 228 = 1140 B < 1460 MTU.
  *
  * Uses a circular write index instead of shifting the entire buffer,
- * reducing per-frame cost from (SIZE-1)×228 B memcpy to a single 228 B write.
- * Critical for large spacings (S=32 → SIZE=128 → old shift was 29 KB/frame). */
-static uint8_t  g_udp_history[UDP_HISTORY_SIZE][FRAME_SIZE];
+ * reducing per-frame cost from (SIZE-1)×228 B memcpy to a single 228 B write. */
+static volatile uint32_t g_udp_spacing   = UDP_SPACING_DEFAULT;
+static volatile uint32_t g_udp_hist_size = (UDP_REDUNDANCY - 1u) * UDP_SPACING_DEFAULT;
+
+static uint8_t  g_udp_history[UDP_HISTORY_MAX][FRAME_SIZE];
 static uint32_t g_udp_hist_wr    = 0;  /* next write slot (circular) */
-static uint32_t g_udp_hist_count = 0;  /* valid entries (ramps to UDP_HISTORY_SIZE) */
+static uint32_t g_udp_hist_count = 0;  /* valid entries (ramps to g_udp_hist_size) */
 
 static void data_udp_init(void)
 {
@@ -363,7 +368,7 @@ static void data_udp_init(void)
 
     printf("[UDP-DATA] Streaming to %s:%u (%u× redundancy, spacing=%u, %u B/datagram)\n",
            g_host_ip, (unsigned)DATA_UDP_PORT,
-           (unsigned)UDP_REDUNDANCY, (unsigned)UDP_SPACING,
+           (unsigned)UDP_REDUNDANCY, (unsigned)g_udp_spacing,
            (unsigned)(UDP_REDUNDANCY * FRAME_SIZE));
 }
 
@@ -390,6 +395,10 @@ static void do_udp_stream_work(void)
     if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP)
         return;
 
+    /* Snapshot volatile runtime spacing into locals for consistency within
+     * this call.  The set_spacing CMD can change g_udp_spacing at any time. */
+    const uint32_t spacing = g_udp_spacing;
+
     /* Pop up to 16 frames per main-loop iteration to avoid starving other work */
     uint8_t frame_buf[FRAME_SIZE];
     for (int burst = 0; burst < 16; burst++) {
@@ -401,7 +410,7 @@ static void do_udp_stream_work(void)
          * Only include if we have that many frames in history. */
         uint32_t n_copies = 1;   /* slot 0 = new frame (always) */
         for (uint32_t i = 1; i < UDP_REDUNDANCY; i++) {
-            if (i * UDP_SPACING <= g_udp_hist_count)
+            if (i * spacing <= g_udp_hist_count)
                 n_copies++;
             else
                 break;
@@ -416,11 +425,11 @@ static void do_udp_stream_work(void)
             /* Slot 0: the new frame */
             memcpy(dst, frame_buf, FRAME_SIZE);
             /* Slots 1..n_copies-1: spaced history entries from circular buffer.
-             * Frame i*S ago is at (wr - i*S) mod SIZE.  Adding SIZE before
-             * subtracting guarantees a non-negative dividend. */
+             * Frame i*S ago is at (wr - i*S) mod ARRAY_SIZE.  Adding ARRAY_SIZE
+             * before subtracting guarantees a non-negative dividend. */
             for (uint32_t i = 1; i < n_copies; i++) {
-                uint32_t idx = (g_udp_hist_wr + UDP_HISTORY_SIZE
-                                - i * UDP_SPACING) % UDP_HISTORY_SIZE;
+                uint32_t idx = (g_udp_hist_wr + UDP_HISTORY_MAX
+                                - i * spacing) % UDP_HISTORY_MAX;
                 memcpy(dst + i * FRAME_SIZE,
                        g_udp_history[idx], FRAME_SIZE);
             }
@@ -435,8 +444,8 @@ static void do_udp_stream_work(void)
          * Old code shifted the entire buffer ((SIZE-1)×228 B per frame);
          * circular index eliminates that overhead entirely. */
         memcpy(g_udp_history[g_udp_hist_wr], frame_buf, FRAME_SIZE);
-        g_udp_hist_wr = (g_udp_hist_wr + 1) % UDP_HISTORY_SIZE;
-        if (g_udp_hist_count < UDP_HISTORY_SIZE)
+        g_udp_hist_wr = (g_udp_hist_wr + 1) % UDP_HISTORY_MAX;
+        if (g_udp_hist_count < UDP_HISTORY_MAX)
             g_udp_hist_count++;
     }
 }
@@ -492,12 +501,13 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         uint32_t buffered = ring_count(&g_ring);
         uint32_t dropped  = g_ring.dropped;
         cmd_send(pcb, "frames_sent=%lu dropped=%lu buffered=%lu "
-                      "wifi=%d tcp=%d",
+                      "wifi=%d tcp=%d spacing=%lu",
                  (unsigned long)g_sent_frames,
                  (unsigned long)dropped,
                  (unsigned long)buffered,
                  (int)(cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) == CYW43_LINK_UP),
-                 (int)g_data_connected);
+                 (int)g_data_connected,
+                 (unsigned long)g_udp_spacing);
 
     } else if (strcasecmp(cmd, "scan_all") == 0) {
         /* Return the most-recently-buffered raw data as hex.
@@ -549,6 +559,24 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
                 g_data_connected = false;
                 g_data_pending   = false;
             }
+        }
+
+    } else if (strncasecmp(cmd, "set_spacing", 11) == 0) {
+        /* set_spacing <S>  — change UDP redundancy spacing at runtime.
+         * Valid range: 1..UDP_SPACING_MAX (32).  Resets history buffer. */
+        const char *arg = cmd + 11;
+        while (*arg == ' ') arg++;
+        int s = (*arg) ? atoi(arg) : 0;
+        if (s < 1 || s > (int)UDP_SPACING_MAX) {
+            cmd_send(pcb, "error: set_spacing requires 1..%u",
+                     (unsigned)UDP_SPACING_MAX);
+        } else {
+            g_udp_spacing    = (uint32_t)s;
+            g_udp_hist_size  = (UDP_REDUNDANCY - 1u) * (uint32_t)s;
+            g_udp_hist_wr    = 0;   /* reset history (old entries invalid) */
+            g_udp_hist_count = 0;
+            cmd_send(pcb, "spacing=%d hist_size=%lu",
+                     s, (unsigned long)g_udp_hist_size);
         }
 
     } else if (strcasecmp(cmd, "benchmark") == 0) {
@@ -725,7 +753,8 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
 
     } else if (strcasecmp(cmd, "help") == 0) {
         cmd_send(pcb, "Commands: ping | status | scan_all | benchmark | "
-                      "read_regs | set_fps <hz> | set_host <ip> | retx <seq> <n> | "
+                      "read_regs | set_fps <hz> | set_host <ip> | "
+                      "set_spacing <S> | retx <seq> <n> | "
                       "blink_led | test_hardware | ota_reboot | crash_log | help");
         cmd_send(pcb, "True wireless OTA: connect ota_client.py to port %u", OTA_PORT);
 
@@ -1147,7 +1176,7 @@ int main(void)
            (unsigned)(1000000u / DEMO_SCAN_PERIOD_US));
     printf("[RUN] Data  → UDP %s:%u (%u× redundancy, spacing=%u)\n",
            g_host_ip, (unsigned)DATA_UDP_PORT,
-           (unsigned)UDP_REDUNDANCY, (unsigned)UDP_SPACING);
+           (unsigned)UDP_REDUNDANCY, (unsigned)g_udp_spacing);
     printf("[RUN] CMD   → port %d\n\n", CMD_PORT);
 
     uint32_t last_stats_ms  = to_ms_since_boot(get_absolute_time());

@@ -496,12 +496,13 @@ class _GridDataThread(threading.Thread):
 
 class DataReceiver(threading.Thread):
     # UDP datagram = UDP_REDUNDANCY frames; each frame is rx.FRAME_SIZE bytes.
-    UDP_REDUNDANCY = 5
-    UDP_SPACING    = 16
-    # Dedup window: must cover the full spread of staggered copies.
-    # With R=5, S=16 the oldest copy is (R-1)*S = 64 packets behind the newest.
+    UDP_REDUNDANCY     = 5
+    UDP_SPACING        = 16       # runtime-adjustable via set_spacing()
+    UDP_SPACING_MAX    = 32
+    # Dedup window: must cover the full spread for worst-case spacing.
+    # With R=5, S=32 the oldest copy is (R-1)*S = 128 packets behind.
     # Use 2× that for safety margin against reordering.
-    _DEDUP_WINDOW  = 2 * (UDP_REDUNDANCY - 1) * UDP_SPACING  # 128
+    _DEDUP_WINDOW  = 2 * (UDP_REDUNDANCY - 1) * UDP_SPACING_MAX  # 256
 
     def __init__(self, port, buf_size):
         super().__init__(daemon=True)
@@ -557,6 +558,19 @@ class DataReceiver(threading.Thread):
         self._h5_config         = None # config snapshot dict for file metadata
         self._h5_gap_events     = []   # list of (frame_idx, expected_seq, actual_seq, gap_size, wall_clock)
         self._pending_gap       = None # set by _ingest on gap detection, consumed under _log_lock
+
+    def set_spacing(self, s: int):
+        """Update the local UDP_SPACING value (must match firmware).
+
+        Called by the Settings tab or SpacingCalibrator to keep the GUI
+        in sync with the firmware's current spacing.  The dedup window is
+        already sized for the worst-case spacing (UDP_SPACING_MAX=32),
+        so no resize is needed.
+        """
+        s = max(1, min(s, self.UDP_SPACING_MAX))
+        self.UDP_SPACING = s
+        print(f"[DATA-RX] Spacing updated to {s} "
+              f"(dedup window={self._DEDUP_WINDOW})")
 
     def run(self):
         """Main receiver loop — UDP on port self.port (default 9004).
@@ -999,6 +1013,113 @@ class DataReceiver(threading.Thread):
         """
         data = list(self.buffers[flat_idx])
         return data[-n_samples:]
+
+
+# =============================================================================
+# Spacing Auto-Calibrator
+# =============================================================================
+
+class SpacingCalibrator(threading.Thread):
+    """Test multiple UDP_SPACING values and pick the one with the lowest loss.
+
+    Runs as a daemon thread.  For each candidate spacing value, it:
+      1. Sends ``set_spacing <S>`` to the Pico via the CMD socket.
+      2. Updates the DataReceiver's local spacing.
+      3. Waits a settle period (for the history buffer to ramp up).
+      4. Snapshots ``frames_session`` and ``missed_session``.
+      5. Measures for ``measure_s`` seconds.
+      6. Computes loss_rate.
+    After all candidates, applies the best spacing and reports results.
+
+    Callbacks are posted to *on_progress* and *on_complete* (both called from
+    this thread — the GUI must use ``root.after()`` to safely update widgets).
+    """
+
+    CANDIDATES    = (4, 8, 16, 32)
+    SETTLE_S      = 5      # wait for Pico history buffer to fill at new spacing
+    MEASURE_S     = 60     # measurement window per candidate
+
+    def __init__(self, send_cmd_fn, receiver, on_progress_fn=None,
+                 on_complete_fn=None):
+        super().__init__(daemon=True, name='SpacingCalibrator')
+        self._send_cmd   = send_cmd_fn
+        self._rx          = receiver
+        self._on_progress = on_progress_fn   # fn(msg: str)
+        self._on_complete = on_complete_fn   # fn(results: list[dict], best_s: int)
+        self._stop_event  = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    # ------------------------------------------------------------------
+    def _progress(self, msg):
+        print(f'[CALIBRATE] {msg}')
+        if self._on_progress:
+            self._on_progress(msg)
+
+    def run(self):
+        results = []
+        self._progress(f'Starting calibration: candidates={self.CANDIDATES}, '
+                       f'{self.MEASURE_S}s per candidate')
+
+        for idx, s in enumerate(self.CANDIDATES):
+            if self._stop_event.is_set():
+                self._progress('Cancelled.')
+                return
+
+            self._progress(f'[{idx+1}/{len(self.CANDIDATES)}] Testing S={s} …')
+
+            # 1. Send set_spacing to Pico
+            self._send_cmd(f'set_spacing {s}')
+            # 2. Update receiver locally
+            self._rx.set_spacing(s)
+
+            # 3. Settle — let history buffer ramp up
+            self._progress(f'  Settling ({self.SETTLE_S}s) …')
+            if self._stop_event.wait(self.SETTLE_S):
+                return  # cancelled
+
+            # 4. Snapshot before measurement
+            f0 = self._rx.frames_session
+            m0 = self._rx.missed_session
+
+            # 5. Measure
+            self._progress(f'  Measuring ({self.MEASURE_S}s) …')
+            if self._stop_event.wait(self.MEASURE_S):
+                return  # cancelled
+
+            # 6. Compute
+            f1 = self._rx.frames_session
+            m1 = self._rx.missed_session
+            frames_delta = f1 - f0
+            missed_delta = m1 - m0
+            total = frames_delta + missed_delta
+            loss_pct = (missed_delta / total * 100) if total > 0 else 0.0
+            fps = frames_delta / self.MEASURE_S if self.MEASURE_S > 0 else 0.0
+
+            result = {
+                'spacing': s,
+                'frames': frames_delta,
+                'missed': missed_delta,
+                'loss_pct': loss_pct,
+                'fps': fps,
+            }
+            results.append(result)
+            self._progress(f'  S={s}: {frames_delta:,} frames, '
+                           f'{missed_delta} missed ({loss_pct:.4f}%), '
+                           f'{fps:.0f} FPS')
+
+        # Pick best
+        best = min(results, key=lambda r: r['loss_pct'])
+        best_s = best['spacing']
+        self._progress(f'Best spacing: S={best_s} ({best["loss_pct"]:.4f}% loss)')
+
+        # Apply the winner
+        self._send_cmd(f'set_spacing {best_s}')
+        self._rx.set_spacing(best_s)
+
+        if self._on_complete:
+            self._on_complete(results, best_s)
 
 
 # =============================================================================
@@ -1751,6 +1872,8 @@ class MushIOGUI:
         self._fw_log_text     = None   # Deploy log ScrolledText, built in programming tab
         self._fw_conn_deadline = 0.0   # time.time() deadline for _fw_test_connection retries
         self._fw_ssid_history = _s.get('ssid_history', [])   # list[str], most-recent first
+        # UDP spacing — persisted across sessions, sent to Pico on CMD connect
+        self._udp_spacing_var = tk.IntVar(value=_s.get('udp_spacing', 16))
         self._fw_ssid_cb      = None                          # Combobox widget, built lazily
         # Try to detect the SSID the PC is currently connected to
         _auto_ssid = ''
@@ -3855,6 +3978,51 @@ class MushIOGUI:
         self._cam_preview_labels.append(_lbl_settings)
 
         # =====================================================================
+        # --- UDP Redundancy Spacing ---
+        # =====================================================================
+        spf = ttk.LabelFrame(pad, text="UDP Redundancy Spacing", padding=8)
+        spf.pack(fill=tk.X, padx=12, pady=4)
+
+        # Manual spacing selection
+        sp_row = tk.Frame(spf, bg=BG_DARK)
+        sp_row.pack(fill=tk.X, pady=2)
+        tk.Label(sp_row, text="Spacing (S):", bg=BG_DARK, fg=FG_DIM,
+                 width=_LW, anchor=tk.W).pack(side=tk.LEFT)
+        self._spacing_combo = ttk.Combobox(
+            sp_row, values=['4', '8', '16', '32'], width=5,
+            state='readonly')
+        self._spacing_combo.set(str(self._udp_spacing_var.get()))
+        self._spacing_combo.pack(side=tk.LEFT, padx=4)
+        ttk.Button(sp_row, text="Apply",
+                   command=self._apply_spacing).pack(side=tk.LEFT, padx=4)
+        ttk.Button(sp_row, text="Auto-Calibrate (~4 min)",
+                   command=self._toggle_calibration).pack(side=tk.LEFT, padx=12)
+
+        # Status / progress label
+        self._spacing_status_var = tk.StringVar(value='')
+        tk.Label(spf, textvariable=self._spacing_status_var,
+                 bg=BG_DARK, fg=ACCENT, font=('Consolas', 8),
+                 anchor=tk.W).pack(fill=tk.X, pady=2)
+
+        # Calibration results text area (hidden until calibration runs)
+        self._spacing_results_txt = tk.Text(
+            spf, height=7, wrap=tk.WORD,
+            bg=BG_LIGHT, fg=FG_MAIN, font=('Consolas', 8),
+            relief=tk.FLAT, padx=4, pady=4, state=tk.DISABLED)
+        self._spacing_results_txt.pack(fill=tk.X, pady=2)
+
+        tk.Label(spf,
+                 text="Each UDP packet carries 5 copies of the current frame plus "
+                      "staggered copies from S, 2S, 3S, 4S packets ago.  "
+                      "Lower S increases burst resistance but may resonate with WiFi interference.  "
+                      "Auto-Calibrate tests S=4,8,16,32 for 60s each and picks the lowest loss.",
+                 bg=BG_DARK, fg=FG_DIMMER, font=('Helvetica', 7),
+                 wraplength=680, justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+
+        # Calibrator thread reference
+        self._spacing_calibrator = None
+
+        # =====================================================================
         # --- Save defaults ---
         # =====================================================================
         sb = tk.Frame(pad, bg=BG_DARK)
@@ -4890,6 +5058,7 @@ class MushIOGUI:
             'experiment_desc':     self._exp_desc_txt.get('1.0', tk.END).strip()
                                    if hasattr(self, '_exp_desc_txt') else '',
             'ssid_history':        self._fw_ssid_history,
+            'udp_spacing':         self._udp_spacing_var.get(),
         }
         try:
             with open(SETTINGS_FILE, 'w') as f:
@@ -4898,6 +5067,78 @@ class MushIOGUI:
             self.root.after(3000, lambda: self._settings_status.set(''))
         except Exception as e:
             self._settings_status.set(f"Error: {e}")
+
+    # ---- UDP spacing controls -----------------------------------------------
+
+    def _apply_spacing(self):
+        """Send the manually-selected spacing to the Pico and DataReceiver."""
+        try:
+            s = int(self._spacing_combo.get())
+        except (ValueError, TypeError):
+            self._spacing_status_var.set("Invalid spacing value")
+            return
+        if s < 1 or s > 32:
+            self._spacing_status_var.set("Spacing must be 1..32")
+            return
+        self._udp_spacing_var.set(s)
+        if self._receiver:
+            self._receiver.set_spacing(s)
+        self._send_cmd(f'set_spacing {s}')
+        self._save_settings()
+        self._spacing_status_var.set(f"Applied S={s} and saved to settings.")
+        self.root.after(5000, lambda: self._spacing_status_var.set(''))
+
+    def _toggle_calibration(self):
+        """Start or cancel the auto-calibration routine."""
+        if self._spacing_calibrator and self._spacing_calibrator.is_alive():
+            # Cancel running calibration
+            self._spacing_calibrator.stop()
+            self._spacing_status_var.set("Calibration cancelled.")
+            self._spacing_calibrator = None
+            return
+
+        if not self._receiver:
+            self._spacing_status_var.set("No data receiver — start the GUI first.")
+            return
+
+        self._spacing_calibrator = SpacingCalibrator(
+            send_cmd_fn=self._send_cmd,
+            receiver=self._receiver,
+            on_progress_fn=self._cal_progress_cb,
+            on_complete_fn=self._cal_complete_cb,
+        )
+        self._spacing_calibrator.start()
+        self._spacing_status_var.set("Calibration started …")
+
+    def _cal_progress_cb(self, msg):
+        """Called from the calibrator thread — post to main thread."""
+        self.root.after(0, lambda: self._spacing_status_var.set(msg))
+
+    def _cal_complete_cb(self, results, best_s):
+        """Called from the calibrator thread when all candidates are tested."""
+        def _update():
+            # Update combo, save settings
+            self._udp_spacing_var.set(best_s)
+            self._spacing_combo.set(str(best_s))
+            self._save_settings()
+            self._spacing_status_var.set(
+                f"Calibration complete — best spacing: S={best_s}")
+
+            # Populate results text area
+            self._spacing_results_txt.config(state=tk.NORMAL)
+            self._spacing_results_txt.delete('1.0', tk.END)
+            hdr = f"{'S':>4}  {'Frames':>8}  {'Missed':>7}  {'Loss%':>9}  {'FPS':>6}\n"
+            self._spacing_results_txt.insert(tk.END, hdr)
+            self._spacing_results_txt.insert(tk.END, '-' * 42 + '\n')
+            for r in sorted(results, key=lambda x: x['spacing']):
+                line = (f"{r['spacing']:>4}  {r['frames']:>8,}  "
+                        f"{r['missed']:>7}  {r['loss_pct']:>8.4f}%  "
+                        f"{r['fps']:>6.0f}\n")
+                self._spacing_results_txt.insert(tk.END, line)
+            winner = f"\nBest: S={best_s}\n"
+            self._spacing_results_txt.insert(tk.END, winner)
+            self._spacing_results_txt.config(state=tk.DISABLED)
+        self.root.after(0, _update)
 
     # ---- Full experiment config save / load --------------------------------
 
@@ -7585,6 +7826,10 @@ class MushIOGUI:
                         self._cmd_status_dot.config(fg=GREEN)
                         self._cmd_status_lbl.config(text=line)
                         self._cmd_connect_btn.config(text="Disconnect")
+                        # Send saved spacing to Pico on CMD connect
+                        saved_s = self._udp_spacing_var.get()
+                        if saved_s and 1 <= saved_s <= 32:
+                            self._send_cmd(f'set_spacing {saved_s}')
                     elif 'Disconnected' in line or 'Connecting' in line:
                         self._cmd_status_dot.config(fg=RED if 'Disconnected' in line else FG_DIMMER)
                         self._cmd_status_lbl.config(text=line)

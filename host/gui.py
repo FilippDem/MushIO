@@ -4012,7 +4012,7 @@ class MushIOGUI:
                 _log(f"ERROR: Wrong firmware folder.")
                 _log(f"       Missing: {', '.join(_missing)}")
                 _log(f"       Point 'Firmware folder' to the firmware/ subdirectory")
-                _log(f"       (e.g. C:/Users/filip/OneDrive/Desktop/MushIV1p0/firmware)")
+                _log(f"       (e.g. C:/path/to/MushIO/firmware_c)")
                 _set_status("Wrong firmware folder — see Deploy Log for details.", RED)
                 return
 
@@ -4291,7 +4291,12 @@ class MushIOGUI:
             _env = dict(_os.environ)
             _env['PATH'] = ';'.join(p for p in _extra if _os.path.isdir(p)) \
                            + ';' + _env.get('PATH', '')
-            _env.setdefault('PICO_SDK_PATH', r'C:\pico\pico-sdk')
+            # Common Pico SDK locations (checked in order)
+            if 'PICO_SDK_PATH' not in _env:
+                for _sdk_candidate in [r'C:\pico\pico-sdk', _os.path.expanduser('~/pico/pico-sdk')]:
+                    if _os.path.isdir(_sdk_candidate):
+                        _env['PICO_SDK_PATH'] = _sdk_candidate
+                        break
 
             cmake    = shutil.which('cmake',    path=_env['PATH'])
             ninja    = shutil.which('ninja',    path=_env['PATH'])

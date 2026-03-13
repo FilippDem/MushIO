@@ -33,6 +33,12 @@ firmware_c/_flash_config_override.py
 Thumbs.db
 desktop.ini
 
+# ── Development tools ────────────────────────────────────────────────────────
+.claude/
+
+# ── Test results ─────────────────────────────────────────────────────────────
+spacing_results.json
+
 # ── Misc junk ─────────────────────────────────────────────────────────────────
 nul
 *.log

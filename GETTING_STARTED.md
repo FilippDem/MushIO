@@ -1,20 +1,27 @@
 # MushIO V1.0 — Getting Started
 
 72-channel electrophysiology recorder for mushroom mycelium studies.
+Pico 2W (C firmware) streams 500 FPS over WiFi to a Python GUI.
 
 ---
 
 ## 1. Prerequisites
 
 ### Host PC
-- Python 3.8 or later
-- Packages: `pip install matplotlib numpy opencv-python`
-- Windows 10/11 (batch launchers), macOS/Linux (run `python host/gui.py` directly)
+- Python 3.10 or later
+- Run `install.bat` (Windows) or `install.sh` (macOS/Linux) to install dependencies
+- Or manually: `pip install -r host/requirements.txt`
 
 ### Hardware
-- MushIO V1.0 board (Raspberry Pi Pico 2W + ADS124S08 x6)
+- MushIO V1.0 board (Raspberry Pi Pico 2W + ADS124S08 ×6)
 - USB cable (for first flash)
 - Same WiFi network as the host PC
+
+### Firmware build tools (only needed to recompile firmware)
+- [CMake](https://cmake.org/) 3.13+
+- [Ninja](https://ninja-build.org/)
+- [ARM GCC toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) (arm-none-eabi-gcc)
+- [Pico SDK](https://github.com/raspberrypi/pico-sdk) — clone and set `PICO_SDK_PATH`
 
 ---
 
@@ -22,130 +29,107 @@
 
 Double-click **`launch_gui_demo.bat`** — or from a terminal:
 
-```bat
-python host\gui.py --demo
-```
-
-This streams 200 fps of simulated electrophysiology data so you can explore all UI controls before hardware arrives.
-
-To exit demo mode, click the green **DEMO MODE ON** button.
-
----
-
-## 3. Flash Firmware to the Pico
-
-### 3a. Install MicroPython on the Pico 2W
-
-1. Hold the **BOOTSEL** button while plugging in USB.
-2. A drive called `RPI-RP2` appears — drag the MicroPython `.uf2` file onto it.
-   - Download: https://micropython.org/download/rp2350/
-
-### 3b. Copy firmware files
-
-Copy every file from `firmware/` to the Pico's root filesystem:
-
-```
-ads124s08.py
-adc_manager.py
-streamer.py
-cmd_server.py
-bringup.py
-config.py
-main.py
-```
-
-Tools: [Thonny IDE](https://thonny.org) (beginner-friendly) or `mpremote`:
 ```bash
-pip install mpremote
-mpremote connect auto cp firmware/*.py :
+python host/gui.py --demo
 ```
+
+This streams 500 FPS of simulated electrophysiology data so you can
+explore all UI controls before hardware arrives.
 
 ---
 
-## 4. Configure Credentials
+## 3. Configure and Build Firmware
 
-Edit `firmware/config.py` on the Pico:
+### 3a. Edit WiFi credentials
 
-```python
-WIFI_SSID     = "YourNetworkName"
-WIFI_PASSWORD = "YourPassword"
-HOST_IP       = "192.168.1.X"   # your PC's IP — run `ipconfig` to find it
+Edit `firmware_c/config.h`:
+
+```c
+#define WIFI_SSID       "YourNetworkName"
+#define WIFI_PASSWORD   "YourPassword"
+#define HOST_IP         "192.168.1.X"   // your PC's IP — run ipconfig to find it
 ```
 
 > **Tip:** On Windows, open a terminal and run `ipconfig`. Look for the IPv4 address
 > on your WiFi adapter (e.g. `192.168.1.42`).
 
----
+### 3b. Build the firmware
 
-## 5. Run Board Bringup
+Set up your environment and run the build script:
 
-With the Pico connected via USB, open a REPL (Thonny or `mpremote repl`) and run:
-
-```python
-import bringup
-bringup.run_all()
+```bat
+set PICO_SDK_PATH=C:\path\to\pico-sdk
+build_and_launch.bat
 ```
 
-This checks each subsystem in order:
+Or build manually:
 
-| Check | What it verifies |
-|-------|-----------------|
-| Analog power good | Charge pump rails healthy |
-| Clock enable | 4.096 MHz external clock toggling |
-| ADC IDs | All 6 ADS124S08 respond on SPI |
-| Single channel read | One electrode reads a plausible value |
-| DRDY timing | Conversion latency matches configured data rate |
-| Full 72-ch scan | All channels return data (no timeouts) |
-| Frame rate | scan_frame() achieves ≥ 100 FPS |
-| WiFi | Pico connects to your AP |
-| TCP | Pico can reach HOST_IP:9000 |
+```bash
+cd firmware_c
+mkdir build && cd build
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DMUSHIO_DEMO=1
+ninja -j4
+```
 
-Fix any failures before proceeding. The most common issues:
+Set `-DMUSHIO_DEMO=0` for real ADC hardware (production mode).
 
-- **ADC ID FAIL** → check SPI wiring and CS pin assignments in `config.py`
-- **DRDY never asserts** → check CLK_EN (GP22) and external 4.096 MHz oscillator
-- **WiFi won't connect** → verify SSID/password; Pico 2W supports 2.4 GHz only
+The build produces `firmware_c/build/mushio_c.uf2`.
 
 ---
 
-## 6. Start Recording
+## 4. Flash Firmware to the Pico
 
-### 6a. On the Host PC — start the GUI
+### Option A: USB BOOTSEL (first time)
+
+1. Hold the **BOOTSEL** button while plugging in USB.
+2. A drive called `RPI-RP2` appears — copy `mushio_c.uf2` onto it.
+
+### Option B: OTA (over WiFi, for updates)
+
+If the Pico is already running MushIO firmware:
+
+```bash
+python host/ota_client.py firmware_c/build/mushio_c.uf2 --host <PICO_IP>
+```
+
+The `build_and_launch.bat` script handles both methods automatically.
+
+---
+
+## 5. Start Recording
+
+### 5a. Launch the GUI
 
 Double-click **`launch_gui.bat`**, or:
 
 ```bash
-python host\gui.py
+python host/gui.py
 ```
 
-Optional arguments:
-```
---data-port 9000      TCP port for Pico data stream (default 9000)
---cmd-host  <IP>      Pico's IP for command channel
---cmd-port  9001      Pico command server port (default 9001)
---demo                Start in demo mode (no hardware)
-```
+### 5b. The Pico connects automatically
 
-### 6b. On the Pico — run the firmware
+After flashing, the Pico will:
+1. Connect to your WiFi network
+2. Broadcast UDP beacon on port 9003 every 3 seconds
+3. Start streaming data via UDP to your PC on port 9004
+4. Listen for commands on TCP port 9001
 
-In Thonny, press **Run** (`main.py`), or reset the Pico (it auto-runs `main.py` on boot).
+The GUI's **Data stream** indicator turns green when data arrives.
+Recording starts automatically when the Pico connects.
 
-The Pico will:
-1. Initialize all 6 ADCs
-2. Connect to WiFi
-3. Connect to the host GUI on port 9000
-4. Start streaming ~200 frames/sec
-
-The GUI's **Data stream** dot turns green when the Pico connects.
-
-### 6c. Connect the command channel (optional)
+### 5c. Connect the command channel (optional)
 
 Enter the Pico's IP in the **Command → Pico IP** field and click **Connect**.
-The command dot turns green. You can now send diagnostic commands from the terminal.
+This enables diagnostic commands and register configuration.
 
 ---
 
-## 7. GUI Quick Reference
+## 6. GUI Quick Reference
+
+### Electrode Grid (8×8)
+
+The main view shows all 64 electrode channels as an 8×8 grid with
+real-time waveforms. Each cell is color-coded by signal amplitude.
 
 ### Waveform panel
 
@@ -155,65 +139,118 @@ The command dot turns green. You can now send diagnostic commands from the termi
 | Y-scale | Manual voltage range (disabled when Auto-scale is on) |
 | Auto-scale Y | Fit waveform to window automatically |
 | Channel listbox | Select up to 8 channels to display simultaneously |
-| 8 Elec / All STIM / Clear | Quick-select presets |
-| STIM_0…STIM_7 buttons | Toggle individual STIM channels in/out of view |
+| Bandpass filter | Configurable low/high cutoff for electrode channels |
 
 ### Command terminal
 
-Type commands and press **Enter** or click **Send**. Up/Down arrows scroll history.
+Type commands and press **Enter** or click **Send**:
 
-Common commands:
 ```
-ping          — check Pico is alive
-status        — streaming stats (fps, dropped frames, WiFi/TCP state)
-check_adcs    — verify all 6 ADC device IDs
-scan_all      — print current value of all 72 channels
-scan_single 0 0 10   — read ADC0 AIN0, 10 samples
-benchmark     — measure maximum scan_frame() rate
-set_datarate 0x0D    — set 4000 SPS on all ADCs
-dump_regs 0   — print all registers on ADC0
+ping              — check Pico is alive
+status            — streaming stats (fps, dropped frames, WiFi state)
+set_fps <hz>      — change scan rate (default: 500 FPS)
+check_adcs        — verify all 6 ADC device IDs
+scan_all          — print current value of all 72 channels
+benchmark         — measure maximum scan_frame() rate
+set_datarate 0x0D — set 4000 SPS on all ADCs
+dump_regs 0       — print all registers on ADC0
 ```
 
-### Webcam capture (left panel, bottom)
+### Recording
 
-1. Tick **Enable**
+| Feature | Details |
+|---------|---------|
+| Format | HDF5 (.h5) with gzip compression |
+| Auto-record | Starts when Pico connects, survives brief disconnects (60s grace) |
+| Data dir | Configurable in Settings tab (default: `data/`) |
+| Rolling | New file every hour (configurable) |
+| Gap markers | Sequence gaps recorded in `data/gap_events` dataset |
+| Recovery | Always-on ring buffer saves last ~20 min to disk |
+
+### Webcam capture
+
+1. Tick **Enable** in the webcam panel
 2. Select camera index (0 = default webcam)
 3. Choose capture interval (1–60 minutes)
-4. Images saved to `captures/mushio_capture_YYYYMMDD_HHMMSS.jpg`
-5. Click **Capture Now** for an immediate shot
+4. Images saved alongside data files
 
 ---
 
-## 8. Data Output
+## 7. Data Output
 
-CSV files are written to `data/` each session:
+Recordings are saved in HDF5 format (`.h5`) to the configured data directory:
 
-| File | Contents |
-|------|----------|
-| `mushio_elec_YYYYMMDD_HHMMSS.csv` | 64 recording electrode channels (raw ADC counts) |
-| `mushio_stim_YYYYMMDD_HHMMSS.csv` | 8 stimulation monitor channels |
-
-Columns: `timestamp_ms`, `seq`, then one column per channel named by electrode (e.g. `ELEC02`, `STIM_0`).
-
-To also log raw binary frames (for replay/offline analysis):
-```bash
-python host\receiver.py --raw
 ```
+data/
+  mushio_20260313_143000.h5
+  mushio_20260313_153000.h5
+```
+
+Each file contains:
+
+| Dataset | Shape | Description |
+|---------|-------|-------------|
+| `data/samples` | (N, 72) | Raw ADC samples, int32 |
+| `data/timestamps_us` | (N,) | Pico microsecond timestamps |
+| `data/seq` | (N,) | Sequence numbers (gap detection) |
+| `data/gap_events` | (M, 5) | Detected gaps: frame_idx, expected_seq, actual_seq, gap_size, wall_clock |
+| `channels` | (72,) | Channel names (ELEC00–ELEC63, STIM_0–STIM_7) |
+| `channel_types` | (72,) | "recording" or "stim" |
+| `metadata/*` | attrs | Hardware config (Vref, gain, ADC settings) |
+| `experiment/*` | attrs | Start time, board ID, species info |
+
+### Reading data in Python
+
+```python
+import h5py
+import numpy as np
+
+with h5py.File('data/mushio_20260313_143000.h5', 'r') as f:
+    samples = f['data/samples'][:]      # (N, 72) array
+    timestamps = f['data/timestamps_us'][:]
+    seq = f['data/seq'][:]
+    gaps = f['data/gap_events'][:]      # (M, 5) — empty if no gaps
+    channels = [c.decode() for c in f['channels'][:]]
+    print(f"Frames: {len(seq)}, Duration: {(timestamps[-1]-timestamps[0])/1e6:.1f}s")
+```
+
+---
+
+## 8. Network Architecture
+
+```
+Pico 2W (firmware_c)              Host PC (host/gui.py)
+─────────────────────             ─────────────────────
+UDP beacon :9003  ───────────────▶  Discovery listener
+UDP data   :9004  ───────────────▶  DataReceiver (500 FPS)
+TCP cmd    :9001  ◀──────────────▶  Command channel
+OTA server :9002  ◀──────────────   OTA firmware updater
+```
+
+- **Data**: UDP with 5× staggered redundancy (S=16 spacing). Each frame
+  is sent 5 times across different packets. Typical loss: <0.01%.
+- **Commands**: TCP for reliable bidirectional control.
+- **OTA**: Firmware updates over WiFi without USB.
 
 ---
 
 ## 9. Long-Run Experiments
 
-The firmware is designed for multi-day unattended operation:
-- **Watchdog timer** (8 s): board resets automatically if firmware hangs
-- **WiFi reconnection**: retries every 5 s if connection drops
-- **Ring buffer**: 64 frames buffered during brief WiFi outages
-- **CSV auto-flush**: every 5 s to minimize data loss on crash
+The system is designed for multi-day unattended operation:
+
+- **Watchdog timer** (8s): board resets automatically if firmware hangs
+- **WiFi reconnection**: automatic, with UDP beacon for discovery
+- **Ring buffer**: 1536 frames (3.1s at 500 FPS) buffered on Pico
+- **UDP redundancy**: 5× staggered copies eliminate most packet loss
+- **Auto-recording**: starts on connect, 60s grace period on disconnect
+- **HDF5 flush**: every 100 frames (~200ms) to minimize crash data loss
+- **Recovery files**: 20 min rolling buffer always active on host
 
 Recommended setup:
-- Set the Pico to auto-run `main.py` on boot (default behaviour)
-- Run `launch_gui.bat` on the host PC at the start of each session
+- Flash firmware via OTA or USB BOOTSEL
+- Run `launch_gui.bat` on the host PC
 - Enable webcam capture to photograph the preparation periodically
+- Data auto-records to the configured data directory
 
 ---
 
@@ -221,10 +258,37 @@ Recommended setup:
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| Data dot stays grey | Pico not connected or wrong HOST_IP | Check `config.py`, rerun firmware |
-| FPS shown as 0 | No frames received | Check firewall — allow Python on port 9000 |
+| Data dot stays grey | Pico not connected or wrong HOST_IP | Check `config.h`, verify WiFi |
+| FPS shown as 0 | No frames received | Check firewall — allow Python on UDP port 9004 |
 | CRC errors > 0 | WiFi interference | Move AP closer, reduce channel congestion |
-| Missed frames > 0 | Host CPU overloaded | Close other apps; lower display FPS in `gui.py` |
+| Missed frames > 0 | Brief WiFi bursts | Normal at <0.01%; check WiFi signal if higher |
 | All channels read 0x800000 | ADC DRDY timeout | Check CLK_EN (GP22) and SPI wiring |
-| GUI won't start | Missing packages | Run `pip install matplotlib numpy opencv-python` |
-| Webcam error | Wrong camera index | Try Camera 1 or 2 in the Webcam section |
+| GUI won't start | Missing packages | Run `install.bat` or `pip install -r host/requirements.txt` |
+| Build fails | Missing toolchain | Install CMake, Ninja, ARM GCC; set PICO_SDK_PATH |
+| OTA fails | Pico not reachable | Verify Pico IP, ensure UDP port 9003 beacon visible |
+
+---
+
+## 11. Project Structure
+
+```
+MushIO/
+├── firmware_c/           C firmware for Pico 2W (Pico SDK)
+│   ├── config.h          WiFi credentials, network ports, ADC pins
+│   ├── main.c            Main firmware (WiFi, UDP streaming, CMD server)
+│   ├── CMakeLists.txt    Build configuration
+│   └── BUILD.md          Firmware build instructions
+├── host/                 Python GUI and utilities
+│   ├── gui.py            Main GUI application (tkinter + matplotlib)
+│   ├── receiver.py       Frame parser and protocol constants
+│   ├── ota_client.py     Over-the-air firmware updater
+│   ├── analyze.py        Post-hoc data analysis tools
+│   └── requirements.txt  Python dependencies
+├── HW/                   Hardware design files (schematics, PCB)
+├── archive/              Legacy MicroPython firmware (historical)
+├── install.bat / .sh     Dependency installer
+├── launch_gui.bat        GUI launcher with dependency check
+├── build_and_launch.bat  Full build → flash → launch pipeline
+├── GETTING_STARTED.md    This file
+└── SPEC.md               Hardware specification
+```

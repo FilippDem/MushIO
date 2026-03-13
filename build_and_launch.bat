@@ -1,15 +1,15 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 
-set CMAKE=C:\Users\filip\scoop\apps\cmake\4.2.3\bin
-set NINJA=C:\Users\filip\scoop\apps\ninja\1.13.2
-set GCC=C:\Users\filip\scoop\apps\gcc-arm-none-eabi\15.2.rel1\bin
-
-:: Find mingw bin dir (for make/sh used by some cmake scripts)
-for /d %%d in (C:\Users\filip\scoop\apps\mingw\*) do set MINGW=%%d\bin
-
-set PATH=%CMAKE%;%NINJA%;%GCC%;%MINGW%;%PATH%
-set PICO_SDK_PATH=C:\pico\pico-sdk
+:: ============================================================
+::  MushIO V1.0  --  Build + Flash + GUI launcher
+::
+::  Toolchain discovery (checked in this order):
+::    1. Environment variables: CMAKE_BIN, NINJA_BIN, GCC_ARM_BIN, PICO_SDK_PATH
+::    2. Tools already on PATH (cmake, ninja, arm-none-eabi-gcc)
+::
+::  Set DEMO=1 before running for demo mode (synthetic data, no ADC hw).
+:: ============================================================
 
 set ROOT=%~dp0
 set FW_DIR=%ROOT%firmware_c
@@ -18,6 +18,48 @@ set BUILD_DIR=%FW_DIR%\build
 echo ============================================================
 echo  MushIO V1.0  --  Build + Flash + GUI launcher
 echo ============================================================
+
+:: ---- Toolchain: add user-specified dirs to PATH if set --------
+if defined CMAKE_BIN    set "PATH=%CMAKE_BIN%;%PATH%"
+if defined NINJA_BIN    set "PATH=%NINJA_BIN%;%PATH%"
+if defined GCC_ARM_BIN  set "PATH=%GCC_ARM_BIN%;%PATH%"
+if defined MINGW_BIN    set "PATH=%MINGW_BIN%;%PATH%"
+
+:: Verify required tools are available
+where cmake >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] cmake not found on PATH.
+    echo         Install CMake and ensure it is on your PATH,
+    echo         or set CMAKE_BIN=^<path-to-cmake-bin-dir^>
+    exit /b 1
+)
+where ninja >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] ninja not found on PATH.
+    echo         Install Ninja and ensure it is on your PATH,
+    echo         or set NINJA_BIN=^<path-to-ninja-dir^>
+    exit /b 1
+)
+where arm-none-eabi-gcc >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] arm-none-eabi-gcc not found on PATH.
+    echo         Install the ARM GCC toolchain and ensure it is on your PATH,
+    echo         or set GCC_ARM_BIN=^<path-to-gcc-arm-bin-dir^>
+    exit /b 1
+)
+if not defined PICO_SDK_PATH (
+    echo [ERROR] PICO_SDK_PATH not set.
+    echo         Clone the Pico SDK and set PICO_SDK_PATH to its location:
+    echo           git clone https://github.com/raspberrypi/pico-sdk
+    echo           set PICO_SDK_PATH=C:\path\to\pico-sdk
+    exit /b 1
+)
+
+echo [OK] cmake:              found
+echo [OK] ninja:              found
+echo [OK] arm-none-eabi-gcc:  found
+echo [OK] PICO_SDK_PATH:      %PICO_SDK_PATH%
+echo.
 
 :: ---- 1. CMake configure ------------------------------------------------
 if not exist "%BUILD_DIR%\CMakeCache.txt" (
@@ -47,20 +89,8 @@ echo [2/3] Built: %UF2%
 
 :: ---- 3. Flash ----------------------------------------------------------
 echo [3/3] Flashing...
-:: Auto-detect Pico IP from active data-stream connection on port 9000
-set PICO_IP=
-for /f "tokens=3" %%i in ('netstat -an 2^>nul ^| findstr ":9000 " ^| findstr "ESTABLISHED"') do (
-    if not defined PICO_IP (
-        for /f "tokens=1 delims=:" %%a in ("%%i") do set PICO_IP=%%a
-    )
-)
 :: Try OTA first (Pico already running firmware)
-if defined PICO_IP (
-    echo [OTA] Detected Pico at %PICO_IP% via port-9000 data stream.
-    python "%ROOT%host\ota_client.py" "%UF2%" --host %PICO_IP% 2>nul
-) else (
-    python "%ROOT%host\ota_client.py" "%UF2%" 2>nul
-)
+python "%ROOT%host\ota_client.py" "%UF2%" 2>nul
 if errorlevel 1 (
     echo [INFO] OTA not available. Checking for RPI-RP2 BOOTSEL drive...
     :: Look for the drive

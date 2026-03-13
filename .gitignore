@@ -19,6 +19,7 @@ captures/                 # webcam captures
 
 # ── Firmware C build artefacts ────────────────────────────────────────────────
 firmware_c/build/
+firmware_c/build2/
 
 # ── Firmware config override (generated at flash time) ────────────────────────
 firmware_c/_flash_config_override.py

@@ -83,6 +83,23 @@ static inline uint32_t ring_count(const ring_t *r)
 }
 
 /*
+ * ring_peek — read a frame by offset from tail without consuming it.
+ * offset=0 is the oldest frame (tail), offset=1 is next oldest, etc.
+ * Returns true if the frame exists, false if offset >= count.
+ * Called by Core 0 only (for retransmission requests).
+ */
+static inline bool ring_peek(const ring_t *r, uint32_t offset, uint8_t *dest)
+{
+    uint32_t count = (r->head - r->tail + RING_SIZE) % RING_SIZE;
+    if (offset >= count) return false;
+
+    uint32_t idx = (r->tail + offset) % RING_SIZE;
+    __dmb();
+    memcpy(dest, r->buf + idx * FRAME_SIZE, FRAME_SIZE);
+    return true;
+}
+
+/*
  * ring_init — zero-initialise the ring buffer.
  * Call once before launching Core 1.
  */

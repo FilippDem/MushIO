@@ -17,8 +17,9 @@
  * All computations are driven by the hardware timestamp (us) so frequencies
  * are exact in Hz regardless of scan rate set via 'set_fps'.
  *
- * STIM channels (ADC 2 ain>=8, ADC 3 ain>=8): amplitude halved to
- * visually distinguish them from recording channels.
+ * Amplitude: ~1 mV pk-pk input-referred (realistic biopotential level).
+ *   amp_frac = 1 mV * AFE_GAIN / (2 * VREF) = 0.001 * 11 / 10.16 ≈ 0.0011
+ * STIM channels (ADC 2 ain>=8, ADC 3 ain>=8): amplitude halved (~0.5 mV pk-pk).
  *
  * Output byte order: big-endian 24-bit signed (MSB first), matching the
  * real ADS124S08 SPI read format.
@@ -114,7 +115,10 @@ void demo_adc_scan(uint8_t *out_data, uint32_t ts_us)
         }
         }
 
-        int32_t val = (int32_t)(val_f * (float)ADC_FULL_SCALE * 0.4f);
+        /* ~1 mV pk-pk input-referred (was 40% FS = ~185 mV).
+         * amp_frac = 1 mV * AFE_GAIN / (2 * VREF)
+         *          = 0.001 * 11.0 / (2 * 5.08) = 0.001083                 */
+        int32_t val = (int32_t)(val_f * (float)ADC_FULL_SCALE * 0.0011f);
 
         /* STIM channels: halve amplitude to visually distinguish them */
         bool is_stim = ((adc == 2 || adc == 3) && ain >= 8);

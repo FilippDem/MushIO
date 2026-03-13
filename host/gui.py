@@ -21,7 +21,7 @@ Requirements
 
 Usage
 -----
-    python host/gui.py [--data-port 9000] [--cmd-host <ip>] [--cmd-port 9001] [--demo]
+    python host/gui.py [--data-port 9004] [--cmd-host <ip>] [--cmd-port 9001] [--demo]
 """
 
 import tkinter as tk
@@ -41,6 +41,7 @@ import random
 import json
 from datetime import datetime
 from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import NullLocator
 
 import matplotlib
 import matplotlib.ticker as mticker
@@ -62,10 +63,16 @@ except ImportError:
     HAS_PIL = False
 
 try:
-    from scipy.signal import butter, sosfilt, sosfiltfilt
+    from scipy.signal import butter, sosfilt, sosfiltfilt, detrend as _detrend
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
+
+try:
+    import h5py
+    HAS_H5PY = True
+except ImportError:
+    HAS_H5PY = False
 
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -94,7 +101,7 @@ _sinc3_us   = 3 * 1_000_000 // rx.ADC_DATA_RATE_SPS                      # 750 �
 _spi_us     = rx.NUM_ADCS * (3 + 4) * 8 * 1_000_000 // rx.SPI_CLOCK_HZ  # 336 µs
 ASSUMED_FPS = 1_000_000 / ((_sinc3_us + _spi_us) * rx.CHANNELS_PER_ADC) # ~77 FPS
 
-GRID_FPS     = 15
+GRID_FPS     = 12
 OVERLAY_FPS  = 25
 HEATMAP_FPS  = 3
 
@@ -251,8 +258,13 @@ _ICON_B64 = (
 # =============================================================================
 
 def bandpass_filter(data, low_hz, high_hz, fs, order=4):
-    # sosfiltfilt requires padlen = 3 * (2 * n_sos) samples.
-    # butter bandpass of order N → N SOS sections → padlen = 6*N.
+    """Apply a Butterworth bandpass (or lowpass) with zero-phase filtering.
+
+    When the high-pass cutoff requires more padding than the data window
+    can provide (i.e. fewer than ~3 full cycles of the cutoff frequency),
+    we fall back to detrend + lowpass to avoid the diagonal baseline-tilt
+    artifacts that sosfiltfilt produces with insufficient edge padding.
+    """
     if not HAS_SCIPY or len(data) < max(order * 6 + 2, 30):
         return data
     nyq = fs / 2.0
@@ -261,11 +273,23 @@ def bandpass_filter(data, low_hz, high_hz, fs, order=4):
     if lo >= hi or hi >= 1.0:
         return data
     try:
+        # How much padding the high-pass component needs: ~3 time-constants
+        hp_pad_needed = int(3.0 * fs / max(low_hz, 1e-3))
+
+        if hp_pad_needed > len(data) // 2:
+            # High-pass period far exceeds data window — bandpass would produce
+            # severe edge artifacts.  Instead: detrend (removes DC + linear
+            # drift) then apply only a low-pass filter.
+            out = _detrend(data, type='linear')
+            sos_lp = butter(order, hi, btype='low', output='sos')
+            padlen_lp = min(len(out) - 1, 3 * (2 * len(sos_lp) - 1))
+            return sosfiltfilt(sos_lp, out, padlen=padlen_lp)
+
+        # Normal bandpass: generous padding avoids diagonal baseline tilt.
         sos = butter(order, [lo, hi], btype='band', output='sos')
-        # sosfiltfilt: zero-phase (forward+backward) — no startup transient,
-        # no phase distortion.  Replaces causal sosfilt which produced
-        # visible ringing at the start of every display window.
-        return sosfiltfilt(sos, data)
+        default_pad = 3 * (2 * len(sos) - 1)
+        padlen      = min(len(data) - 1, max(default_pad, hp_pad_needed))
+        return sosfiltfilt(sos, data, padlen=padlen)
     except Exception:
         return data
 
@@ -280,7 +304,7 @@ def compute_fft(data, fs):
     return freq, mag
 
 
-def display_decimate(arr, max_pts=600):
+def display_decimate(arr, max_pts=120):
     """Block-average arr to at most max_pts samples for visual display.
 
     Block averaging is a boxcar lowpass at ~FPS/(2*block) Hz followed by
@@ -289,6 +313,10 @@ def display_decimate(arr, max_pts=600):
     density greatly exceeds screen pixel density (e.g. 2500 samples in a
     150-pixel-wide cell).  Returns the decimated array; caller should
     regenerate t_vec with np.linspace to match the new length.
+
+    120 points at a 5 s window gives 24 display-samples/sec (Nyquist ~12 Hz),
+    enough to faithfully render the Pico's 1-12 Hz demo signals.
+    Adjustable via the Display > Display res combobox.
     """
     n = len(arr)
     if n <= max_pts:
@@ -299,10 +327,182 @@ def display_decimate(arr, max_pts=600):
 
 
 # =============================================================================
+# Background grid data processor (runs in dedicated thread)
+# =============================================================================
+
+class _GridDataThread(threading.Thread):
+    """Process electrode data in a background thread for grid rendering.
+
+    Produces normalised (x, y) arrays that fit within fixed axis limits
+    [0, 1] × [-1, 1] so the main thread never needs to call canvas.draw()
+    during normal operation — only restore_region / draw_artist / blit.
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self._lock = threading.Lock()
+        self._receiver = None
+        self._params = {}
+        self._frame = {}       # flat -> (x_norm, y_norm)
+        self._clip = {}        # flat -> bool
+        self._new = False
+        self._stop_flag = False
+
+    # -- called from main thread ------------------------------------------
+
+    def configure(self, receiver, **params):
+        """Snapshot receiver reference and GUI state each render tick."""
+        self._receiver = receiver
+        self._params = params
+
+    def get_frame(self):
+        """Return (frame_dict, clip_dict, is_new).  Thread-safe."""
+        with self._lock:
+            n = self._new
+            self._new = False
+            return self._frame, self._clip, n
+
+    def stop(self):
+        self._stop_flag = True
+
+    # -- background loop ---------------------------------------------------
+
+    def run(self):
+        _err_count = 0
+        while not self._stop_flag:
+            t0 = time.perf_counter()
+            r = self._receiver
+            p = self._params
+            if r and p and r.last_frame_time > 0.0:
+                try:
+                    self._process(r, p)
+                except Exception:
+                    _err_count += 1
+                    if _err_count <= 5:
+                        import traceback
+                        print(f"[GRID THREAD] _process error #{_err_count}:",
+                              flush=True)
+                        traceback.print_exc()
+                    elif _err_count == 100:
+                        print(f"[GRID THREAD] 100 errors suppressed",
+                              flush=True)
+            dt = time.perf_counter() - t0
+            time.sleep(max(0.010, 1.0 / (GRID_FPS + 5) - dt))
+
+    # Maximum samples fed into per-channel processing (bandpass, FFT, etc.).
+    # Larger windows are pre-decimated to this count first, keeping the
+    # processing cost constant regardless of the display time-window setting.
+    _MAX_PROC = 600
+
+    def _process(self, r, p):
+        n_samp     = p.get('n_samp', 385)
+        fft_mode   = p.get('fft_mode', False)
+        bp_on      = p.get('bp_on', False)
+        bp_low     = p.get('bp_low', 1.0)
+        bp_high    = p.get('bp_high', 100.0)
+        bp_order   = p.get('bp_order', 4)
+        total_gain = p.get('total_gain', 1.0)
+        fps_stable = p.get('fps_stable', 77.0)
+        auto_sc    = p.get('auto_sc', True)
+        uv_half    = p.get('uv_half', 500.0)
+        n_fft      = p.get('n_fft', 256)
+        max_pts    = p.get('max_pts', 120)  # 0 = no display decimation
+
+        _CLIP    = int(FS * 0.97)
+        _empty_x = np.array([0.0, 1.0])
+        _empty_y = np.array([0.0, 0.0])
+        _MAX     = self._MAX_PROC
+
+        # Pre-compute decimation factor once for the whole frame.
+        # For a 20 s window at 500 FPS → 10 000 samples; we decimate
+        # to _MAX_PROC (600) so bandpass runs on ~600 pts, not 10 000.
+        _dec_factor = max(1, n_samp // _MAX) if n_samp > _MAX else 1
+        # Effective sample rate after early decimation
+        _eff_fps = fps_stable / _dec_factor if _dec_factor > 1 else fps_stable
+
+        frame = {}
+        clip  = {}
+
+        for row in range(8):
+            for col in range(8):
+                flat = ELEC_GRID.get((col, row))
+                if flat is None:
+                    continue
+
+                raw = r.get_channel(flat, n_samp)
+                if len(raw) < 2:
+                    frame[flat] = (_empty_x, _empty_y)
+                    clip[flat] = False
+                    continue
+
+                arr_int = np.array(raw, dtype=np.int32)
+                clip[flat] = bool(
+                    arr_int.size > 0
+                    and int(np.max(np.abs(arr_int))) >= _CLIP)
+
+                if fft_mode:
+                    raw_fft = r.get_channel(flat, n_fft)
+                    arr = np.array(raw_fft, dtype=float) / FS * VREF / total_gain * 1e6
+                else:
+                    # Early decimation: reduce 10 000 → ~600 samples BEFORE
+                    # expensive operations (bandpass, scaling).
+                    if _dec_factor > 1:
+                        n_out = len(arr_int) // _dec_factor
+                        arr_int = arr_int[:n_out * _dec_factor].reshape(
+                            n_out, _dec_factor).mean(axis=1).astype(np.int32)
+                    arr = arr_int.astype(float) / FS * VREF / total_gain * 1e6
+
+                if bp_on and not fft_mode:
+                    arr = bandpass_filter(arr, bp_low, bp_high, _eff_fps, bp_order)
+
+                if fft_mode:
+                    if bp_on:
+                        arr = bandpass_filter(arr, bp_low, bp_high, fps_stable, bp_order)
+                    freq, mag = compute_fft(arr, fps_stable)
+                    if mag.size > 1:
+                        mag_max = float(mag.max())
+                        x_n = np.linspace(0, 1, len(mag))
+                        y_n = mag / max(mag_max, 1e-9) * 0.85
+                    else:
+                        x_n, y_n = _empty_x, _empty_y
+                else:
+                    arr = display_decimate(arr, max_pts) if max_pts > 0 else arr
+                    n = len(arr)
+                    if n > 0:
+                        x_n = np.linspace(0, 1, n)
+                        if auto_sc:
+                            mn = float(arr.min())
+                            mx = float(arr.max())
+                            rng = max(mx - mn, 1.0)
+                            ctr = (mn + mx) * 0.5
+                            y_n = (arr - ctr) / (rng * 0.5) * 0.85
+                        else:
+                            y_n = np.clip(arr / max(uv_half, 1.0) * 0.85,
+                                          -1.0, 1.0)
+                    else:
+                        x_n, y_n = _empty_x, _empty_y
+
+                frame[flat] = (x_n, y_n)
+
+        with self._lock:
+            self._frame = frame
+            self._clip = clip
+            self._new = True
+
+
+# =============================================================================
 # Data Receiver Thread
 # =============================================================================
 
 class DataReceiver(threading.Thread):
+    # UDP datagram = UDP_REDUNDANCY frames; each frame is rx.FRAME_SIZE bytes.
+    UDP_REDUNDANCY = 5
+    UDP_SPACING    = 4
+    # Dedup window: must cover the full spread of staggered copies.
+    # With R=5, S=4 the oldest copy is (R-1)*S = 16 packets behind the newest.
+    # Use 2× that for safety margin against reordering.
+    _DEDUP_WINDOW  = 2 * (UDP_REDUNDANCY - 1) * UDP_SPACING  # 32
+
     def __init__(self, port, buf_size):
         super().__init__(daemon=True)
         self.port      = port
@@ -319,13 +519,18 @@ class DataReceiver(threading.Thread):
         self.fps            = 0.0
         self.connected      = False
         self.client_ip      = ""
-        self.bytes_session  = 0   # raw bytes received in current TCP session
+        self.bytes_session  = 0   # raw bytes received in current UDP session
         self._last_seq      = None
         self._fps_count     = 0
         self._fps_time      = time.time()
         self.last_frame_time = 0.0   # wall-clock time of last successfully ingested frame
         self._stop_event    = threading.Event()
-        self._current_conn  = None   # active data socket (set in _process)
+        self._current_conn  = None   # kept for API compat (force_disconnect)
+        self._udp_sock      = None   # the UDP socket
+        # --- dedup ring (set of recently ingested seq numbers) ---
+        self._seen_seqs      = set()
+        self._seen_seq_order = collections.deque()  # FIFO to evict oldest
+        self.dedup_hits      = 0   # counter: duplicate frames suppressed
         # --- recovery ring-files ---
         self._rec_lock       = threading.Lock()
         self._rec_file       = None   # open file handle for active recovery file
@@ -343,156 +548,152 @@ class DataReceiver(threading.Thread):
         self._log_roll_mins = 60
         self._log_next_roll = None
         self.log_curr_path  = ''
+        # --- HDF5 log ---
+        self._h5_file           = None
+        self._h5_buf_samp       = []   # list of (72,) sample tuples
+        self._h5_buf_ts         = []   # list of uint32 timestamps
+        self._h5_buf_seq        = []   # list of uint16 sequence numbers
+        self._h5_flush_interval = 500  # frames between flushes (~1 s at 500 SPS)
+        self._h5_config         = None # config snapshot dict for file metadata
 
     def run(self):
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        """Main receiver loop — UDP on port self.port (default 9004).
+
+        Each datagram = UDP_REDUNDANCY × FRAME_SIZE bytes (5 × 228 = 1140).
+        Frames are parsed and deduplicated; only unique new frames are ingested.
+        No connection state — the Pico fires and forgets.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # 512 KB receive buffer — at 4× redundancy (456 KB/s) this gives
+        # ~1.1 s of headroom for GIL contention / processing delays.
         try:
-            srv.bind(('0.0.0.0', self.port))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+        except Exception:
+            pass
+        try:
+            sock.bind(('0.0.0.0', self.port))
         except OSError as e:
-            print(f"[DATA-RX] FATAL: Cannot bind port {self.port}: {e}")
+            print(f"[DATA-RX] FATAL: Cannot bind UDP port {self.port}: {e}")
             return
-        srv.listen(1)
-        srv.settimeout(1.0)
-        print(f"[DATA-RX] Listening on 0.0.0.0:{self.port} for Pico data stream")
+        sock.settimeout(1.0)
+        self._udp_sock = sock
+        print(f"[DATA-RX] Listening on UDP 0.0.0.0:{self.port} "
+              f"({self.UDP_REDUNDANCY}× redundancy, dedup window={self._DEDUP_WINDOW})")
+
+        _log_t = time.time()
+        FRAME_SZ = rx.FRAME_SIZE
+        EXPECTED_DGRAM = self.UDP_REDUNDANCY * FRAME_SZ  # 912
+
         while not self._stop_event.is_set():
             try:
-                conn, addr = srv.accept()
+                data, addr = sock.recvfrom(2048)
             except socket.timeout:
+                # Mark disconnected if no data for >5 seconds
+                if self.connected and time.time() - self.last_frame_time > 5.0:
+                    print(f"[DATA-RX] No UDP data for 5s — marking disconnected")
+                    self.connected = False
                 continue
-            print(f"[DATA-RX] Pico connected from {addr[0]}:{addr[1]}")
-            self.connected      = True
-            self.client_ip      = addr[0]
-            self.frames_session = 0
-            self.bytes_session  = 0
-            self.missed_session = 0
-            self._last_seq      = None
-            self._process(conn)
-            self.connected = False
-            print(f"[DATA-RX] Pico disconnected. Session: {self.frames_session} frames, {self.bytes_session} bytes")
-        srv.close()
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    print(f"[DATA-RX] UDP recv error: {e}")
+                break
+
+            self.bytes_session += len(data)
+
+            # Mark connected on first datagram (or when source changes)
+            if not self.connected or self.client_ip != addr[0]:
+                self.client_ip = addr[0]
+                if not self.connected:
+                    print(f"[DATA-RX] Receiving UDP data from {addr[0]}:{addr[1]}")
+                    self.connected      = True
+                    self.frames_session = 0
+                    self.bytes_session  = len(data)
+                    self.missed_session = 0
+
+            # Parse individual frames from the datagram
+            n_frames = len(data) // FRAME_SZ
+            for i in range(n_frames):
+                frame_bytes = data[i * FRAME_SZ : (i + 1) * FRAME_SZ]
+                self._ingest(frame_bytes)
+
+            # Periodic stats every 5 seconds
+            _now = time.time()
+            if _now - _log_t >= 5.0:
+                print(f"[DATA-RX] fps={self.fps:.0f}  frames={self.frames_session}  "
+                      f"bytes={self.bytes_session}  crc_err={self.crc_errors}  "
+                      f"missed={self.missed_session}  dedup={self.dedup_hits}")
+                _log_t = _now
+
+        self._udp_sock = None
+        sock.close()
 
     def force_disconnect(self):
-        """Close the active data socket from any thread.
-        Causes _process()'s recv() to raise immediately, breaking the loop.
-        The receiver then falls back to srv.accept() so the Pico can reconnect."""
-        conn = self._current_conn
-        if conn is not None:
-            print("[DATA-RX] force_disconnect() called — closing active socket")
+        """Compatibility shim — UDP has no connection to close.
+        Closes the UDP socket to unblock recvfrom(); the run() loop
+        will rebind on the next iteration if needed."""
+        sock = self._udp_sock
+        if sock is not None:
+            print("[DATA-RX] force_disconnect() — closing UDP socket")
             try:
-                conn.shutdown(socket.SHUT_RDWR)
+                sock.close()
             except Exception:
                 pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _process(self, conn):
-        # TCP_NODELAY on the host side prompts the OS to ACK incoming data
-        # quickly rather than batching ACKs (Windows delayed-ACK = 200 ms).
-        # Together with TCP_NODELAY on the Pico this lifts FPS from ~10 to
-        # the full ~100-200 FPS the hardware can sustain.
-        try:
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except Exception:
-            pass
-        # Enable TCP keepalive to detect dead connections faster.
-        # Without this, a silently-dead Pico can hold the socket open for
-        # minutes while the OS waits for its default keepalive timeout.
-        try:
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            if hasattr(socket, 'TCP_KEEPIDLE'):   # Linux
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-            elif hasattr(socket, 'SIO_KEEPALIVE_VALS'):   # Windows
-                # struct: (onoff=1, keepalivetime_ms=5000, keepaliveinterval_ms=2000)
-                conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5000, 2000))
-        except Exception:
-            pass
-        conn.settimeout(5.0)    # 5 s (was 10) — Pico streams at ~200 FPS
-        self._current_conn = conn
-        buf = bytearray()
-        _log_t = time.time()
-        _last_frame_t = time.time()   # frame-level watchdog
-        _FRAME_WD_SEC = 15.0          # force-close if no valid frames this long
-        while not self._stop_event.is_set():
-            try:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    print("[DATA-RX] Connection closed by Pico (recv returned empty)")
-                    break
-                self.bytes_session += len(chunk)
-                buf.extend(chunk)
-                _got_frame = False
-                while len(buf) >= rx.FRAME_SIZE:
-                    pos = rx.MushIOReceiver._find_sync(buf)
-                    if pos < 0:
-                        buf = buf[-1:]; break
-                    if pos > 0:
-                        buf = buf[pos:]
-                    if len(buf) < rx.FRAME_SIZE:
-                        break
-                    frame_bytes = bytes(buf[:rx.FRAME_SIZE])
-                    buf = buf[rx.FRAME_SIZE:]
-                    self._ingest(frame_bytes)
-                    _got_frame = True
-                if _got_frame:
-                    _last_frame_t = time.time()
-                # Frame-level watchdog: bytes arriving but no valid frames
-                # for an extended period means a corrupted / stale stream.
-                elif time.time() - _last_frame_t > _FRAME_WD_SEC:
-                    print(f"[DATA-RX] Frame watchdog: no valid frames for {_FRAME_WD_SEC:.0f}s -- disconnecting")
-                    break
-                # Periodic stats every 5 seconds
-                _now = time.time()
-                if _now - _log_t >= 5.0:
-                    print(f"[DATA-RX] fps={self.fps:.0f}  frames={self.frames_session}  bytes={self.bytes_session}  crc_err={self.crc_errors}  missed={self.missed_session}")
-                    _log_t = _now
-            except socket.timeout:
-                print("[DATA-RX] Socket timeout (5s no data) -- disconnecting")
-                break
-            except Exception as e:
-                print(f"[DATA-RX] Exception in _process: {e}")
-                break
-        self._current_conn = None
-        try:
-            conn.close()
-        except Exception:
-            pass   # already closed by force_disconnect()
 
     def _ingest(self, frame_bytes):
         if self._paused:
             return
+
+        # ---- Fast dedup BEFORE expensive CRC (Phase 3B) ----
+        # With 4× staggered redundancy, 75% of frames are duplicates.
+        # Extract seq from the header (bytes 6-7) cheaply to skip CRC
+        # on duplicates.  This is critical for throughput: the pure-Python
+        # CRC costs ~2 ms per frame, and at 2000 frames/sec (4 × 500 FPS)
+        # that would saturate the thread.
+        if len(frame_bytes) < rx.HEADER_SIZE:
+            return
+        sync = struct.unpack_from('<H', frame_bytes, 0)[0]
+        if sync != rx.SYNC_WORD:
+            return
+        seq = struct.unpack_from('<H', frame_bytes, 6)[0]
+
+        if seq in self._seen_seqs:
+            self.dedup_hits += 1
+            return
+
+        # ---- First time seeing this seq — full parse + CRC ----
         parsed = rx.parse_frame(frame_bytes)
         if parsed is None:
             return
-        self.frames_total   += 1
-        self.frames_session += 1
-        self._fps_count     += 1
         if not parsed['crc_valid']:
             self.crc_errors += 1
             return
-        seq = parsed['seq']
+
+        # Record this seq as seen
+        self._seen_seqs.add(seq)
+        self._seen_seq_order.append(seq)
+        while len(self._seen_seq_order) > self._DEDUP_WINDOW:
+            old = self._seen_seq_order.popleft()
+            self._seen_seqs.discard(old)
+
+        # ---- Unique frame — count and check for gaps ----
+        self.frames_total   += 1
+        self.frames_session += 1
+        self._fps_count     += 1
+
         if self._last_seq is not None:
             expected = (self._last_seq + 1) & 0xFFFF
             if seq != expected:
                 gap = (seq - expected) & 0xFFFF
+                # With UDP redundancy, a "backward" seq (gap > 32768) means
+                # a late-arriving older frame — not a true gap.  Drop it.
+                if gap >= 32768:
+                    # Stale frame — seq is behind _last_seq.  Already deduped
+                    # above for exact matches; this catches out-of-order frames
+                    # with seqs older than our dedup window.
+                    return
                 self.missed_frames += gap
                 self.missed_session += gap
-                # Only flush on a full uint16 wraparound gap (≥32768).
-                # Smaller gaps are caused by Pico-side ring-buffer drops
-                # (Core 1 seq counter increments even when ring_push fails),
-                # NOT by stale data on the host — so don't clear the display.
-                # A gap ≥ 32768 indicates the Pico seq counter restarted from
-                # 0 while the TCP session stayed open (firmware reset), which
-                # would make buffered data genuinely stale.
-                _flush_threshold = 32768
-                if gap >= _flush_threshold:
-                    for buf in self.buffers:
-                        buf.clear()
-                    self.timestamps.clear()
         self._last_seq = seq
         for i, s in enumerate(parsed['samples']):
             self.buffers[i].append(s)
@@ -504,27 +705,46 @@ class DataReceiver(threading.Thread):
             self.fps        = self._fps_count / dt
             self._fps_count = 0
             self._fps_time  = now
-        # Binary log (valid frames only, user-initiated)
+        # Data log (valid frames only, user-initiated)
         if self.log_active:
             with self._log_lock:
-                if self._log_next_roll and now >= self._log_next_roll:
-                    self._open_log_file()
-                if self._log_file:
+                if self._h5_file is not None:
+                    # HDF5 path: buffer parsed data, flush periodically
+                    self._h5_buf_samp.append(list(parsed['samples']))
+                    self._h5_buf_ts.append(parsed['timestamp_us'])
+                    self._h5_buf_seq.append(seq)
+                    self.log_frames += 1
+                    if len(self._h5_buf_samp) >= self._h5_flush_interval:
+                        self._h5_flush()
+                    # Rolling: close current HDF5, open new file
+                    if self._log_next_roll and now >= self._log_next_roll:
+                        self._h5_flush()
+                        try: self._h5_file.close()
+                        except Exception: pass
+                        self._open_h5_file(self._h5_config)
+                elif self._log_file:
+                    # Legacy .bin path (fallback when h5py unavailable)
+                    if self._log_next_roll and now >= self._log_next_roll:
+                        self._open_log_file()
                     self._log_file.write(frame_bytes)
                     self.log_frames += 1
         # Recovery ring-file (always-on, small rolling window)
         self._write_recovery_frame(frame_bytes)
 
-    # --- binary rolling log API ---
+    # --- recording log API ---
 
-    def start_logging(self, data_dir, prefix, roll_mins):
+    def start_logging(self, data_dir, prefix, roll_mins, config_dict=None):
         with self._log_lock:
             self._log_dir       = data_dir
             self._log_prefix    = prefix
             self._log_roll_mins = max(1, roll_mins)
             self.log_frames     = 0
             self.log_active     = True
-            self._open_log_file()
+            self._h5_config     = config_dict
+            if HAS_H5PY:
+                self._open_h5_file(config_dict)
+            else:
+                self._open_log_file()
 
     def _open_log_file(self):
         """Open a new .bin file (must be called with _log_lock held)."""
@@ -538,9 +758,94 @@ class DataReceiver(threading.Thread):
         self.log_curr_path  = path
         self._log_next_roll = time.time() + self._log_roll_mins * 60
 
+    # --- HDF5 log API ---
+
+    def _open_h5_file(self, config_dict):
+        """Create a new .h5 file with extensible datasets and embedded metadata.
+        Must be called with _log_lock held."""
+        if self._h5_file is not None:
+            try:
+                self._h5_flush()
+                self._h5_file.close()
+            except Exception:
+                pass
+        os.makedirs(self._log_dir, exist_ok=True)
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self._log_dir, f"{self._log_prefix}_{ts}.h5")
+        f = h5py.File(path, 'w')
+        # --- extensible data datasets ---
+        dg = f.create_group('data')
+        dg.create_dataset('samples',       shape=(0, rx.TOTAL_CHANNELS),
+                          maxshape=(None, rx.TOTAL_CHANNELS),
+                          chunks=(500, rx.TOTAL_CHANNELS),
+                          dtype=np.int32, compression='gzip',
+                          compression_opts=1)
+        dg.create_dataset('timestamps_us', shape=(0,), maxshape=(None,),
+                          chunks=(500,), dtype=np.uint32)
+        dg.create_dataset('seq',           shape=(0,), maxshape=(None,),
+                          chunks=(500,), dtype=np.uint16)
+        # --- channel info ---
+        dt_str = h5py.string_dtype()
+        f.create_dataset('channels',      data=rx.CHANNEL_NAMES,     dtype=dt_str)
+        ch_types = ['stim' if i in rx.STIM_CHANNEL_INDICES else 'recording'
+                    for i in range(rx.TOTAL_CHANNELS)]
+        f.create_dataset('channel_types', data=ch_types,             dtype=dt_str)
+        # --- hardware metadata ---
+        mg = f.create_group('metadata')
+        mg.attrs['vref']           = rx.VREF
+        mg.attrs['afe_gain']       = rx.AFE_GAIN
+        mg.attrs['adc_full_scale'] = rx.ADC_FULL_SCALE
+        mg.attrs['frame_size']     = rx.FRAME_SIZE
+        mg.attrs['total_channels'] = rx.TOTAL_CHANNELS
+        mg.attrs['sps']            = rx.ADC_DATA_RATE_SPS
+        # --- experiment metadata ---
+        eg = f.create_group('experiment')
+        eg.attrs['start_time'] = datetime.now().isoformat(timespec='seconds')
+        if config_dict:
+            eg.attrs['gui_config_json'] = json.dumps(config_dict)
+            exp = config_dict.get('experiment', {})
+            for k in ('board_id', 'species_common', 'species_scientific',
+                       'description'):
+                if k in exp:
+                    eg.attrs[k] = str(exp[k])
+        self._h5_file      = f
+        self.log_curr_path = path
+        self._log_next_roll = time.time() + self._log_roll_mins * 60
+        print(f"[DATA-RX] HDF5 recording: {path}", flush=True)
+
+    def _h5_flush(self):
+        """Append buffered frames to HDF5 datasets.  Must be called with
+        _log_lock held.  No-op if buffer is empty."""
+        if not self._h5_buf_samp or self._h5_file is None:
+            return
+        n = len(self._h5_buf_samp)
+        samp_arr = np.array(self._h5_buf_samp, dtype=np.int32)   # (n, 72)
+        ts_arr   = np.array(self._h5_buf_ts,   dtype=np.uint32)  # (n,)
+        seq_arr  = np.array(self._h5_buf_seq,  dtype=np.uint16)  # (n,)
+        ds_s = self._h5_file['data/samples']
+        ds_t = self._h5_file['data/timestamps_us']
+        ds_q = self._h5_file['data/seq']
+        old  = ds_s.shape[0]
+        ds_s.resize(old + n, axis=0);  ds_s[old:] = samp_arr
+        ds_t.resize(old + n, axis=0);  ds_t[old:] = ts_arr
+        ds_q.resize(old + n, axis=0);  ds_q[old:] = seq_arr
+        self._h5_file.flush()
+        self._h5_buf_samp.clear()
+        self._h5_buf_ts.clear()
+        self._h5_buf_seq.clear()
+
     def stop_logging(self):
         with self._log_lock:
             self.log_active = False
+            # HDF5 path
+            if self._h5_file is not None:
+                try:
+                    self._h5_flush()
+                    self._h5_file.close()
+                except Exception:
+                    pass
+                self._h5_file = None
+            # Legacy .bin path
             if self._log_file:
                 try: self._log_file.close()
                 except Exception: pass
@@ -660,19 +965,24 @@ class DataReceiver(threading.Thread):
 class DemoDataInjector(threading.Thread):
     """
     Injects synthetic biopotential data into DataReceiver buffers.
-    Each electrode column (0-7) has a distinct signal type so all GUI
-    features can be exercised without hardware.
+    Matches the Pico firmware's demo signal generator: pure sine waves
+    whose frequency increases with column index (1-12 Hz), so display
+    fidelity and decimation can be verified visually.
 
     Column types
     ------------
-    Col 0 : Gaussian white noise           (resting-state baseline)
-    Col 1 : Triangle wave 1.5 Hz           (slow LFP — visually distinct from sine)
-    Col 2 : Action-potential spike trains  (Poisson, ~5 Hz)
-    Col 3 : Pure DC offsets per row        (demonstrates baseline/gain/saturation)
-    Col 4 : Chirp 2→20 Hz over 4 s         (frequency sweep)
-    Col 5 : 20 Hz burst firing             (periodic 0.5 s bursts / 2 s)
-    Col 6 : Brownian random walk           (1/f-like noise)
-    Col 7 : Sawtooth 6 Hz + noise          (asymmetric ramp)
+    Col 0 : 1 Hz sine                      (verifies basic rendering)
+    Col 1 : 2 Hz sine                      (low frequency baseline)
+    Col 2 : 4 Hz sine                      (mid frequency)
+    Col 3 : 6 Hz sine                      (Nyquist boundary at Low detail)
+    Col 4 : 8 Hz sine                      (aliased at Low detail, clean at Med)
+    Col 5 : 10 Hz sine                     (aliased at Low detail, clean at Med)
+    Col 6 : 12 Hz sine                     (Nyquist boundary at Med detail)
+    Col 7 : Action-potential spike trains   (biological test signal)
+
+    Row offset: each row in a column has a phase offset so waveforms
+    are visually distinct.  Amplitude is 40% of ADC full-scale (matches
+    Pico firmware demo).
     """
 
     FPS = 200.0
@@ -718,6 +1028,7 @@ class DemoDataInjector(threading.Thread):
             self._rx._fps_count     += 1
 
             now2 = time.time()
+            self._rx.last_frame_time = now2
             dt   = now2 - self._rx._fps_time
             if dt >= 0.5:
                 self._rx.fps        = self._rx._fps_count / dt
@@ -743,64 +1054,23 @@ class DemoDataInjector(threading.Thread):
             samples.append(max(-8388607, min(8388607, int(s))))
         return samples
 
+    # Sine frequencies per column — matches Pico firmware demo generator.
+    # Columns 0-6: pure sines 1-12 Hz; column 7: spike trains for bio test.
+    _COL_FREQ = [1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, None]
+
     def _column_wave(self, col, row, ch, t, frame_idx):
-        amp   = 200 + row * 70          # row scales amplitude
-        phase = row * math.pi / 4.0
+        # ~1 mV pk-pk input-referred (matches Pico firmware demo amplitude)
+        # amp_frac = 1 mV * AFE_GAIN / (2 * VREF) ≈ 0.0011
+        amp   = int(0.0011 * 8388607)   # ≈ 9227 counts
+        phase = row * math.pi / 4.0     # phase-offset per row
 
-        if col == 0:
-            # Gaussian white noise
-            return int(random.gauss(0, amp * 0.9))
+        freq = self._COL_FREQ[col]
+        if freq is not None:
+            # Pure sine wave — clean signal for display fidelity verification
+            return int(amp * math.sin(2 * math.pi * freq * t + phase))
 
-        elif col == 1:
-            # Triangle wave 1.5 Hz — slow LFP, visually distinct from sine
-            # asin(sin(x))/pi*2 gives a triangle with range [-1, 1]
-            tri = 2.0 / math.pi * math.asin(
-                math.sin(2 * math.pi * 1.5 * t + phase))
-            return int(amp * 3.5 * tri)
-
-        elif col == 2:
-            # Poisson action-potential spike train (~5 Hz)
-            return self._spike(ch, amp)
-
-        elif col == 3:
-            # Pure DC offsets — each row holds a different constant level
-            # (demonstrates baseline offsets, DC coupling, and gain saturation)
-            dc_levels = [-8388600, -8200000, -3000000, -800, 800, 3000000, 8200000, 8388600]
-            dc = dc_levels[row] if row < len(dc_levels) else 0
-            return int(dc + random.gauss(0, 12))
-
-        elif col == 4:
-            # Chirp: frequency sweeps 2→20 Hz over a 4 s period + light noise
-            chirp_period = 4.0
-            f_lo, f_hi   = 2.0, 20.0
-            frac         = math.fmod(t + row * chirp_period / 8.0, chirp_period) / chirp_period
-            f_inst       = f_lo + (f_hi - f_lo) * frac
-            chirp        = amp * 2.2 * math.sin(2 * math.pi * f_inst * t + phase)
-            return int(chirp + random.gauss(0, amp * 0.2))
-
-        elif col == 5:
-            # Burst activity: 20 Hz oscillation in 0.5 s bursts every 2 s
-            burst_period = 2.0
-            burst_dur    = 0.5
-            cycle_t      = math.fmod(t + row * burst_period / 8.0, burst_period)
-            if cycle_t < burst_dur:
-                osc = amp * 3.0 * math.sin(2 * math.pi * 20.0 * t + phase)
-                return int(osc + random.gauss(0, amp * 0.2))
-            return int(random.gauss(0, amp * 0.18))
-
-        elif col == 6:
-            # Brownian random walk (1/f noise)
-            step         = random.gauss(0, 35)
-            self._rw[ch] = max(-4500.0, min(4500.0, self._rw[ch] * 0.998 + step))
-            return int(self._rw[ch])
-
-        elif col == 7:
-            # Sawtooth 6 Hz + light noise — asymmetric ramp, visually unlike sine
-            # math.fmod gives [0,1) ramp; shift to [-1, 1)
-            saw = 2.0 * math.fmod(6.0 * t + phase / (2 * math.pi), 1.0) - 1.0
-            return int(amp * 2.2 * saw + random.gauss(0, amp * 0.25))
-
-        return 0
+        # Column 7: Poisson action-potential spike train (~5 Hz)
+        return self._spike(ch, int(amp * 0.15))
 
     def _spike(self, ch, amp):
         """Return one sample of a Poisson spike train with realistic AP shape."""
@@ -1293,6 +1563,7 @@ class MushIOGUI:
         self._display_secs   = tk.DoubleVar(value=DISPLAY_SECS)
         self._uv_scale       = tk.DoubleVar(value=500.0)
         self._auto_scale     = tk.BooleanVar(value=True)
+        self._display_detail = tk.StringVar(value='Med (120)')
         self._fft_mode       = tk.BooleanVar(value=False)
         self._overlay_panels = tk.IntVar(value=1)
         self._waterfall_var  = tk.DoubleVar(value=500.0)  # µV stacking offset
@@ -1348,6 +1619,7 @@ class MushIOGUI:
         self._grid_texts     = {}
         self._stim_grid_lines = {}
         self._stim_grid_axes  = {}
+        self._stim_grid_texts = {}
 
         self._overlay_fig          = None
         self._overlay_canvas       = None
@@ -1552,7 +1824,10 @@ class MushIOGUI:
         # Start background services
         print(f"[INIT] MushIO GUI starting ({'DEMO' if self._demo_mode else 'LIVE'} mode)")
         print(f"[INIT] Data port: {self.data_port}  CMD: {self.cmd_host}:{self.cmd_port}")
-        self._start_receiver()
+        # DataReceiver is created now (for recovery preload) but the thread
+        # is started AFTER _finalize_ui completes to avoid UDP buffer overflow
+        # during heavy matplotlib init.  See _finalize_ui().
+        self._start_receiver_create_only()
         self._start_cmd_client()
 
         # UDP beacon listener for Pico auto-discovery
@@ -1567,8 +1842,9 @@ class MushIOGUI:
         )
         self._webcam.start()
 
-        # Start render loops
-        self._start_grid_loop()
+        # Start render loops — grid loop is deferred to _finalize_ui so the
+        # initial canvas.draw() happens at the small (1440×900) size.
+        # _start_grid_loop() is called at the end of _finalize_ui.
 
         # Polling
         self._poll_cmd_queue()
@@ -1576,28 +1852,47 @@ class MushIOGUI:
         self._poll_webcam()
         self._poll_recording_status()
 
-        # Defer initial canvas draw so the window appears instantly
+        # Defer finalization and grid start so the window appears instantly
         self.root.after(80, self._finalize_ui)
 
     def _finalize_ui(self):
-        """Draw all matplotlib canvases after the window is rendered."""
+        """Finish UI setup after the window is rendered."""
         # Force Tkinter to process all pending geometry/style requests so
         # ttk.LabelFrame interiors and comboboxes don't flash white on startup.
         self.root.update_idletasks()
-        if self._grid_canvas:
-            self._grid_canvas.draw_idle()
-        if self._overlay_canvas:
-            self._overlay_canvas.draw_idle()
-        if self._heatmap_canvas:
-            self._heatmap_canvas.draw_idle()
-        if self._stim_canvas:
-            self._stim_canvas.draw_idle()
+
+        # --- Maximize FIRST, then pre-render at the final size ---
+        # Doing canvas.draw() once at full-screen size avoids the expensive
+        # post-maximize background rebuild that would freeze the UI for ~3 s.
+        self.root.state('zoomed')
+        self.root.update()                 # process ALL events incl. resize
+
+        _t0 = time.perf_counter()
+        _fig = self._grid_fig
+        _w = _fig.get_figwidth() * _fig.get_dpi()
+        _h = _fig.get_figheight() * _fig.get_dpi()
+        print(f"[GRID] Figure pixel size: {_w:.0f}×{_h:.0f} "
+              f"dpi={_fig.get_dpi()}")
+        self._grid_canvas.draw()
+        self._grid_bg = self._grid_canvas.copy_from_bbox(_fig.bbox)
+        print(f"[GRID] Pre-render at fullscreen: "
+              f"{(time.perf_counter()-_t0)*1000:.0f} ms")
+        # Cancel any pending rebuild scheduled by the resize event handler
+        # (the resize fired when we maximized above, but we just did the
+        # pre-render at full size so no rebuild is needed).
+        _pending = getattr(self, '_grid_resize_after_id', None)
+        if _pending is not None:
+            self.root.after_cancel(_pending)
+            self._grid_resize_after_id = None
+        # NOW start the grid render loop (after background is cached)
+        self._start_grid_loop()
+        # Start the UDP receiver thread now that heavy init is done.
+        # This prevents UDP buffer overflow during canvas.draw() above.
+        self._start_receiver_thread()
         # Populate experiment description text widget (needs window to exist first)
         if self._exp_desc_loaded and hasattr(self, '_exp_desc_txt'):
             self._exp_desc_txt.delete('1.0', tk.END)
             self._exp_desc_txt.insert('1.0', self._exp_desc_loaded)
-        # Second pass — force a full render after canvases have been drawn
-        self.root.update_idletasks()
         # Auto-enable webcam if it was enabled last session
         if self._cam_enable_var.get():
             self._on_cam_enable()
@@ -1661,15 +1956,22 @@ class MushIOGUI:
 
         self._build_top_bar()
 
+        # Scale panel sizes based on screen DPI
+        _dpi_scale = max(1.0, self.root.winfo_fpixels('1i') / 96.0)
+        _sash_w    = max(6, int(6 * _dpi_scale))
+        _left_w    = max(260, int(260 * _dpi_scale))
+        _left_min  = max(200, int(200 * _dpi_scale))
+
         main_pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL,
-                                   bg=BG_DARK, sashwidth=5, sashrelief=tk.FLAT)
+                                   bg=BG_DARK, sashwidth=_sash_w,
+                                   sashrelief=tk.RAISED, sashpad=2)
         main_pane.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
 
-        left = self._build_left_panel(main_pane)
-        main_pane.add(left, minsize=240, width=248)
+        left = self._build_left_panel(main_pane, panel_width=_left_w)
+        main_pane.add(left, minsize=_left_min, width=_left_w)
 
         nb_frame = self._build_notebook_area(main_pane)
-        main_pane.add(nb_frame, minsize=700)
+        main_pane.add(nb_frame, minsize=int(500 * _dpi_scale))
 
         self._build_status_bar()
 
@@ -1689,6 +1991,13 @@ class MushIOGUI:
             relief=tk.FLAT, bd=0, font=('Consolas', 9, 'bold'), pady=3,
             command=self._toggle_demo)
         self._demo_btn.pack(side=tk.RIGHT, padx=8)
+
+        # Demo waveform description — hidden by default, shown when demo active
+        self._demo_info_lbl = tk.Label(
+            ds, text="", bg=BG_MID, fg=ORANGE,
+            font=('Consolas', 8), anchor=tk.E)
+        # (packed/unpacked dynamically in _start_demo / _stop_demo)
+
         tk.Label(ds, text="Data stream  port:", bg=BG_MID, fg=FG_DIM).pack(side=tk.LEFT)
         self._data_port_var = tk.StringVar(value=str(self.data_port))
         tk.Entry(ds, textvariable=self._data_port_var, width=6,
@@ -1725,13 +2034,13 @@ class MushIOGUI:
 
     # ---- left panel (scrollable) -----------------------------------------
 
-    def _build_left_panel(self, parent):
+    def _build_left_panel(self, parent, panel_width=260):
         """Return a vertically-scrollable sidebar containing all left-panel sections."""
-        container = tk.Frame(parent, bg=BG_DARK, width=260)
+        container = tk.Frame(parent, bg=BG_DARK, width=panel_width)
         container.pack_propagate(False)
 
         canvas = tk.Canvas(container, bg=BG_DARK, highlightthickness=0,
-                           width=258, bd=0)
+                           width=panel_width - 2, bd=0)
         sb = ttk.Scrollbar(container, orient='vertical', command=canvas.yview)
         canvas.configure(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1834,6 +2143,18 @@ class MushIOGUI:
         _fft_entry.grid(row=4, column=1, sticky=tk.W, padx=4, pady=(4, 0))
         _tt(_fft_entry, "Upper frequency limit for the FFT view.\n"
                         "0 = auto (half the current sample rate / Nyquist).")
+
+        # ---- Display resolution (decimation) --------------------------------
+        tk.Label(frame, text="Display res:", bg=BG_DARK,
+                 fg=FG_DIM).grid(row=5, column=0, sticky=tk.W, pady=(4, 0))
+        _detail_cb = ttk.Combobox(frame, textvariable=self._display_detail,
+                                  values=['Low (60)', 'Med (120)',
+                                          'High (300)', 'Full'],
+                                  width=10, state='readonly')
+        _detail_cb.grid(row=5, column=1, sticky=tk.W, padx=4, pady=(4, 0))
+        _tt(_detail_cb, "Display points per grid cell (display resolution).\n"
+                        "Higher = more faithful waveforms, slower rendering.\n"
+                        "Med (120) correctly displays up to 12 Hz at 5 s window.")
 
     def _on_tw_combo_select(self, _event=None):
         val = self._tw_combo.get()
@@ -2264,6 +2585,7 @@ class MushIOGUI:
         self._ch_colors_hc    = {}   # flat -> high-contrast palette hex string
         self._stim_grid_lines = {}
         self._stim_grid_axes  = {}
+        self._stim_grid_texts = {}
         # Reverse maps for click-to-toggle: axes object -> flat index
         self._grid_ax_to_elec = {}   # ax -> electrode flat index
         self._grid_ax_to_stim = {}   # ax -> stim flat index
@@ -2283,16 +2605,29 @@ class MushIOGUI:
                 ax = self._grid_fig.add_subplot(gs[gs_row, gs_col])
                 ax.tick_params(labelbottom=False, labelleft=False,
                                bottom=False, left=False)
+                # Completely disable tick computation — NullLocator skips
+                # the tick-position search that dominates canvas.draw() time
+                # with 72 axes.
+                ax.xaxis.set_major_locator(NullLocator())
+                ax.yaxis.set_major_locator(NullLocator())
+                ax.xaxis.set_minor_locator(NullLocator())
+                ax.yaxis.set_minor_locator(NullLocator())
+
+                # Hide spines — use patch edgecolor for cell borders instead.
+                # Removing 288 spine artists from canvas.draw() saves ~1 s.
+                for sp in ax.spines.values():
+                    sp.set_visible(False)
 
                 if is_stim:
                     sname, flat = STIM_PHYS_TO_INFO[(pc, pr)]
                     ax.set_facecolor(STIM_BG)
-                    for sp in ax.spines.values():
-                        sp.set_color(ORANGE); sp.set_linewidth(0.8)
-                    line, = ax.plot([], [], color=ORANGE, linewidth=0.7, rasterized=True)
-                    ax.text(0.04, 0.92, sname, transform=ax.transAxes,
-                            fontsize=4, color=ORANGE, va='top', ha='left')
+                    ax.patch.set_edgecolor(ORANGE)
+                    ax.patch.set_linewidth(0.8)
+                    line, = ax.plot([], [], color=ORANGE, linewidth=0.7)
+                    _stxt = ax.text(0.04, 0.92, sname, transform=ax.transAxes,
+                                    fontsize=4, color=ORANGE, va='top', ha='left')
                     self._stim_grid_lines[flat] = line
+                    self._stim_grid_texts[flat] = _stxt
                     self._stim_grid_axes[flat]  = ax
                     self._grid_ax_to_stim[ax]   = flat
 
@@ -2312,21 +2647,21 @@ class MushIOGUI:
                     _r, _g, _b = colorsys.hsv_to_rgb(_hue, _sat, _val)
                     _line_col = '#{:02x}{:02x}{:02x}'.format(
                         int(_r * 255), int(_g * 255), int(_b * 255))
-                    ax.set_facecolor(BG_MID)
-                    for sp in ax.spines.values():
-                        sp.set_color(BG_LIGHT); sp.set_linewidth(0.4)
+                    ax.set_facecolor('#1e1e30')   # slightly lighter than BG_MID so cells are visible
+                    ax.patch.set_edgecolor('#45456a')
+                    ax.patch.set_linewidth(0.6)
                     if flat is not None:
                         nm = ALL_NAMES[flat]
                         self._ch_colors[flat]    = _line_col
                         self._ch_colors_hc[flat] = COLORS[(pc * 8 + pr) % len(COLORS)]
                         line, = ax.plot([], [], color=_line_col,
-                                        linewidth=0.6, rasterized=True)
+                                        linewidth=0.8)
                         self._grid_lines[flat] = line
                         self._grid_axes[flat]  = ax
                         self._grid_ax_to_elec[ax] = flat
                         self._grid_texts[flat] = ax.text(
                             0.04, 0.92, nm[4:], transform=ax.transAxes,
-                            fontsize=4, color=_line_col, va='top', ha='left')
+                            fontsize=6, color=_line_col, va='top', ha='left')
                         # Clipping warning — shown when bandpass on but raw clips
                         self._clip_texts[flat] = ax.text(
                             0.5, 0.5, 'CLIP!', transform=ax.transAxes,
@@ -2342,12 +2677,80 @@ class MushIOGUI:
         self._grid_canvas = FigureCanvasTkAgg(self._grid_fig, master=parent)
         self._grid_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._grid_canvas.mpl_connect('button_press_event', self._on_grid_click)
+        self._grid_canvas.mpl_connect('resize_event',
+                                       lambda e: self._on_grid_resize())
+        self._grid_bg = None    # blitting background cache (figure + static elements)
+
+        # ---- Fixed axis limits ----
+        # Data is normalised to [0,1]×[-1,1] by the background thread so
+        # axis limits NEVER change → canvas.draw() only on init / resize.
+        for _flat, _ax in self._grid_axes.items():
+            _ax.set_xlim(0, 1)
+            _ax.set_ylim(-1, 1)
+        for _flat, _ax in self._stim_grid_axes.items():
+            _ax.set_xlim(0, 1)
+            _ax.set_ylim(-1, 1)
+        # ---- animated=True for dynamic artists only (data lines + CLIP) ----
+        # Static elements (patches, text labels) stay non-animated so
+        # canvas.draw() renders them into the background cache in one pass.
+        # Per-frame blitting then only draws ~72 data lines + CLIP indicators.
+        for _ln in self._grid_lines.values():
+            _ln.set_animated(True)
+        for _ln in self._stim_grid_lines.values():
+            _ln.set_animated(True)
+        for _ct in self._clip_texts.values():
+            _ct.set_animated(True)
+
+        # ---- Scale annotations (first column: amplitude, bottom-left: time) ----
+        # Non-animated text artists cached in the blitting background.
+        self._grid_yscale_texts = []   # 3 Text artists: +uv, 0, -uv
+        self._grid_xscale_texts = []   # 2 Text artists: -win_secs, 0s
+
+        _col0_row0_flat = ELEC_GRID.get((0, 0))
+        _col0_row7_flat = ELEC_GRID.get((0, 7))
+
+        if _col0_row0_flat is not None:
+            _ax0 = self._grid_axes.get(_col0_row0_flat)
+            if _ax0 is not None:
+                # Y-axis amplitude labels on left edge of top-left electrode cell
+                # transAxes y: data ±0.85 → transAxes 0.925 / 0.075
+                _kw = dict(transform=_ax0.transAxes, fontsize=3.5,
+                           color=FG_DIM, ha='right', va='center',
+                           clip_on=False, family='monospace')
+                _tu = _ax0.text(-0.04, 0.925, "+500 µV", **_kw)
+                _t0 = _ax0.text(-0.04, 0.500, "0",      **_kw)
+                _tl = _ax0.text(-0.04, 0.075, "-500 µV", **_kw)
+                self._grid_yscale_texts = [_tu, _t0, _tl]
+
+        if _col0_row7_flat is not None:
+            _ax7 = self._grid_axes.get(_col0_row7_flat)
+            if _ax7 is not None:
+                # X-axis time labels at bottom of bottom-left electrode cell
+                _kw2 = dict(transform=_ax7.transAxes, fontsize=3.5,
+                            color=FG_DIM, va='top', clip_on=False,
+                            family='monospace')
+                _tx0 = _ax7.text(0.0, -0.04, "-5s", ha='left',  **_kw2)
+                _tx1 = _ax7.text(1.0, -0.04, "0s",  ha='right', **_kw2)
+                self._grid_xscale_texts = [_tx0, _tx1]
+
+        # Set initial text values
+        self._update_grid_scale_labels()
+
+        # Trace callbacks: update scale labels when settings change
+        self._uv_scale.trace_add('write',
+            lambda *_: self._on_scale_setting_changed())
+        self._auto_scale.trace_add('write',
+            lambda *_: self._on_scale_setting_changed())
+        self._display_secs.trace_add('write',
+            lambda *_: self._on_scale_setting_changed())
+        self._fft_mode.trace_add('write',
+            lambda *_: self._on_scale_setting_changed())
 
         # Apply initial colour mode (picks up any persisted setting)
         self._apply_grid_color_mode()
 
     def _apply_grid_color_mode(self):
-        """Repaint every grid line, label, and spine with the currently selected colour scheme."""
+        """Repaint every grid line, label, and patch edge with the currently selected colour scheme."""
         mode = self._grid_color_mode.get()
         for flat, line in self._grid_lines.items():
             is_sel = flat in self._selected_elec
@@ -2362,20 +2765,72 @@ class MushIOGUI:
             ax = self._grid_axes.get(flat)
             if ax is not None:
                 if mode == 'highcontrast':
-                    # Outline is always the channel's HC colour — only the
-                    # waveform goes grey when unselected.
-                    sp_col = self._ch_colors_hc.get(flat, BG_LIGHT)
-                    lw     = 1.0 if is_sel else 0.8
+                    edge_col = self._ch_colors_hc.get(flat, BG_LIGHT)
+                    lw       = 1.0 if is_sel else 0.8
                 else:
-                    sp_col = col if is_sel else BG_LIGHT
-                    lw     = 1.0 if is_sel else 0.4
-                for sp in ax.spines.values():
-                    sp.set_color(sp_col)
-                    sp.set_linewidth(lw)
+                    edge_col = col if is_sel else '#45456a'
+                    lw       = 1.0 if is_sel else 0.6
+                ax.patch.set_edgecolor(edge_col)
+                ax.patch.set_linewidth(lw)
+
         # Sync the tkinter electrode-button colours in the Physical Layout panel
         self._update_electrode_btn_colors()
-        if self._grid_canvas:
-            self._grid_canvas.draw_idle()
+        self._invalidate_grid_bg()
+
+    # ---- grid scale label helpers ----------------------------------------
+
+    def _on_scale_setting_changed(self):
+        """Called via trace when display_secs / uv_scale / auto_scale /
+        fft_mode changes — update the first-column scale annotations and
+        invalidate the blitting background cache so they repaint."""
+        self._update_grid_scale_labels()
+        self._invalidate_grid_bg()
+
+    @staticmethod
+    def _fmt_uv(val):
+        """Format a µV value with appropriate unit (µV or mV)."""
+        if val >= 1000:
+            mv = val / 1000.0
+            return f"{mv:g} mV" if mv == int(mv) else f"{mv:.1f} mV"
+        return f"{int(val)} µV" if val == int(val) else f"{val:g} µV"
+
+    def _update_grid_scale_labels(self):
+        """Refresh the text content of the grid scale annotations."""
+        auto_sc  = self._auto_scale.get()
+        fft_mode = self._fft_mode.get()
+        uv_half  = self._uv_scale.get()
+        win_secs = self._display_secs.get()
+
+        # ---- Y-axis labels (top-left cell) ----
+        if self._grid_yscale_texts:
+            if fft_mode:
+                # FFT mode: Y is magnitude (auto-scaled), hide amplitude labels
+                for _t in self._grid_yscale_texts:
+                    _t.set_text("")
+            elif auto_sc:
+                self._grid_yscale_texts[0].set_text("Auto")
+                self._grid_yscale_texts[1].set_text("")
+                self._grid_yscale_texts[2].set_text("")
+            else:
+                top_s = "+" + self._fmt_uv(uv_half)
+                bot_s = "-" + self._fmt_uv(uv_half)
+                self._grid_yscale_texts[0].set_text(top_s)
+                self._grid_yscale_texts[1].set_text("0")
+                self._grid_yscale_texts[2].set_text(bot_s)
+
+        # ---- X-axis labels (bottom-left cell) ----
+        if self._grid_xscale_texts:
+            if fft_mode:
+                # FFT mode: X is frequency — hide time labels
+                self._grid_xscale_texts[0].set_text("")
+                self._grid_xscale_texts[1].set_text("")
+            else:
+                if win_secs >= 1.0:
+                    t_str = f"-{win_secs:g}s"
+                else:
+                    t_str = f"-{win_secs * 1000:g}ms"
+                self._grid_xscale_texts[0].set_text(t_str)
+                self._grid_xscale_texts[1].set_text("0s")
 
     # ---- Overlay tab -----------------------------------------------------
 
@@ -4033,7 +4488,7 @@ class MushIOGUI:
     def _fw_test_connection(self):
         """Check whether the Pico has connected to the data receiver.
 
-        The Pico is the TCP CLIENT — it connects to this PC's port 9000.
+        The Pico sends UDP data to this PC's port 9004.
         So we check self._receiver.connected rather than probing outward.
         Separately, try the Pico CMD port (9001) if a Pico IP is entered.
         """
@@ -4076,7 +4531,7 @@ class MushIOGUI:
         pico_ip = _raw_ip.split()[0] if _raw_ip else ''
         if not pico_ip:
             if time.time() < self._fw_conn_deadline:
-                msg = (f"Waiting for Pico data connection on port {self.data_port} ...")
+                msg = (f"Waiting for Pico UDP data on port {self.data_port} ...")
                 self._fw_status.set(msg)
                 self._fw_status_lbl.config(fg=ORANGE)
                 self._fw_log_append(f"[FW] {msg}\n")
@@ -4285,13 +4740,19 @@ class MushIOGUI:
         prefix   = self._log_prefix_var.get().strip() or 'mushio'
         roll_key = self._log_roll_var.get()
         roll_min = LOG_ROLL_OPTIONS.get(roll_key, 60)
-        self._receiver.start_logging(data_dir, prefix, roll_min)
+        config   = self._config_snapshot()
+        if not HAS_H5PY:
+            print("[WARN] h5py not installed — recording to .bin (no metadata)",
+                  flush=True)
+        self._receiver.start_logging(data_dir, prefix, roll_min,
+                                     config_dict=config)
         self._log_active = True
         if hasattr(self, '_rec_btn'):
             self._rec_btn.config(text="  \u25a0 Stop Recording  ",
                                   bg='#3a1a1a', fg=RED,
                                   activebackground=RED)
-        self._log_status_var.set("Starting...")
+        fmt = "HDF5" if HAS_H5PY else "BIN"
+        self._log_status_var.set(f"Starting ({fmt})...")
 
     def _stop_recording(self):
         self._receiver.stop_logging()
@@ -4418,7 +4879,8 @@ class MushIOGUI:
                 'bp_high':      self._bp_high.get(),
                 'bp_order':     self._bp_order_var.get(),
                 'uv_scale':     self._uv_scale.get(),
-                'display_secs': self._display_secs.get(),
+                'display_secs':   self._display_secs.get(),
+                'display_detail': self._display_detail.get(),
             },
             'stim_configs': stim,
             'registers': regs,
@@ -4448,7 +4910,8 @@ class MushIOGUI:
         if 'bp_high' in disp:      self._bp_high.set(disp['bp_high'])
         if 'bp_order' in disp:     self._bp_order_var.set(disp['bp_order'])
         if 'uv_scale' in disp:     self._uv_scale.set(disp['uv_scale'])
-        if 'display_secs' in disp: self._display_secs.set(disp['display_secs'])
+        if 'display_secs' in disp:   self._display_secs.set(disp['display_secs'])
+        if 'display_detail' in disp: self._display_detail.set(disp['display_detail'])
 
         for key, val_str in cfg.get('registers', {}).items():
             try:
@@ -4892,7 +5355,7 @@ class MushIOGUI:
             return
         all_files = sorted(os.listdir(folder))
         self._review_bin_files = [os.path.join(folder, f) for f in all_files
-                                   if f.lower().endswith('.bin')]
+                                   if f.lower().endswith(('.bin', '.h5'))]
         self._review_img_files = [os.path.join(folder, f) for f in all_files
                                    if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
         self._review_bin_lb.delete(0, tk.END)
@@ -4934,7 +5397,13 @@ class MushIOGUI:
         def _worker():
             def _status(msg):
                 self.root.after(0, lambda m=msg: self._review_progress_var.set(m))
-            result = self._review_parse_numpy(paths, status_cb=_status)
+            # Dispatch by file extension — all paths must be same type
+            if paths and paths[0].lower().endswith('.h5') and HAS_H5PY:
+                h5_paths = [p for p in paths if p.lower().endswith('.h5')]
+                result = self._review_read_h5(h5_paths, status_cb=_status)
+            else:
+                bin_paths = [p for p in paths if p.lower().endswith('.bin')]
+                result = self._review_parse_numpy(bin_paths, status_cb=_status)
             self.root.after(0, lambda: self._review_on_loaded(result, label))
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -5036,6 +5505,80 @@ class MushIOGUI:
         t_plot    = t_sec[idx]
         samp_plot = samps_all[idx].astype(np.float64) * SCALE   # (n_plot, 72) µV
         # File boundary times for vertical marker lines (skip index 0 = start of dataset)
+        break_times = [float(t_sec[fb]) for fb in file_breaks if 0 < fb < N]
+
+        return {
+            'n':            len(idx),
+            'total_frames': N,
+            'n_files':      len(paths),
+            'file_breaks':  file_breaks,
+            'break_times':  break_times,
+            't_plot':       t_plot,
+            'samp_plot':    samp_plot,
+            'rec_chs':      rec_chs,
+            'fps':          fps_est,
+            'dur_s':        dur_s,
+        }
+
+    def _review_read_h5(self, paths, status_cb=None):
+        """Load one or more .h5 recording files.  Returns the same dataset dict
+        as _review_parse_numpy so _review_render works unchanged."""
+        MAX_PLOT = 5000
+        TOTAL_CH = 72
+
+        all_ts      = []
+        all_samps   = []
+        file_breaks = []
+
+        for fi, path in enumerate(paths):
+            if status_cb:
+                status_cb(f'Reading {os.path.basename(path)} ({fi + 1}/{len(paths)})...')
+            try:
+                f = h5py.File(path, 'r')
+            except Exception as e:
+                print(f"[REVIEW] Cannot open {path}: {e}", flush=True)
+                continue
+            try:
+                samps = f['data/samples'][:]       # (n, 72) int32
+                ts    = f['data/timestamps_us'][:].astype(np.uint64)  # (n,) uint32→uint64
+            except Exception as e:
+                print(f"[REVIEW] Bad HDF5 structure in {path}: {e}", flush=True)
+                f.close()
+                continue
+            f.close()
+            if len(ts) == 0:
+                continue
+            file_breaks.append(sum(len(t) for t in all_ts))
+            all_ts.append(ts)
+            all_samps.append(samps)
+
+        if not all_ts:
+            return {'error': 'No valid frames found in the selected .h5 file(s)'}
+
+        if status_cb:
+            status_cb('Computing time axis...')
+
+        ts_all    = np.concatenate(all_ts)
+        samps_all = np.concatenate(all_samps, axis=0)   # (N, 72) int32
+        N         = len(ts_all)
+
+        # Monotonic time: wrap-safe uint32 µs diff
+        dt       = np.empty(N, dtype=np.float64)
+        dt[0]    = 0.0
+        dt[1:]   = ((ts_all[1:] - ts_all[:-1]) % (2 ** 32)).astype(np.float64) / 1e6
+        t_sec    = np.cumsum(dt)
+        dur_s    = float(t_sec[-1]) if N > 1 else 0.0
+        fps_est  = N / dur_s if dur_s > 0 else 0.0
+
+        step = max(1, N // MAX_PLOT)
+        idx  = np.arange(0, N, step)
+
+        STIM_IDX = {32, 33, 34, 35, 44, 45, 46, 47}
+        rec_chs  = [i for i in range(TOTAL_CH) if i not in STIM_IDX]
+        SCALE    = 5.08 / (11.0 * (2 ** 23)) * 1e6   # raw int32 → µV
+
+        t_plot    = t_sec[idx]
+        samp_plot = samps_all[idx].astype(np.float64) * SCALE
         break_times = [float(t_sec[fb]) for fb in file_breaks if 0 < fb < N]
 
         return {
@@ -5646,7 +6189,10 @@ class MushIOGUI:
     # ==========================================================================
 
     def _on_grid_click(self, event):
-        """Matplotlib button_press_event: click a cell to open a zoom popup."""
+        """Matplotlib button_press_event: DOUBLE-click a cell to open a zoom popup.
+        Single clicks are ignored to prevent accidental zoom window spawning."""
+        if not event.dblclick:
+            return
         ax = event.inaxes
         if ax is None:
             return
@@ -5662,17 +6208,17 @@ class MushIOGUI:
             self._selected_elec.discard(flat)
         else:
             self._selected_elec.add(flat)
-        self._update_electrode_btn_colors()
+        self._apply_grid_color_mode()
         self._update_elec_count()
 
     def _select_all_elec(self):
         self._selected_elec = set(ELEC_IDX)
-        self._update_electrode_btn_colors()
+        self._apply_grid_color_mode()
         self._update_elec_count()
 
     def _select_none_elec(self):
         self._selected_elec = set()
-        self._update_electrode_btn_colors()
+        self._apply_grid_color_mode()
         self._update_elec_count()
 
     def _update_electrode_btn_colors(self):
@@ -5689,8 +6235,8 @@ class MushIOGUI:
                 # Highlight the matching grid axes
                 ax = self._grid_axes.get(flat)
                 if ax is not None:
-                    for sp in ax.spines.values():
-                        sp.set_color(col); sp.set_linewidth(1.0)
+                    ax.patch.set_edgecolor(col)
+                    ax.patch.set_linewidth(1.0)
                     needs_draw = True
             else:
                 btn.config(bg=BG_LIGHT, fg=FG_DIM, font=('Consolas', 7))
@@ -5699,16 +6245,16 @@ class MushIOGUI:
                     if mode == 'highcontrast':
                         # Outline always shows the channel's HC colour so every
                         # cell is identifiable; only the waveform goes grey.
-                        sp_col = self._ch_colors_hc.get(flat, BG_LIGHT)
-                        sp_lw  = 0.8
+                        edge_col = self._ch_colors_hc.get(flat, BG_LIGHT)
+                        edge_lw  = 0.8
                     else:  # spatial
-                        sp_col = self._ch_colors.get(flat, BG_LIGHT)
-                        sp_lw  = 0.4
-                    for sp in ax.spines.values():
-                        sp.set_color(sp_col); sp.set_linewidth(sp_lw)
+                        edge_col = self._ch_colors.get(flat, BG_LIGHT)
+                        edge_lw  = 0.4
+                    ax.patch.set_edgecolor(edge_col)
+                    ax.patch.set_linewidth(edge_lw)
                     needs_draw = True
-        if needs_draw and hasattr(self, '_grid_canvas') and self._grid_canvas:
-            self._grid_canvas.draw_idle()
+        if needs_draw:
+            self._invalidate_grid_bg()
 
     def _update_elec_count(self):
         self._elec_count_var.set(f"{len(self._selected_elec)} of 64 selected")
@@ -5977,156 +6523,185 @@ class MushIOGUI:
     # ---- grid ------------------------------------------------------------
 
     def _start_grid_loop(self):
+        self._grid_data_thread = _GridDataThread()
+        self._grid_data_thread.start()
         self._update_grid()
 
     def _update_grid(self):
+        # ALWAYS reschedule first to guarantee loop never dies.
+        self.root.after(1000 // GRID_FPS, self._update_grid)
+
+        try:
+            self._update_grid_inner()
+        except Exception:
+            import traceback
+            _n = getattr(self, '_grid_exc_n', 0) + 1
+            self._grid_exc_n = _n
+            if _n <= 3:
+                print(f"[GRID] _update_grid EXCEPTION #{_n}:", flush=True)
+                traceback.print_exc()
+
+    def _update_grid_inner(self):
+
         # Skip render if wrong tab or no receiver at all.
-        # Do NOT gate on .connected — keep rendering buffered data during
-        # brief TCP reconnects (≈1 s gap) so the display doesn't blank.
         if self._active_tab != 'grid' or not self._receiver:
-            self.root.after(1000 // GRID_FPS, self._update_grid)
-            return
-        # If we've never received any data, pause render to avoid empty draw.
-        if self._receiver.last_frame_time == 0.0:
-            self.root.after(1000 // GRID_FPS, self._update_grid)
             return
 
-        # Scale interval by selected channel count — many channels take longer to draw.
-        n_sel = len(self._selected_elec)
-        interval = 1000 // GRID_FPS if n_sel <= 32 else 1000 // max(8, GRID_FPS // 2)
+        # ================================================================
+        # ADAPTIVE FRAME THROTTLE
+        # ================================================================
+        # The render loop is scheduled every 66 ms (GRID_FPS=15), but a
+        # single blit can exceed that (90–300 ms at high detail).  If we
+        # render back-to-back without pause the Tk event queue starves and
+        # the GUI freezes.  Guarantee ≥25 ms idle between blits so Tkinter
+        # can process mouse/keyboard/combobox events.
+        # ================================================================
+        _now = time.perf_counter()
+        _last_render = getattr(self, '_grid_last_render_t', 0)
+        _last_blit_s = getattr(self, '_grid_last_blit_s', 0.060)
+        _min_gap = max(1.0 / GRID_FPS, _last_blit_s + 0.025)
+        if (_now - _last_render) < _min_gap:
+            return   # skip this frame — not enough idle time since last blit
 
-        # Schedule BEFORE render so exceptions can never kill the loop.
-        self.root.after(interval, self._update_grid)
+        canvas = self._grid_canvas
 
+        # ================================================================
+        # BACKGROUND CACHE
+        # ================================================================
+        # canvas.draw() renders the figure background + all non-animated
+        # static elements (patches, labels).  On fullscreen this
+        # takes ~2-3 s — we pump Tk events before/after to reduce the
+        # chance of Windows flagging "Not Responding".
+        # ================================================================
+        if self._grid_bg is None:
+            self.root.update_idletasks()           # flush pending Tk events
+            _t0 = time.perf_counter()
+            canvas.draw()
+            self._grid_bg = canvas.copy_from_bbox(self._grid_fig.bbox)
+            _ms = (time.perf_counter() - _t0) * 1000
+            print(f"[GRID] Background cache: {_ms:.0f} ms", flush=True)
+            self.root.update_idletasks()           # catch up after blocking
+
+        # ---- Push GUI params to background thread (every frame) ----------
         win_secs   = self._display_secs.get()
         fft_mode   = self._fft_mode.get()
-        auto_sc    = self._auto_scale.get()
-        uv_half    = self._uv_scale.get()
         fps_est, fps_stable, n_samp = self._get_fps_nsamp(win_secs)
-        total_gain = self._pga_gain.get() * GAIN
 
-        self._autoscale_ctr = (self._autoscale_ctr + 1) % 5
-        do_auto = auto_sc and (self._autoscale_ctr == 0)
+        # Parse display resolution combobox → max_pts integer (0 = full / no decimation)
+        _detail = self._display_detail.get()
+        if '(' in _detail:
+            _max_pts = int(_detail.split('(')[1].rstrip(')'))
+        else:
+            _max_pts = 0   # "Full" — no display decimation
 
-        # Hoist per-frame constants and Tk var reads outside the 64-channel loop.
-        # Each .get() call enters the Tcl interpreter; reading 64× per frame wastes time.
-        bp_on    = self._bp_enabled.get()
-        bp_low   = self._bp_low.get()
-        bp_high  = self._bp_high.get()
-        bp_order = self._bp_order_var.get()
-        _cmode   = self._grid_color_mode.get()
-        _CLIP    = int(FS * 0.97)   # 97% of full scale = ADC saturation (constant)
-        _n_fft   = self._get_n_fft(fps_stable) if fft_mode else 0  # hoist out of 64-ch loop
+        self._grid_data_thread.configure(
+            self._receiver,
+            win_secs=win_secs,
+            fft_mode=fft_mode,
+            n_samp=n_samp,
+            n_fft=self._get_n_fft(fps_stable) if fft_mode else 256,
+            fps_stable=fps_stable,
+            total_gain=self._pga_gain.get() * GAIN,
+            bp_on=self._bp_enabled.get(),
+            bp_low=self._bp_low.get(),
+            bp_high=self._bp_high.get(),
+            bp_order=self._bp_order_var.get(),
+            auto_sc=self._auto_scale.get(),
+            uv_half=self._uv_scale.get(),
+            max_pts=_max_pts,
+        )
 
-        # -- Electrode subplots --
-        for row in range(8):
-            for col in range(8):
-                flat = ELEC_GRID.get((col, row))
-                if flat is None: continue
-                line = self._grid_lines.get(flat)
-                ax   = self._grid_axes.get(flat)
-                txt  = self._grid_texts.get(flat)
-                if line is None: continue
+        # ---- Get pre-computed frame from background thread ----
+        frame, clip_state, is_new = self._grid_data_thread.get_frame()
 
-                # Time-domain display uses the screen window (n_samp).
-                # FFT uses a larger buffer window (_n_fft) so df is small
-                # enough to place every signal frequency on an exact FFT bin,
-                # eliminating the "two-state" spectral-leakage oscillation.
-                raw = self._receiver.get_channel(flat, n_samp)
+        # Skip blit when data hasn't changed — canvas keeps previous image.
+        if not is_new:
+            return
 
-                # Convert raw deque → numpy int32 once; reuse for clip detection
-                # and (in time mode) for the displayed waveform.
-                arr_int = np.array(raw, dtype=np.int32)
+        # ---- Fast blit: restore bg → draw lines → composite ----
+        _blit_t0 = time.perf_counter()
+        try:
+            canvas.restore_region(self._grid_bg)
 
-                # Clipping detection: if raw signal saturates ADC AND bandpass is on,
-                # the filtered trace looks clean but DC clipping is hidden — warn user.
-                # Use numpy max — avoids a 2500-iteration pure-Python loop × 64 channels.
-                is_clipping = (arr_int.size > 0 and
-                               int(np.max(np.abs(arr_int))) >= _CLIP)
-                clip_txt    = self._clip_texts.get(flat)
-                if clip_txt is not None:
-                    if is_clipping and bp_on:
-                        clip_txt.set_visible(not clip_txt.get_visible())  # flash
-                    else:
-                        clip_txt.set_visible(False)
+            bp_on = self._bp_enabled.get()
 
-                if fft_mode:
-                    raw_fft = self._receiver.get_channel(flat, _n_fft)
-                    arr = np.array(raw_fft, dtype=float) / FS * VREF / total_gain * 1e6
+            # -- Electrode data lines (per-axes) --
+            for flat, ax in self._grid_axes.items():
+                data = frame.get(flat)
+                if data is not None:
+                    line = self._grid_lines.get(flat)
+                    if line is not None:
+                        line.set_data(data[0], data[1])
+                        ax.draw_artist(line)
+                if clip_state.get(flat, False) and bp_on:
+                    ct = self._clip_texts.get(flat)
+                    if ct is not None:
+                        ax.draw_artist(ct)
+
+            # -- STIM data lines (main thread — max 8, lightweight) --
+            for name, flat in STIM_BY_NAME:
+                line = self._stim_grid_lines.get(flat)
+                ax   = self._stim_grid_axes.get(flat)
+                if line is None or ax is None:
+                    continue
+                cfg = self._stim_ch_configs.get(flat, {})
+                if cfg.get('type', 'Off') == 'Off':
+                    line.set_data([], [])
                 else:
-                    arr = arr_int.astype(float) / FS * VREF / total_gain * 1e6
-
-                if bp_on:
-                    arr = bandpass_filter(arr, bp_low, bp_high, fps_stable, bp_order)
-
-                is_sel = flat in self._selected_elec
-                if _cmode == 'highcontrast':
-                    color = COLORS[(col*8+row) % len(COLORS)] if is_sel else FG_DIMMER
-                else:
-                    # Spatial: show spatial hue when selected, grey when not
-                    color = self._ch_colors.get(flat, FG_DIMMER) if is_sel else FG_DIMMER
-                lw = 0.9 if is_sel else 0.4
-
-                if fft_mode:
-                    freq, mag = compute_fft(arr, fps_stable)
-                    line.set_xdata(freq); line.set_ydata(mag)
-                    ax.set_xlim(0, self._fft_xlim(fps_stable))
-                    if do_auto: ax.set_ylim(0, max(float(mag.max())*1.2, 1.0))
-                    elif not auto_sc: ax.set_ylim(0, uv_half)
-                else:
-                    n_raw = len(raw)   # save pre-decimate count for correct time span
-                    arr = display_decimate(arr)
-                    # win_actual may be < win_secs when buffer is filling or
-                    # was just flushed after a frame gap.  Anchor the waveform
-                    # to t=0 so it grows in from the right with no false zeros.
-                    # Use n_raw (not len(arr)) because display_decimate shrinks
-                    # the array; dividing the decimated length by the original
-                    # fps would under-estimate the window and compress the trace
-                    # into the right portion of the cell.
-                    win_actual = n_raw / fps_stable if fps_stable > 0 else win_secs
-                    t = np.linspace(-win_actual, 0, len(arr))
-                    line.set_xdata(t); line.set_ydata(arr)
-                    ax.set_xlim(-win_secs, 0)
-                    if do_auto:
+                    t_prog, arr = self._stim_waveform_for_display(
+                        flat, n_samp, fps_est, win_secs)
+                    if len(arr) > 0:
+                        x_n = np.linspace(0, 1, len(arr))
                         mn, mx = float(arr.min()), float(arr.max())
-                        pad = max((mx-mn)*0.15, 1.0)
-                        ax.set_ylim(mn-pad, mx+pad)
-                    elif not auto_sc:
-                        ax.set_ylim(-uv_half, uv_half)
+                        rng = max(mx - mn, 0.01)
+                        ctr = (mn + mx) * 0.5
+                        y_n = (arr - ctr) / (rng * 0.5) * 0.85
+                        line.set_data(x_n, y_n)
+                    else:
+                        line.set_data([], [])
+                ax.draw_artist(line)
 
-                line.set_color(color); line.set_linewidth(lw)
-                if txt:
-                    # Label always tracks the waveform colour; in spatial mode
-                    # this is the spatial hue, in high-contrast mode it follows
-                    # selection state (dim when unselected, vivid when selected)
-                    txt.set_color(color)
+            canvas.blit(self._grid_fig.bbox)
+        except Exception:
+            import traceback
+            _err_n = getattr(self, '_grid_render_err', 0) + 1
+            self._grid_render_err = _err_n
+            if _err_n <= 3:
+                print(f"[GRID] Render error #{_err_n}:", flush=True)
+                traceback.print_exc()
+            return
 
-        # -- STIM outer ring -- show programmed output only when channel is active --
-        for name, flat in STIM_BY_NAME:
-            line = self._stim_grid_lines.get(flat)
-            ax   = self._stim_grid_axes.get(flat)
-            if line is None: continue
+        # Track blit timing for adaptive throttle + periodic diagnostics
+        _blit_end = time.perf_counter()
+        self._grid_last_render_t = _blit_end
+        self._grid_last_blit_s   = _blit_end - _blit_t0
+        self._grid_blit_n = getattr(self, '_grid_blit_n', 0) + 1
+        if self._grid_blit_n % 60 == 0:
+            _blit_ms = self._grid_last_blit_s * 1000
+            _eff_fps = 1.0 / max(1.0 / GRID_FPS, self._grid_last_blit_s + 0.025)
+            print(f"[GRID] Blit #{self._grid_blit_n}: {_blit_ms:.1f} ms  "
+                  f"(target: {1000/GRID_FPS:.0f} ms, eff ~{_eff_fps:.0f} FPS)",
+                  flush=True)
 
-            cfg = self._stim_ch_configs.get(flat, {})
-            if cfg.get('type', 'Off') == 'Off':
-                line.set_xdata([]); line.set_ydata([])
-                continue
+    def _invalidate_grid_bg(self):
+        """Call when grid layout/colours change to force a full redraw next frame."""
+        self._grid_bg = None
 
-            t_prog, arr = self._stim_waveform_for_display(flat, n_samp, fps_est, win_secs)
-            if fft_mode:
-                freq, mag = compute_fft(arr, fps_stable)
-                line.set_xdata(freq); line.set_ydata(mag)
-                ax.set_xlim(0, self._fft_xlim(fps_stable))
-                if do_auto: ax.set_ylim(0, max(float(mag.max())*1.2, 0.1))
-            else:
-                line.set_xdata(t_prog); line.set_ydata(arr)
-                ax.set_xlim(-win_secs, 0)
-                if do_auto:
-                    mn, mx = float(arr.min()), float(arr.max())
-                    pad = max((mx - mn) * 0.15, 0.1)
-                    ax.set_ylim(mn - pad, mx + pad)
+    def _on_grid_resize(self):
+        """Handle canvas resize: keep rendering with old (stretched) background
+        while scheduling a deferred cache rebuild.  This prevents the multi-
+        second canvas.draw() from blocking the GUI during maximize/resize."""
+        # Do NOT set _grid_bg = None here — keep the old cached background
+        # so the render loop continues without blocking.
+        _pending = getattr(self, '_grid_resize_after_id', None)
+        if _pending is not None:
+            self.root.after_cancel(_pending)
+        self._grid_resize_after_id = self.root.after(500, self._rebuild_grid_bg)
 
-        self._grid_canvas.draw_idle()
+    def _rebuild_grid_bg(self):
+        """Rebuild grid background cache after a resize settles."""
+        self._grid_resize_after_id = None
+        self._grid_bg = None   # force rebuild on next render frame
 
     # ---- overlay ---------------------------------------------------------
 
@@ -6161,7 +6736,7 @@ class MushIOGUI:
         # Schedule BEFORE render so exceptions can never kill the loop.
         self.root.after(interval, self._update_overlay)
 
-        elec_ch    = sorted(self._selected_elec)
+        elec_ch    = sorted(self._selected_elec, key=lambda f: ALL_NAMES[f])
         n_panels   = self._overlay_panels.get()
         fft_mode   = self._fft_mode.get()
         auto_sc    = self._auto_scale.get()
@@ -6169,7 +6744,7 @@ class MushIOGUI:
         offset     = 0          # Overlay: channels always overlap (offset=0)
         win_secs   = self._display_secs.get()
         connected  = self._receiver and self._receiver.connected
-        # Show buffered data during brief TCP reconnects (≈1 s gap).
+        # Show buffered data during brief UDP gaps (≈1 s).
         # Only blank after 5 s of no data or if we've never connected.
         _has_data  = (self._receiver and self._receiver.last_frame_time > 0.0 and
                       time.time() - self._receiver.last_frame_time < 5.0)
@@ -6368,7 +6943,7 @@ class MushIOGUI:
             return
 
         ax         = self._wf_axes[0]
-        elec_ch    = sorted(self._selected_elec)
+        elec_ch    = sorted(self._selected_elec, key=lambda f: ALL_NAMES[f])
         fft_mode   = self._fft_mode.get()
         auto_sc    = self._auto_scale.get()
         uv_half    = self._uv_scale.get()
@@ -6576,9 +7151,10 @@ class MushIOGUI:
     # Connection management
     # ==========================================================================
 
-    def _start_receiver(self):
-        # 1000 samples/sec headroom — handles anything up to ~1000 FPS.
-        # ASSUMED_FPS is no longer used here; buf_size is rate-agnostic.
+    def _start_receiver_create_only(self):
+        """Create the DataReceiver object and start recovery preload.
+        The receiver thread itself is NOT started yet — call
+        _start_receiver_thread() after heavy init is done."""
         buf_size = int(BUFFER_SECS * 1000)
         self._receiver = DataReceiver(self.data_port, buf_size)
         # Recovery ring-files live next to gui.py so they never pollute the
@@ -6586,16 +7162,25 @@ class MushIOGUI:
         _rec_dir = os.path.dirname(os.path.abspath(__file__))
         self._receiver._rec_path_a = os.path.join(_rec_dir, 'mushio_recovery_a.bin')
         self._receiver._rec_path_b = os.path.join(_rec_dir, 'mushio_recovery_b.bin')
-        # Preload recovery data in a background thread so it never delays startup.
-        # start_recovery_writer() is called AFTER preload completes to avoid a
-        # race where the writer truncates a file the reader is still scanning.
-        # _write_recovery_frame() safely no-ops while _rec_file is None.
+        # Preload recovery data synchronously BEFORE the thread starts
+        # so we don't contend with live data ingestion.
         def _bg_preload():
             n = self._receiver.preload_from_recovery()
             if n:
                 print(f"[GUI] Recovery preload: {n:,} frames restored to display buffers")
             self._receiver.start_recovery_writer(_rec_dir)
         threading.Thread(target=_bg_preload, daemon=True).start()
+
+    def _start_receiver_thread(self):
+        """Start the DataReceiver thread.  Called after _finalize_ui()
+        so the heavy matplotlib canvas.draw() doesn't starve the recv loop."""
+        if self._receiver and not self._receiver.is_alive():
+            self._receiver.start()
+            print(f"[DATA-RX] Receiver thread started (post-init)")
+
+    def _start_receiver(self):
+        """Legacy helper — create + start immediately (used by demo mode)."""
+        self._start_receiver_create_only()
         self._receiver.start()
 
     def _start_cmd_client(self):
@@ -6651,9 +7236,22 @@ class MushIOGUI:
         if self._demo_mode: self._stop_demo()
         else:               self._start_demo()
 
+    # -- Demo waveform descriptions (shown in top bar when active) ----------
+    _SW_DEMO_DESC = (
+        "SW Demo:  Col 0-6 = sine 1,2,4,6,8,10,12 Hz  |  Col 7 = spike trains  |  "
+        "~1 mV pk-pk  |  phase offset per row"
+    )
+    _PICO_DEMO_DESC = (
+        "Pico Demo:  sine/triangle/chirp/sawtooth at 1-12 Hz  |  "
+        "~1 mV pk-pk  |  phase offset per channel"
+    )
+
     def _start_demo(self):
         self._demo_mode = True
         self._demo_btn.config(text="SW Demo mode  ON", bg=GREEN, fg=BG_DARK)
+        # Show waveform description
+        self._demo_info_lbl.config(text=self._SW_DEMO_DESC)
+        self._demo_info_lbl.pack(side=tk.RIGHT, padx=(0, 6))
         # Pause live TCP ingestion so demo and real data don't interleave
         self._receiver._paused = True
         for _buf in self._receiver.buffers:
@@ -6671,11 +7269,22 @@ class MushIOGUI:
     def _stop_demo(self):
         self._demo_mode = False
         self._demo_btn.config(text="SW Demo mode  [Ctrl+D]", bg=BG_LIGHT, fg=FG_MAIN)
+        # Hide waveform description
+        self._demo_info_lbl.pack_forget()
         if self._demo_injector:
-            self._demo_injector.stop(); self._demo_injector = None
+            self._demo_injector.stop()
+            self._demo_injector.join(timeout=2.0)   # wait for thread to finish
+            self._demo_injector = None
+        # Clear stale demo data before resuming live
+        for _buf in self._receiver.buffers:
+            _buf.clear()
+        self._receiver.timestamps.clear()
         # Resume live TCP ingestion
         self._receiver._paused = False
-        self._cmd_client.stop()
+        try:
+            self._cmd_client.stop()
+        except Exception:
+            pass
         self._start_cmd_client()
         self._cmd_status_dot.config(fg=FG_DIMMER)
         self._cmd_status_lbl.config(text="Not connected")
@@ -6968,20 +7577,13 @@ class MushIOGUI:
                 data_age = (time.time() - r.last_frame_time
                             if r.last_frame_time > 0.0 else None)
                 if data_age is not None and data_age > 2.0:
-                    # TCP connected but no frames arriving — show gap duration.
+                    # UDP data gap — no frames arriving for > 2 seconds.
                     if data_age < 60:
                         age_str = f"{data_age:.0f}s"
                     else:
                         age_str = f"{int(data_age // 60)}m {int(data_age % 60)}s"
                     dot_color = ORANGE
                     lbl_text  = f"DATA GAP ({age_str}) — {r.client_ip}"
-                    # Active recovery: if gap persists beyond the socket recv
-                    # timeout (5 s), kill the stuck socket now.  This handles
-                    # the case where the Pico's TCP stack trickles bytes (or
-                    # OS keepalives arrive) preventing the recv() timeout from
-                    # ever firing, while no valid frames are decoded.
-                    if data_age > 5.0:
-                        r.force_disconnect()
                 else:
                     dot_color = GREEN
                     lbl_text  = f"Streaming from {r.client_ip}"
@@ -6996,6 +7598,13 @@ class MushIOGUI:
             self._stat_vars['crc'    ].set(f"CRC err: {r.crc_errors}")
             self._stat_vars['missed' ].set(f"Missed: {r.missed_session}")
             self._stat_vars['session'].set(f"Session: {r.frames_session}")
+
+            # ---- Auto-record when Pico connects ----
+            if r.connected and not self._demo_mode:
+                if not self._auto_log_started:
+                    self._auto_log_started = True
+                    if not self._log_active:
+                        self._start_recording()
 
             if not r.connected:
                 self._auto_log_started  = False
@@ -7064,6 +7673,20 @@ class MushIOGUI:
                     else:
                         pico_ip = None   # suppress auto-connect until user picks
 
+            # Show/hide Pico demo waveform description (only when NOT in SW demo)
+            if not self._demo_mode and r.connected and has_beacon:
+                fw_type = self._beacon.pico_info.get('fw', '')
+                if fw_type == 'demo':
+                    if not self._demo_info_lbl.winfo_ismapped():
+                        self._demo_info_lbl.config(text=self._PICO_DEMO_DESC)
+                        self._demo_info_lbl.pack(side=tk.RIGHT, padx=(0, 6))
+                else:
+                    if self._demo_info_lbl.winfo_ismapped():
+                        self._demo_info_lbl.pack_forget()
+            elif not self._demo_mode and not r.connected:
+                if self._demo_info_lbl.winfo_ismapped():
+                    self._demo_info_lbl.pack_forget()
+
             # Auto-connect CMD channel if not already connected.
             if (pico_ip and pico_ip != "demo"
                     and not self._demo_mode
@@ -7107,12 +7730,18 @@ class MushIOGUI:
 
 def main():
     parser = argparse.ArgumentParser(description="MushIO V1.0 Real-Time Biopotential Monitor")
-    parser.add_argument('--data-port', type=int, default=9000)
+    parser.add_argument('--data-port', type=int, default=9004)
     parser.add_argument('--cmd-host',  type=str, default='')
     parser.add_argument('--cmd-port',  type=int, default=9001)
     parser.add_argument('--demo',      action='store_true',
                         help='Start in demo mode')
     args = parser.parse_args()
+
+    # DPI awareness: let Windows handle scaling instead of rendering at native
+    # 4K+ resolution.  This makes matplotlib canvas.draw() 4-8× faster because
+    # the figure is rendered at logical (scaled) resolution, then Windows
+    # upscales.  Text may be very slightly softer but grid waveforms look fine.
+    # NOT setting DPI awareness = app renders at ~96 DPI, Windows upscales.
 
     root = tk.Tk()
     root.withdraw()   # hide while building -- prevents white-box flash

@@ -1,16 +1,16 @@
 """
 MushIO V1.0  —  Post-Processing Analysis Tool
 
-Reads one or more .bin raw-frame files recorded by receiver.py (--raw flag),
-parses every 228-byte frame, and produces per-channel statistics and optional
-plots / CSV export.
+Reads one or more recording files (.bin raw frames or .h5 HDF5) and produces
+per-channel statistics and optional plots / CSV export.
 
 Usage
 -----
+    python analyze.py recording.h5 [recording2.h5 ...]
     python analyze.py recording.bin [recording2.bin ...]
-    python analyze.py recording.bin --csv summary.csv
+    python analyze.py recording.h5 --csv summary.csv
     python analyze.py recording.bin --plot
-    python analyze.py recording.bin --channels 0,1,2,32 --plot
+    python analyze.py recording.h5 --channels 0,1,2,32 --plot
     python analyze.py recording.bin --secs 10            # analyse first 10 s
 
 Requirements
@@ -18,6 +18,7 @@ Requirements
     Python 3.8+   (no external dependencies for stats)
     matplotlib    (optional, only needed for --plot)
     numpy         (optional, faster path used if present)
+    h5py          (optional, needed for .h5 files)
 """
 
 import argparse
@@ -177,6 +178,49 @@ def read_frames(path: str, max_secs: float = None):
             yield frame
 
 
+def read_frames_h5(path: str, max_secs: float = None):
+    """
+    Generator: yield parsed frame dicts from a .h5 HDF5 file.
+    HDF5 files store pre-validated data (no CRC needed).
+    Stops early if max_secs is set (based on firmware timestamp).
+    """
+    try:
+        import h5py
+    except ImportError:
+        print("Error: h5py not installed.  pip install h5py", file=sys.stderr)
+        return
+
+    with h5py.File(path, 'r') as f:
+        samples   = f['data/samples']       # (N, 72) int32
+        ts        = f['data/timestamps_us']  # (N,) uint32
+        seqs      = f['data/seq']            # (N,) uint16
+        n_frames  = samples.shape[0]
+        print(f"  {os.path.basename(path)}: {n_frames} frames (HDF5)")
+
+        # Read in chunks for memory efficiency
+        CHUNK = 10000
+        first_ts = None
+        for start in range(0, n_frames, CHUNK):
+            end = min(start + CHUNK, n_frames)
+            samp_chunk = samples[start:end]   # (chunk, 72)
+            ts_chunk   = ts[start:end]         # (chunk,)
+            seq_chunk  = seqs[start:end]       # (chunk,)
+            for i in range(end - start):
+                timestamp_us = int(ts_chunk[i])
+                if first_ts is None:
+                    first_ts = timestamp_us
+                if max_secs is not None:
+                    elapsed_s = (timestamp_us - first_ts) / 1e6
+                    if elapsed_s > max_secs:
+                        return
+                yield {
+                    'timestamp_us': timestamp_us,
+                    'seq':          int(seq_chunk[i]),
+                    'samples':      list(samp_chunk[i]),
+                    'crc_ok':       True,
+                }
+
+
 # ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------
@@ -227,7 +271,8 @@ class ChannelStats:
 
 def analyse_files(paths, channels=None, max_secs=None, csv_out=None, do_plot=False):
     """
-    Analyse one or more .bin files.  channels = list of int indices (None = all).
+    Analyse one or more .bin or .h5 files.  channels = list of int indices (None = all).
+    Auto-detects format by file extension.
     """
     ch_indices = channels if channels is not None else list(range(TOTAL_CHANNELS))
 
@@ -239,7 +284,12 @@ def analyse_files(paths, channels=None, max_secs=None, csv_out=None, do_plot=Fal
 
     print("\nReading frames...")
     for path in paths:
-        for frame in read_frames(path, max_secs=max_secs):
+        # Auto-detect format by extension
+        if path.lower().endswith('.h5'):
+            frame_gen = read_frames_h5(path, max_secs=max_secs)
+        else:
+            frame_gen = read_frames(path, max_secs=max_secs)
+        for frame in frame_gen:
             stats.update(frame['samples'])
             total_frames += 1
             timestamps.append(frame['timestamp_us'] / 1000.0)
@@ -361,7 +411,7 @@ def main():
     )
     parser.add_argument(
         'files', nargs='+',
-        help='.bin raw frame file(s) from receiver.py --raw'
+        help='.bin or .h5 recording file(s) (format auto-detected by extension)'
     )
     parser.add_argument(
         '--channels', '-c', type=str, default=None,

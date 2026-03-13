@@ -5,3 +5,4 @@ Pillow
 opencv-python
 pyserial
 mpremote
+h5py

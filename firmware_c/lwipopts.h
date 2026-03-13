@@ -7,9 +7,15 @@
  * cyw43_arch_lwip_begin() / cyw43_arch_lwip_end().
  *
  * Key sizing decisions:
- *   TCP_SND_BUF  16 KB  — holds ~71 frames (228 B each) before blocking
+ *   TCP_SND_BUF  32 KB  — holds ~142 frames (228 B each) before blocking
  *   TCP_WND      16 KB  — receive window (mostly unused; we only send)
- *   MEM_SIZE     32 KB  — lwIP heap for pbufs, PCBs, etc.
+ *   MEM_SIZE     40 KB  — lwIP heap for pbufs, PCBs, etc.
+ *
+ * Throughput tuning (2026-03-11):
+ *   TCP_MAXRTX        4     — fast failure (~15 s) instead of 20+ min stalls
+ *   TCP_OVERSIZE       MSS  — contiguous pbuf per segment, fewer allocs
+ *   CHECKSUM_ON_COPY   1    — checksum computed during memcpy, saves a pass
+ *   ETH_PAD_SIZE       0    — CYW43 driver doesn't support padding
  */
 
 #ifndef _LWIPOPTS_H
@@ -24,8 +30,12 @@
 
 /* --- Memory ---------------------------------------------------------------- */
 #define MEM_ALIGNMENT               4
-#define MEM_SIZE                    (32 * 1024)   /* 32 KB lwIP heap */
-#define MEMP_NUM_TCP_SEG            96   /* must be >= TCP_SND_QUEUELEN (~90) */
+/* ETH_PAD_SIZE must be 0: the CYW43 driver (cyw43_lwip.c) does NOT strip
+ * pad bytes on TX or add them on RX.  Non-zero values corrupt every
+ * Ethernet frame, breaking DHCP, ARP, ping, and all IP traffic. */
+#define ETH_PAD_SIZE                0
+#define MEM_SIZE                    (40 * 1024)   /* 40 KB lwIP heap */
+#define MEMP_NUM_TCP_SEG            180  /* must be >= TCP_SND_QUEUELEN (~175) */
 #define MEMP_NUM_PBUF               64
 #define PBUF_POOL_SIZE              32
 /* Default MEMP_NUM_TCP_PCB is 5 — too few for data+cmd+ota+TIME_WAIT leftovers.
@@ -37,10 +47,12 @@
 /* --- TCP ------------------------------------------------------------------- */
 #define LWIP_TCP                    1
 #define TCP_MSS                     1460
-#define TCP_SND_BUF                 (16 * 1024)   /* 16 KB send buffer */
+#define TCP_SND_BUF                 (32 * 1024)   /* 32 KB send buffer */
 #define TCP_SND_QUEUELEN            (8 * (TCP_SND_BUF) / (TCP_MSS))
 #define TCP_WND                     (16 * 1024)
-#define TCP_MAXRTX                  12
+#define TCP_OVERSIZE                TCP_MSS  /* pre-alloc contiguous pbuf per segment */
+#define LWIP_CHECKSUM_ON_COPY       1        /* checksum computed during tcp_write memcpy */
+#define TCP_MAXRTX                  4   /* fast failure: ~15 s vs 20+ min at default 12 */
 #define TCP_SYNMAXRTX               4
 #define LWIP_TCP_KEEPALIVE          1
 #define TCP_KEEPIDLE_DEFAULT        10000u  /* 10 s */

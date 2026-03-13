@@ -84,14 +84,19 @@ if %errorlevel% neq 0 (
 )
 
 :: ─────────────────────────────────────────────────────────────
-::  5.  Check for outdated packages
+::  5.  Check for outdated packages (skip if slow — 10 s cap)
 :: ─────────────────────────────────────────────────────────────
 echo.
-echo [INFO]  Checking for package updates ^(may take a few seconds^)...
+echo [INFO]  Checking for package updates ^(10 s timeout^)...
 set "_OUTDATED=%TEMP%\mushio_outdated.txt"
 
-:: Python queries pip for outdated versions of our packages and saves the list
-python -c "import subprocess,sys,os; pkgs={'matplotlib','numpy','scipy','opencv-python'}; r=subprocess.run([sys.executable,'-m','pip','list','--outdated','--format=columns'],capture_output=True,text=True,timeout=30); lines=[l for l in r.stdout.splitlines()[2:] if l.split() and l.split()[0].lower() in pkgs]; open(os.environ['_OUTDATED'],'w').write('\n'.join(lines))"
+:: Write empty file first so FOR loop won't fail if Python times out
+echo.>"%_OUTDATED%"
+python -c "import subprocess,sys,os; pkgs={'matplotlib','numpy','scipy','opencv-python'}; r=subprocess.run([sys.executable,'-m','pip','list','--outdated','--format=columns'],capture_output=True,text=True,timeout=10); lines=[l for l in r.stdout.splitlines()[2:] if l.split() and l.split()[0].lower() in pkgs]; open(os.environ['_OUTDATED'],'w').write('\n'.join(lines))" 2>nul
+if %errorlevel% neq 0 (
+    echo [OK]    Skipped ^(network slow or unavailable^).
+    goto :skip_updates
+)
 
 :: Check whether the file has any content (at least one line = at least one outdated pkg)
 set "_HAS_UPDATES="
@@ -125,6 +130,7 @@ if defined _HAS_UPDATES (
 ) else (
     echo [OK]    All packages are up to date.
 )
+:skip_updates
 del "%_OUTDATED%" >nul 2>&1
 
 :: ─────────────────────────────────────────────────────────────

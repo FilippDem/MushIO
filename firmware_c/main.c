@@ -36,6 +36,8 @@
 #include "lwip/udp.h"
 #include "lwip/netif.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/dhcp.h"
+#include "lwip/etharp.h"
 #include "lwip/err.h"
 #include "lwip/pbuf.h"
 
@@ -143,10 +145,11 @@ static volatile bool   g_data_connected  = false;
 static volatile bool   g_data_pending    = false;   /* connect in progress */
 static uint32_t        g_connect_start_ms = 0;      /* for non-blocking timeout */
 
-/* Streaming batch buffer (stack-allocated in streaming loop) */
-static uint8_t g_batch_buf[FRAME_SIZE * STREAM_BATCH];
-static uint32_t g_batch_count    = 0;
-static uint32_t g_batch_start_ms = 0;
+/* TCP batch buffer — legacy, kept for potential fallback.
+ * Reduced to single buffer since UDP is now the primary data path. */
+static uint8_t  g_batch_buf[FRAME_SIZE * STREAM_BATCH];
+static uint32_t g_batch_count     = 0;
+static uint32_t g_batch_start_ms  = 0;
 
 /* -------------------------------------------------------------------------
  * Raw TCP callbacks for the data connection
@@ -271,52 +274,164 @@ static bool data_tcp_connect(void)
  * Called from the Core 0 main loop on every iteration.
  * ------------------------------------------------------------------------- */
 
+/* Legacy TCP streaming — kept as fallback but not called in main loop.
+ * The primary data path now uses do_udp_stream_work(). */
 static void do_stream_work(void)
 {
     if (!g_data_connected || !g_data_pcb) return;
 
-    /* Fill batch from ring buffer */
     while (g_batch_count < STREAM_BATCH) {
         if (!ring_pop(&g_ring, g_batch_buf + g_batch_count * FRAME_SIZE))
             break;
         g_batch_count++;
     }
-
     if (g_batch_count == 0) return;
 
     uint32_t now_ms  = to_ms_since_boot(get_absolute_time());
-    uint32_t elapsed = now_ms - g_batch_start_ms;
-
     bool full    = (g_batch_count >= STREAM_BATCH);
-    bool timeout = (elapsed >= STREAM_TIMEOUT_MS);
-
+    bool timeout = ((now_ms - g_batch_start_ms) >= STREAM_TIMEOUT_MS);
     if (!full && !timeout) return;
 
     uint32_t len = g_batch_count * FRAME_SIZE;
-
     cyw43_arch_lwip_begin();
-
     u16_t avail = tcp_sndbuf(g_data_pcb);
     if (avail >= (u16_t)len) {
-        err_t err = tcp_write(g_data_pcb, g_batch_buf, (u16_t)len,
-                              TCP_WRITE_FLAG_COPY);
+        err_t err = tcp_write(g_data_pcb, g_batch_buf, (u16_t)len, TCP_WRITE_FLAG_COPY);
         if (err == ERR_OK) {
             tcp_output(g_data_pcb);
             g_sent_frames    += g_batch_count;
-            g_batch_count     = 0;   /* batch consumed — ready for next fill */
+            g_batch_count     = 0;
             g_batch_start_ms  = now_ms;
         } else {
-            printf("[DATA] tcp_write error %d — closing\n", (int)err);
             tcp_close(g_data_pcb);
             g_data_pcb        = NULL;
             g_data_connected  = false;
-            g_batch_count     = 0;   /* discard unsent batch on hard error */
             g_batch_start_ms  = now_ms;
         }
     }
-    /* else: send buffer full; batch stays in g_batch_buf, retried next call */
-
     cyw43_arch_lwip_end();
+}
+
+/* =========================================================================
+ * =========================================================================
+ * UDP Data Streaming  (port 9004, 5× staggered redundancy, spacing=2)
+ * =========================================================================
+ * ========================================================================= */
+
+static struct udp_pcb *g_data_udp_pcb = NULL;
+static ip_addr_t       g_data_udp_dest;      /* resolved host IP */
+static bool            g_data_udp_ready = false;
+
+/* Spaced staggered redundancy buffer.
+ * History stores the last UDP_HISTORY_SIZE frames (= (R-1)×S = 8).
+ * Each datagram picks the new frame + copies at intervals of UDP_SPACING:
+ *   [frame_N, frame_{N-2}, frame_{N-4}, frame_{N-6}, frame_{N-8}]
+ * Total payload = UDP_REDUNDANCY × FRAME_SIZE = 5 × 228 = 1140 B < 1460 MTU. */
+static uint8_t  g_udp_history[UDP_HISTORY_SIZE][FRAME_SIZE];
+static uint32_t g_udp_history_count = 0;  /* how many slots are valid (0..UDP_HISTORY_SIZE) */
+
+static void data_udp_init(void)
+{
+    cyw43_arch_lwip_begin();
+
+    g_data_udp_pcb = udp_new();
+    if (!g_data_udp_pcb) {
+        cyw43_arch_lwip_end();
+        printf("[UDP-DATA] udp_new() failed\n");
+        return;
+    }
+
+    /* Bind to any local port (we just sendto) */
+    udp_bind(g_data_udp_pcb, IP_ADDR_ANY, 0);
+
+    /* Resolve host IP once */
+    if (!ip4addr_aton(g_host_ip, &g_data_udp_dest)) {
+        udp_remove(g_data_udp_pcb);
+        g_data_udp_pcb = NULL;
+        cyw43_arch_lwip_end();
+        printf("[UDP-DATA] Invalid HOST_IP: %s\n", g_host_ip);
+        return;
+    }
+
+    g_data_udp_ready = true;
+    cyw43_arch_lwip_end();
+
+    printf("[UDP-DATA] Streaming to %s:%u (%u× redundancy, spacing=%u, %u B/datagram)\n",
+           g_host_ip, (unsigned)DATA_UDP_PORT,
+           (unsigned)UDP_REDUNDANCY, (unsigned)UDP_SPACING,
+           (unsigned)(UDP_REDUNDANCY * FRAME_SIZE));
+}
+
+/* -------------------------------------------------------------------------
+ * Drain ring buffer and send frames via UDP with spaced staggered redundancy.
+ * Called from the Core 0 main loop on every iteration.
+ *
+ * For each frame popped from the ring:
+ *   1. Build a datagram containing the new frame + up to (R-1) older frames
+ *      picked at intervals of UDP_SPACING from the history buffer.
+ *      Example (R=5, S=2):  [N, N-2, N-4, N-6, N-8]
+ *   2. Send via UDP (fire-and-forget)
+ *   3. Shift the new frame into the history ring
+ *
+ * The host receives R copies of each frame spread across 2×(R-1)+1 = 9
+ * consecutive datagrams.  A burst must span all 9 to lose a single frame.
+ * ------------------------------------------------------------------------- */
+
+static void do_udp_stream_work(void)
+{
+    if (!g_data_udp_ready || !g_data_udp_pcb) return;
+
+    /* WiFi must be up */
+    if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP)
+        return;
+
+    /* Pop up to 16 frames per main-loop iteration to avoid starving other work */
+    uint8_t frame_buf[FRAME_SIZE];
+    for (int burst = 0; burst < 16; burst++) {
+        if (!ring_pop(&g_ring, frame_buf))
+            break;
+
+        /* Count how many spaced copies we can include from history.
+         * Slot i (1..R-1) reads history[i*S - 1].  Include only if
+         * that index is within the valid history count. */
+        uint32_t n_copies = 1;   /* slot 0 = new frame (always) */
+        for (uint32_t i = 1; i < UDP_REDUNDANCY; i++) {
+            uint32_t hist_idx = i * UDP_SPACING - 1;
+            if (hist_idx < g_udp_history_count)
+                n_copies++;
+            else
+                break;
+        }
+        uint16_t payload_len = (uint16_t)(n_copies * FRAME_SIZE);
+
+        cyw43_arch_lwip_begin();
+
+        struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, payload_len, PBUF_RAM);
+        if (p) {
+            uint8_t *dst = (uint8_t *)p->payload;
+            /* Slot 0: the new frame */
+            memcpy(dst, frame_buf, FRAME_SIZE);
+            /* Slots 1..n_copies-1: spaced history entries */
+            for (uint32_t i = 1; i < n_copies; i++) {
+                uint32_t hist_idx = i * UDP_SPACING - 1;
+                memcpy(dst + i * FRAME_SIZE,
+                       g_udp_history[hist_idx], FRAME_SIZE);
+            }
+            udp_sendto(g_data_udp_pcb, p, &g_data_udp_dest, DATA_UDP_PORT);
+            pbuf_free(p);
+            g_sent_frames++;
+        }
+
+        cyw43_arch_lwip_end();
+
+        /* Shift history: move all slots forward by 1, insert new at [0] */
+        if (g_udp_history_count < UDP_HISTORY_SIZE)
+            g_udp_history_count++;
+        for (uint32_t i = g_udp_history_count - 1; i > 0; i--) {
+            memcpy(g_udp_history[i], g_udp_history[i - 1], FRAME_SIZE);
+        }
+        memcpy(g_udp_history[0], frame_buf, FRAME_SIZE);
+    }
 }
 
 /* =========================================================================
@@ -559,9 +674,51 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
             cmd_send(pcb, "[CRASH] No crash record (clean boot).");
         }
 
+    } else if (strncasecmp(cmd, "retx", 4) == 0) {
+        /* retx <start_seq> <count>  — selective retransmission.
+         * Scans ring buffer for frames matching the requested sequence range.
+         * Sends matching frames via UDP to the host on DATA_UDP_PORT.
+         * Best-effort: frames may already have been overwritten by new data. */
+        const char *arg = cmd + 4;
+        while (*arg == ' ') arg++;
+        int start_seq = 0, count = 0;
+        if (sscanf(arg, "%d %d", &start_seq, &count) != 2 || count <= 0 || count > 64) {
+            cmd_send(pcb, "retx_err usage: retx <start_seq> <count> (max 64)");
+        } else {
+            uint32_t found = 0;
+            uint32_t ring_n = ring_count(&g_ring);
+            uint8_t peek_buf[FRAME_SIZE];
+            for (uint32_t off = 0; off < ring_n && found < (uint32_t)count; off++) {
+                if (!ring_peek(&g_ring, off, peek_buf)) break;
+                /* Extract seq from frame header: bytes [6..7] little-endian */
+                uint16_t fseq = (uint16_t)(peek_buf[6] | (peek_buf[7] << 8));
+                /* Check if this seq is in [start_seq .. start_seq+count-1] (mod 65536) */
+                uint16_t delta = (fseq - (uint16_t)start_seq) & 0xFFFF;
+                if (delta < (uint16_t)count) {
+                    /* Send this frame via UDP */
+                    if (g_data_udp_pcb && g_data_udp_ready) {
+                        cyw43_arch_lwip_begin();
+                        struct pbuf *rp = pbuf_alloc(PBUF_TRANSPORT, FRAME_SIZE, PBUF_RAM);
+                        if (rp) {
+                            memcpy(rp->payload, peek_buf, FRAME_SIZE);
+                            udp_sendto(g_data_udp_pcb, rp, &g_data_udp_dest, DATA_UDP_PORT);
+                            pbuf_free(rp);
+                        }
+                        cyw43_arch_lwip_end();
+                    }
+                    found++;
+                }
+            }
+            if (found > 0) {
+                cmd_send(pcb, "retx_ok %lu", (unsigned long)found);
+            } else {
+                cmd_send(pcb, "retx_expired");
+            }
+        }
+
     } else if (strcasecmp(cmd, "help") == 0) {
         cmd_send(pcb, "Commands: ping | status | scan_all | benchmark | "
-                      "read_regs | set_fps <hz> | set_host <ip> | "
+                      "read_regs | set_fps <hz> | set_host <ip> | retx <seq> <n> | "
                       "blink_led | test_hardware | ota_reboot | crash_log | help");
         cmd_send(pcb, "True wireless OTA: connect ota_client.py to port %u", OTA_PORT);
 
@@ -749,18 +906,99 @@ static bool wifi_connect(void)
 {
     printf("[WIFI] Connecting to '%s' ...\n", WIFI_SSID);
 
-    int ret = cyw43_arch_wifi_connect_timeout_ms(
-                  WIFI_SSID, WIFI_PASSWORD,
-                  CYW43_AUTH_WPA2_AES_PSK,
-                  30000);
+    /* Print MAC for diagnostics */
+    {
+        uint8_t mac[6];
+        cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_STA, mac);
+        printf("[WIFI] MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
 
-    if (ret == 0) {
-        printf("[WIFI] Connected.  IP: %s\n",
-               ip4addr_ntoa(netif_ip4_addr(netif_default)));
+    /* Use async connect (same as MicroPython) with WPA2_AES_PSK
+     * to match router config exactly: WPA2-Personal + CCMP */
+    int rc = cyw43_arch_wifi_connect_async(WIFI_SSID, WIFI_PASSWORD,
+                                           CYW43_AUTH_WPA2_AES_PSK);
+    if (rc) {
+        printf("[WIFI] connect_async error: %d\n", rc);
+        return false;
+    }
+
+    /* Poll for up to 30 s — same approach as MicroPython REPL.
+     * Use sleep_ms(1000) to give the async context time to process.
+     * Feed watchdog each iteration so OTA CONFIRMING 30 s timeout
+     * doesn't fire while we're waiting for WiFi. */
+    for (int i = 0; i < 30; i++) {
+        sleep_ms(1000);
+        watchdog_update();  /* keep OTA confirming watchdog alive */
+        int st = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+        printf("[WIFI] status: %d  (%d s)\n", st, i + 1);
+
+        if (st == CYW43_LINK_UP) {
+            printf("[WIFI] Connected!  IP: %s\n",
+                   ip4addr_ntoa(netif_ip4_addr(netif_default)));
+            cyw43_wifi_pm(&cyw43_state,
+                          cyw43_pm_value(CYW43_NO_POWERSAVE_MODE, 0, 0, 0, 0));
+            printf("[WIFI] Power-save DISABLED\n");
+            int32_t rssi = 0;
+            cyw43_wifi_get_rssi(&cyw43_state, &rssi);
+            printf("[WIFI] RSSI: %d dBm\n", (int)rssi);
+            return true;
+        }
+
+        if (st < 0) {
+            printf("[WIFI] Negative status %d — re-joining\n", st);
+            cyw43_arch_wifi_connect_async(WIFI_SSID, WIFI_PASSWORD,
+                                          CYW43_AUTH_WPA2_AES_PSK);
+        }
+    }
+
+    /* Timeout — check final state */
+    int final_st = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+    if (final_st == CYW43_LINK_NOIP) {
+        printf("[WIFI] DHCP failed — static IP fallback\n");
+        struct netif *nif = netif_default;
+        ip4_addr_t ip, mask, gw;
+        IP4_ADDR(&ip,   192, 168, 68, 200);
+        IP4_ADDR(&mask,  255, 255, 255, 0);
+        IP4_ADDR(&gw,   192, 168, 68, 1);
+        cyw43_arch_lwip_begin();
+        dhcp_stop(nif);
+        netif_set_addr(nif, &ip, &mask, &gw);
+        etharp_gratuitous(nif);
+        cyw43_arch_lwip_end();
+        printf("[WIFI] Static IP: %s\n", ip4addr_ntoa(netif_ip4_addr(nif)));
+        cyw43_wifi_pm(&cyw43_state,
+                      cyw43_pm_value(CYW43_NO_POWERSAVE_MODE, 0, 0, 0, 0));
         return true;
     }
 
-    printf("[WIFI] Failed (err %d)\n", ret);
+    printf("[WIFI] Timeout (30 s, status %d)\n", final_st);
+    return false;
+}
+
+/* Check WiFi link and reconnect if dropped.
+ * Returns true if WiFi is currently up, false if still reconnecting. */
+static bool wifi_check_and_reconnect(void)
+{
+    if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) == CYW43_LINK_UP)
+        return true;
+
+    printf("[WIFI] Link lost — reconnecting...\n");
+
+    /* Tear down any stale TCP state */
+    cyw43_arch_lwip_begin();
+    if (g_data_pcb) { tcp_close(g_data_pcb); g_data_pcb = NULL; }
+    cyw43_arch_lwip_end();
+    g_data_connected = false;
+    g_data_pending   = false;
+
+    /* wifi_connect() blocks up to 30 s but feeds watchdog internally */
+    if (wifi_connect()) {
+        printf("[WIFI] Reconnected successfully.\n");
+        return true;
+    }
+
+    printf("[WIFI] Reconnect failed — will retry.\n");
     return false;
 }
 
@@ -801,11 +1039,8 @@ int main(void)
 
     ring_init(&g_ring);
 
-    printf("[INIT] Launching Core 1 (ADC scan loop)...\n");
     multicore_launch_core1(core1_main);
-    /* Give Core 1 a moment to start and init the sine table */
     sleep_ms(100);
-    printf("[INIT] Core 1 running.\n");
 
     /* --------------------------------------------------------------------- */
     /* Phase 3: Initialise cyw43 / WiFi                                       */
@@ -820,11 +1055,18 @@ int main(void)
 
     cyw43_arch_enable_sta_mode();
 
+    /* Let the CYW43 chip fully initialize before connecting.
+     * MicroPython has a natural delay due to REPL interaction.
+     * Feed watchdog in case OTA CONFIRMING 30 s timeout is armed. */
+    sleep_ms(2000);
+    watchdog_update();
+
     /* Startup blink: 5 rapid flashes */
     for (int i = 0; i < 5; i++) {
         led_set(true);  sleep_ms(80);
         led_set(false); sleep_ms(80);
     }
+    watchdog_update();
 
     /* --------------------------------------------------------------------- */
     /* Phase 4: WiFi connect (retry indefinitely)                             */
@@ -832,8 +1074,10 @@ int main(void)
 
     while (!wifi_connect()) {
         printf("[WIFI] Retrying in 5 s...\n");
+        watchdog_update();  /* keep OTA confirming watchdog alive */
         led_blink(3, 200, 200);
         sleep_ms(5000);
+        watchdog_update();
     }
 
     /* --------------------------------------------------------------------- */
@@ -854,13 +1098,11 @@ int main(void)
     printf("[WDT] Watchdog enabled (8 s timeout).\n");
 
     /* --------------------------------------------------------------------- */
-    /* Phase 5: TCP data connection                                           */
+    /* Phase 5: UDP data streaming (replaces TCP data connection)             */
     /* --------------------------------------------------------------------- */
 
-    printf("[INIT] Connecting data socket to %s:%d ...\n", HOST_IP, HOST_PORT);
-    if (data_tcp_connect()) {
-        g_connect_start_ms = to_ms_since_boot(get_absolute_time());
-    }
+    data_udp_init();
+    printf("[INIT] UDP data streaming to %s:%u\n", g_host_ip, (unsigned)DATA_UDP_PORT);
 
     /* --------------------------------------------------------------------- */
     /* Phase 6: CMD server                                                    */
@@ -881,20 +1123,28 @@ int main(void)
     beacon_init();
 
     /* --------------------------------------------------------------------- */
+    /* Phase 6d: OTA boot confirmation                                       */
+    /* WiFi + CMD + OTA + beacon are all up.  If the OTA state machine is    */
+    /* in CONFIRMING state, this marks the firmware as healthy so it won't    */
+    /* be rolled back on the next watchdog reset.                             */
+    /* --------------------------------------------------------------------- */
+
+    ota_boot_confirmed();
+
+    /* --------------------------------------------------------------------- */
     /* Phase 7: Main loop                                                     */
     /* --------------------------------------------------------------------- */
 
     printf("\n[RUN] Streaming.  Channels: %u  Target: ~%u FPS\n",
            (unsigned)TOTAL_CHANNELS,
            (unsigned)(1000000u / DEMO_SCAN_PERIOD_US));
-    printf("[RUN] Data  → %s:%d\n", g_host_ip, HOST_PORT);
+    printf("[RUN] Data  → UDP %s:%u (%u× redundancy, spacing=%u)\n",
+           g_host_ip, (unsigned)DATA_UDP_PORT,
+           (unsigned)UDP_REDUNDANCY, (unsigned)UDP_SPACING);
     printf("[RUN] CMD   → port %d\n\n", CMD_PORT);
 
     uint32_t last_stats_ms  = to_ms_since_boot(get_absolute_time());
-    uint32_t last_recon_ms  = 0;
     uint32_t sent_prev       = 0;
-
-    g_batch_start_ms = to_ms_since_boot(get_absolute_time());
 
     while (true) {
         /* ---- Watchdog feed ----------------------------------------------- */
@@ -920,8 +1170,8 @@ int main(void)
             }
         }
 
-        /* ---- Stream: drain ring → TCP ------------------------------------ */
-        do_stream_work();
+        /* ---- Stream: drain ring → UDP (5× redundancy, spacing=2) ---------- */
+        do_udp_stream_work();
 
         /* ---- Non-blocking benchmark result (500 ms window) --------------- */
         if (g_benchmark_req) {
@@ -936,30 +1186,16 @@ int main(void)
             }
         }
 
-        /* ---- Reconnect data TCP if needed -------------------------------- */
-        if (!g_data_connected && !g_data_pending) {
-            uint32_t now = to_ms_since_boot(get_absolute_time());
-            if (now - last_recon_ms >= RECONNECT_INTERVAL_MS) {
-                printf("[DATA] Reconnecting...\n");
-                if (data_tcp_connect()) {
-                    g_connect_start_ms = now;   /* start non-blocking timeout */
+        /* ---- WiFi reconnect if link dropped -------------------------------- */
+        {
+            static uint32_t last_wifi_check_ms = 0;
+            uint32_t now_wc = to_ms_since_boot(get_absolute_time());
+            /* Check WiFi link every 5 seconds */
+            if (now_wc - last_wifi_check_ms >= 5000u) {
+                last_wifi_check_ms = now_wc;
+                if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP) {
+                    wifi_check_and_reconnect();
                 }
-                last_recon_ms    = to_ms_since_boot(get_absolute_time());
-                g_batch_count    = 0;   /* discard stale batch */
-                g_batch_start_ms = last_recon_ms;
-            }
-        }
-
-        /* ---- Connect-attempt timeout (3 s, non-blocking) ----------------- */
-        if (g_data_pending) {
-            uint32_t now = to_ms_since_boot(get_absolute_time());
-            if (now - g_connect_start_ms > 3000u) {
-                printf("[DATA] Connect timeout\n");
-                g_data_pending   = false;
-                g_data_connected = false;
-                cyw43_arch_lwip_begin();
-                if (g_data_pcb) { tcp_close(g_data_pcb); g_data_pcb = NULL; }
-                cyw43_arch_lwip_end();
             }
         }
 
@@ -972,13 +1208,13 @@ int main(void)
                                            : 0.0f;
 
             printf("[STAT] Sent: %lu (+%lu)  FPS: %.1f  "
-                   "Buffered: %lu  Dropped: %lu  TCP: %d\n",
+                   "Buffered: %lu  Dropped: %lu  UDP: %s\n",
                    (unsigned long)g_sent_frames,
                    (unsigned long)sent_delta,
                    (double)fps,
                    (unsigned long)ring_count(&g_ring),
                    (unsigned long)g_ring.dropped,
-                   (int)g_data_connected);
+                   g_data_udp_ready ? "ready" : "down");
 
             sent_prev      = g_sent_frames;
             last_stats_ms  = now_ms;

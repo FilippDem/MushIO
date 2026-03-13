@@ -322,13 +322,18 @@ static struct udp_pcb *g_data_udp_pcb = NULL;
 static ip_addr_t       g_data_udp_dest;      /* resolved host IP */
 static bool            g_data_udp_ready = false;
 
-/* Spaced staggered redundancy buffer.
- * History stores the last UDP_HISTORY_SIZE frames (= (R-1)×S = 8).
+/* Spaced staggered redundancy — circular history buffer.
+ * Stores the last UDP_HISTORY_SIZE frames (= (R-1)×S).
  * Each datagram picks the new frame + copies at intervals of UDP_SPACING:
- *   [frame_N, frame_{N-2}, frame_{N-4}, frame_{N-6}, frame_{N-8}]
- * Total payload = UDP_REDUNDANCY × FRAME_SIZE = 5 × 228 = 1140 B < 1460 MTU. */
+ *   Example (R=5, S=4):  [N, N-4, N-8, N-12, N-16]
+ * Total payload = UDP_REDUNDANCY × FRAME_SIZE = 5 × 228 = 1140 B < 1460 MTU.
+ *
+ * Uses a circular write index instead of shifting the entire buffer,
+ * reducing per-frame cost from (SIZE-1)×228 B memcpy to a single 228 B write.
+ * Critical for large spacings (S=32 → SIZE=128 → old shift was 29 KB/frame). */
 static uint8_t  g_udp_history[UDP_HISTORY_SIZE][FRAME_SIZE];
-static uint32_t g_udp_history_count = 0;  /* how many slots are valid (0..UDP_HISTORY_SIZE) */
+static uint32_t g_udp_hist_wr    = 0;  /* next write slot (circular) */
+static uint32_t g_udp_hist_count = 0;  /* valid entries (ramps to UDP_HISTORY_SIZE) */
 
 static void data_udp_init(void)
 {
@@ -368,13 +373,13 @@ static void data_udp_init(void)
  *
  * For each frame popped from the ring:
  *   1. Build a datagram containing the new frame + up to (R-1) older frames
- *      picked at intervals of UDP_SPACING from the history buffer.
- *      Example (R=5, S=2):  [N, N-2, N-4, N-6, N-8]
+ *      picked at intervals of UDP_SPACING from the circular history buffer.
+ *      Example (R=5, S=4):  [N, N-4, N-8, N-12, N-16]
  *   2. Send via UDP (fire-and-forget)
- *   3. Shift the new frame into the history ring
+ *   3. Insert new frame into circular history (single memcpy, O(1))
  *
- * The host receives R copies of each frame spread across 2×(R-1)+1 = 9
- * consecutive datagrams.  A burst must span all 9 to lose a single frame.
+ * The host receives R copies of each frame spread across S*(R-1)+1
+ * consecutive datagrams.  A burst must span all of them to lose a frame.
  * ------------------------------------------------------------------------- */
 
 static void do_udp_stream_work(void)
@@ -392,12 +397,11 @@ static void do_udp_stream_work(void)
             break;
 
         /* Count how many spaced copies we can include from history.
-         * Slot i (1..R-1) reads history[i*S - 1].  Include only if
-         * that index is within the valid history count. */
+         * Slot i (1..R-1) needs the frame from i*S frames ago.
+         * Only include if we have that many frames in history. */
         uint32_t n_copies = 1;   /* slot 0 = new frame (always) */
         for (uint32_t i = 1; i < UDP_REDUNDANCY; i++) {
-            uint32_t hist_idx = i * UDP_SPACING - 1;
-            if (hist_idx < g_udp_history_count)
+            if (i * UDP_SPACING <= g_udp_hist_count)
                 n_copies++;
             else
                 break;
@@ -411,11 +415,14 @@ static void do_udp_stream_work(void)
             uint8_t *dst = (uint8_t *)p->payload;
             /* Slot 0: the new frame */
             memcpy(dst, frame_buf, FRAME_SIZE);
-            /* Slots 1..n_copies-1: spaced history entries */
+            /* Slots 1..n_copies-1: spaced history entries from circular buffer.
+             * Frame i*S ago is at (wr - i*S) mod SIZE.  Adding SIZE before
+             * subtracting guarantees a non-negative dividend. */
             for (uint32_t i = 1; i < n_copies; i++) {
-                uint32_t hist_idx = i * UDP_SPACING - 1;
+                uint32_t idx = (g_udp_hist_wr + UDP_HISTORY_SIZE
+                                - i * UDP_SPACING) % UDP_HISTORY_SIZE;
                 memcpy(dst + i * FRAME_SIZE,
-                       g_udp_history[hist_idx], FRAME_SIZE);
+                       g_udp_history[idx], FRAME_SIZE);
             }
             udp_sendto(g_data_udp_pcb, p, &g_data_udp_dest, DATA_UDP_PORT);
             pbuf_free(p);
@@ -424,13 +431,13 @@ static void do_udp_stream_work(void)
 
         cyw43_arch_lwip_end();
 
-        /* Shift history: move all slots forward by 1, insert new at [0] */
-        if (g_udp_history_count < UDP_HISTORY_SIZE)
-            g_udp_history_count++;
-        for (uint32_t i = g_udp_history_count - 1; i > 0; i--) {
-            memcpy(g_udp_history[i], g_udp_history[i - 1], FRAME_SIZE);
-        }
-        memcpy(g_udp_history[0], frame_buf, FRAME_SIZE);
+        /* Insert new frame into circular history — O(1), one memcpy.
+         * Old code shifted the entire buffer ((SIZE-1)×228 B per frame);
+         * circular index eliminates that overhead entirely. */
+        memcpy(g_udp_history[g_udp_hist_wr], frame_buf, FRAME_SIZE);
+        g_udp_hist_wr = (g_udp_hist_wr + 1) % UDP_HISTORY_SIZE;
+        if (g_udp_hist_count < UDP_HISTORY_SIZE)
+            g_udp_hist_count++;
     }
 }
 

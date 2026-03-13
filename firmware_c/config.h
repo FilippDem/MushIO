@@ -85,26 +85,23 @@
  * UDP Data Streaming  (replaces TCP data path)
  *
  * Each datagram carries UDP_REDUNDANCY frames picked from the current frame
- * plus older frames spaced UDP_SPACING packets apart.  Example with R=5, S=4:
- *   Packet for frame N:  [N, N-4, N-8, N-12, N-16]
+ * plus older frames spaced UDP_SPACING packets apart.  Example with R=5, S=16:
+ *   Packet for frame N:  [N, N-16, N-32, N-48, N-64]
  *   5 × 228 = 1140 B < 1460 MTU.
  *
- * All 5 copies are lost only if packets spanning T..T+S*(R-1) = T..T+16
- * (17 consecutive) are all dropped — i.e. a 34 ms WiFi outage at 500 FPS.
+ * S=16 selected by randomized A/B testing (20 trials, 5 per spacing):
+ *   S=4  avg 0.476% loss | S=8  avg 1.247% | S=16 avg 0.002% | S=32 avg 0.300%
+ * S=16 had 0% loss in 2/5 trials and max single-frame gaps otherwise.
  *
- * S=4 is optimal: tight 32 ms copy window keeps copies correlated (if one
- * arrives, most do) while providing strong burst protection (34 ms).
- * Wider spacings (S=32) expose copies to independent loss events across
- * a 256 ms window and perform ~100× worse in practice.
- *
- * History buffer size: (R-1)×S = 16 entries × 228 B = 3,648 B.
+ * History is a circular buffer (O(1) insert via write index, no memmove).
+ * History buffer: (R-1)×S = 64 entries × 228 B = 14,592 B.
  * Bandwidth: 5 × 228 × 500 = 570 KB/s ≈ 4.6 Mbps (~23% of usable WiFi).
  * ========================================================================= */
 
 #define DATA_UDP_PORT           9004u
 #define UDP_REDUNDANCY          5u
-#define UDP_SPACING             4u
-#define UDP_HISTORY_SIZE        ((UDP_REDUNDANCY - 1u) * UDP_SPACING)  /* 16 */
+#define UDP_SPACING             16u
+#define UDP_HISTORY_SIZE        ((UDP_REDUNDANCY - 1u) * UDP_SPACING)  /* 64 */
 
 /* =========================================================================
  * Reconnect  (TCP CMD fallback, legacy data path)

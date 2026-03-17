@@ -1726,6 +1726,16 @@ class MushIOGUI:
         # ---- display state -------------------------------------------------
         self._display_secs   = tk.DoubleVar(value=DISPLAY_SECS)
         self._uv_scale       = tk.DoubleVar(value=227000.0)  # ±227 mV = max range at PGA=1, AFE=11
+        # Human-readable range options: display string → µV value
+        self._range_options = [
+            ('\u00b1227 mV', 227000), ('\u00b1100 mV', 100000), ('\u00b150 mV', 50000),
+            ('\u00b120 mV', 20000),   ('\u00b110 mV', 10000),   ('\u00b15 mV', 5000),
+            ('\u00b12 mV', 2000),     ('\u00b11 mV', 1000),     ('\u00b1500 \u00b5V', 500),
+            ('\u00b1200 \u00b5V', 200), ('\u00b1100 \u00b5V', 100), ('\u00b150 \u00b5V', 50),
+        ]
+        self._range_display  = tk.StringVar(value=self._range_options[0][0])
+        self._range_uv_map   = {label: uv for label, uv in self._range_options}
+        self._range_label_map = {uv: label for label, uv in self._range_options}
         self._auto_scale     = tk.BooleanVar(value=True)
         self._display_detail = tk.StringVar(value='Med (120)')
         self._fft_mode       = tk.BooleanVar(value=False)
@@ -2292,20 +2302,13 @@ class MushIOGUI:
         self._tw_combo.bind('<<ComboboxSelected>>', self._on_tw_combo_select)
 
         # ---- Y range ---------------------------------------------------
-        tk.Label(frame, text="Y range (\u00b1):", bg=BG_DARK,
+        tk.Label(frame, text="Y range:", bg=BG_DARK,
                  fg=FG_DIM).grid(row=2, column=0, sticky=tk.W)
-        # Values in µV: from full-scale (±227 mV) down to ±50 µV
-        _range_vals = [227000, 100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50]
-        cb2 = ttk.Combobox(frame, textvariable=self._uv_scale, width=8,
-                            values=_range_vals, state='readonly')
+        _range_labels = [label for label, _ in self._range_options]
+        cb2 = ttk.Combobox(frame, textvariable=self._range_display, width=10,
+                            values=_range_labels, state='readonly')
         cb2.grid(row=2, column=1, sticky=tk.W, padx=4)
-        self._range_combo = cb2
-        # Show human-readable range next to combobox
-        self._range_label = tk.Label(frame, bg=BG_DARK, fg=FG_DIMMER,
-                                      font=('Helvetica', 7))
-        self._range_label.grid(row=2, column=2, sticky=tk.W)
-        self._uv_scale.trace_add('write', self._update_range_label)
-        self._update_range_label()
+        self._range_display.trace_add('write', self._on_range_combo_changed)
 
         ttk.Checkbutton(frame, text="Auto-scale Y",
                          variable=self._auto_scale).grid(
@@ -2353,9 +2356,19 @@ class MushIOGUI:
         except ValueError:
             pass
 
-    def _update_range_label(self, *_):
+    def _on_range_combo_changed(self, *_):
+        """Sync display StringVar → internal DoubleVar."""
+        label = self._range_display.get()
+        uv = self._range_uv_map.get(label)
+        if uv is not None and uv != self._uv_scale.get():
+            self._uv_scale.set(uv)
+
+    def _sync_range_display(self, *_):
+        """Sync internal DoubleVar → display StringVar (e.g. when loading settings)."""
         uv = self._uv_scale.get()
-        self._range_label.config(text=f"\u00b1{self._fmt_uv(uv)}")
+        label = self._range_label_map.get(uv)
+        if label and label != self._range_display.get():
+            self._range_display.set(label)
 
     def _update_gain_label(self, *_):
         total = self._pga_gain.get() * GAIN
@@ -2920,6 +2933,7 @@ class MushIOGUI:
         # Trace callbacks: update scale labels when settings change
         self._uv_scale.trace_add('write',
             lambda *_: self._on_scale_setting_changed())
+        self._uv_scale.trace_add('write', self._sync_range_display)
         self._auto_scale.trace_add('write',
             lambda *_: self._on_scale_setting_changed())
         self._display_secs.trace_add('write',
@@ -3033,10 +3047,10 @@ class MushIOGUI:
                            command=self._rebuild_overlay_axes).pack(side=tk.LEFT)
 
         # Y-axis range controls (inline — no need to use the left panel)
-        tk.Label(tb, text="  Y \u00b1", bg=BG_MID, fg=FG_DIM,
+        tk.Label(tb, text="  Y range", bg=BG_MID, fg=FG_DIM,
                  font=('Helvetica', 8)).pack(side=tk.LEFT, padx=(14, 2))
-        ttk.Combobox(tb, textvariable=self._uv_scale, width=8,
-                     values=[227000, 100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50],
+        ttk.Combobox(tb, textvariable=self._range_display, width=10,
+                     values=[l for l, _ in self._range_options],
                      state='readonly').pack(side=tk.LEFT)
         ttk.Checkbutton(tb, text="Auto", variable=self._auto_scale
                         ).pack(side=tk.LEFT, padx=(8, 2))
@@ -3098,10 +3112,10 @@ class MushIOGUI:
         tk.Label(tb, text="uV", bg=BG_MID, fg=FG_DIMMER,
                  font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(2, 0))
 
-        tk.Label(tb, text="  Y \u00b1", bg=BG_MID, fg=FG_DIM,
+        tk.Label(tb, text="  Y range", bg=BG_MID, fg=FG_DIM,
                  font=('Helvetica', 8)).pack(side=tk.LEFT, padx=(14, 2))
-        ttk.Combobox(tb, textvariable=self._uv_scale, width=8,
-                     values=[227000, 100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50],
+        ttk.Combobox(tb, textvariable=self._range_display, width=10,
+                     values=[l for l, _ in self._range_options],
                      state='readonly').pack(side=tk.LEFT)
         ttk.Checkbutton(tb, text="Auto", variable=self._auto_scale
                         ).pack(side=tk.LEFT, padx=(8, 2))

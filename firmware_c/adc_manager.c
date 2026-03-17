@@ -250,9 +250,9 @@ bool adc_manager_init(void)
         if (!ok) {
             printf("[ADC] FATAL: no free PIO for SPI1 bus\n");
         } else {
-            /* PIO clock divider: SPI freq = PIO_clock / 3 instructions per bit.
-             * For 4 MHz SPI: PIO_clock = 12 MHz → div = 150 / 12 = 12.5 */
-            float clkdiv = (float)clock_get_hz(clk_sys) / (ADC_SPI_BAUDRATE * 3.0f);
+            /* PIO clock divider: SPI freq = PIO_clock / 4 instructions per bit.
+             * For 4 MHz SPI: PIO_clock = 16 MHz → div = 150 / 16 = 9.375 */
+            float clkdiv = (float)clock_get_hz(clk_sys) / (ADC_SPI_BAUDRATE * 4.0f);
             pio_spi_cpha1_program_init(g_pio, g_pio_sm, g_pio_off,
                                         SPI1_MOSI, SPI1_MISO, SPI1_SCK,
                                         clkdiv);
@@ -520,7 +520,7 @@ int bitbang_spi1_test(char *out, int out_size)
     }
 
     /* 10. Restore PIO SPI */
-    float clkdiv = (float)clock_get_hz(clk_sys) / (ADC_SPI_BAUDRATE * 3.0f);
+    float clkdiv = (float)clock_get_hz(clk_sys) / (ADC_SPI_BAUDRATE * 4.0f);
     pio_spi_cpha1_program_init(g_pio, g_pio_sm, g_pio_off,
                                 SPI1_MOSI, SPI1_MISO, SPI1_SCK, clkdiv);
     BB_APPEND("[BB] PIO SPI restored\n");

@@ -1,31 +1,33 @@
 ;
 ; pio_spi.pio — PIO SPI for ADS124S08 on MushIO V1.0
 ;
-; ADS124S08 SPI timing:
-;   CPOL=0: SCK idles LOW
+; ADS124S08 SPI timing (CPOL=0, CPHA=1 — SPI Mode 1):
+;   SCK idles LOW
 ;   DIN  captured on falling edge of SCLK
-;   DOUT changes  on falling edge of SCLK (t_DO ≈ 25 ns after edge)
-;   DOUT stable during HIGH phase → sample on rising edge
+;   DOUT updated  on falling edge of SCLK (t_DO ≈ 25 ns after edge)
+;
+; 4 PIO cycles per bit:
+;   1. out  side 0  — SCK LOW, set MOSI (stalls here if TX empty → SCK idle LOW)
+;   2. nop  side 1  — SCK HIGH (rising edge)
+;   3. nop  side 0  — SCK LOW  (falling edge) → ADC captures DIN, updates DOUT
+;   4. in   side 0  — SCK LOW  — sample MISO (valid ≥ 83 ns after falling edge)
+;
+; SPI freq = SM clock / 4.
 ;
 ; Pins:
 ;   OUT      = MOSI (1 pin)
 ;   IN       = MISO (1 pin)
 ;   side-set = SCK  (1 pin)
 ;
-; Autopull/autopush at 8 bits, MSB first.
-; 3 PIO cycles per bit  →  SPI freq = SM clock / 3.
-;
-; When TX FIFO is empty the program stalls on `out` with side 0,
-; keeping SCK LOW (correct idle state for CPOL=0).
-;
 
 .program pio_spi_cpha1
 .side_set 1
 
 .wrap_target
-    out pins, 1   side 0       ; Set MOSI bit, SCK LOW
-    in pins, 1    side 1       ; SCK HIGH (rising edge) — sample MISO (stable from prev falling edge)
+    out pins, 1   side 0       ; SCK LOW — set MOSI bit (stalls here if TX empty)
+    nop           side 1       ; SCK HIGH (rising edge)
     nop           side 0       ; SCK LOW  (falling edge) — ADC latches DIN, shifts DOUT
+    in pins, 1    side 0       ; SCK LOW  — sample MISO (valid after t_DO)
 .wrap
 
 % c-sdk {

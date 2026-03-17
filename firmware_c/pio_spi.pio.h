@@ -13,21 +13,22 @@
 // ------------- //
 
 #define pio_spi_cpha1_wrap_target 0
-#define pio_spi_cpha1_wrap 2
+#define pio_spi_cpha1_wrap 3
 #define pio_spi_cpha1_pio_version 1
 
 static const uint16_t pio_spi_cpha1_program_instructions[] = {
             //     .wrap_target
     0x6001, //  0: out    pins, 1         side 0
-    0x5001, //  1: in     pins, 1         side 1
+    0xb042, //  1: nop                    side 1
     0xa042, //  2: nop                    side 0
+    0x4001, //  3: in     pins, 1         side 0
             //     .wrap
 };
 
 #if !PICO_NO_HARDWARE
 static const struct pio_program pio_spi_cpha1_program = {
     .instructions = pio_spi_cpha1_program_instructions,
-    .length = 3,
+    .length = 4,
     .origin = -1,
     .pio_version = pio_spi_cpha1_pio_version,
 #if PICO_PIO_VERSION > 0

@@ -4,9 +4,11 @@
  * Hardware:
  *   6 × ADS124S08 (24-bit delta-sigma ADCs) on two SPI buses
  *   ADC0..ADC2  →  SPI0 (GP2=SCK, GP3=MOSI, GP4=MISO)
- *   ADC3..ADC5  →  SPI1 (GP14=SCK, GP15=MOSI, GP12=MISO)
+ *   ADC3..ADC5  →  PIO SPI (GP14=SCK, GP15=MOSI, GP16=MISO)
+ *                   GP16 maps to hardware SPI0 (not SPI1) on RP2350,
+ *                   so we use a PIO state machine for the second bus.
  *   Each ADC has its own CS and DRDY pin (see config.h)
- *   Shared: ADC_RESET_N (GP20), ADC_START (GP21), ADC_CLK_EN (GP22)
+ *   Shared: ADC_RESET_N (GP20), ADC_START (GP21), STATUS_LED (GP22)
  *
  * Each ADC reads 12 channels per scan frame using input mux cycling.
  * Total: 6 × 12 = 72 channels × 3 bytes = 216 bytes per frame.
@@ -25,9 +27,12 @@
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
+#include "hardware/pio.h"
+#include "hardware/clocks.h"
 
 #include "config.h"
 #include "adc_manager.h"
+#include "pio_spi.h"
 
 /* =========================================================================
  * ADS124S08 SPI Commands
@@ -65,8 +70,15 @@
 static const uint8_t adc_cs_pins[NUM_ADCS]   = ADC_CS_PINS;
 static const uint8_t adc_drdy_pins[NUM_ADCS]  = ADC_DRDY_PINS;
 
-/* Which SPI instance each ADC uses: ADC0..2 → SPI0, ADC3..5 → SPI1 */
-static spi_inst_t *adc_spi[NUM_ADCS];
+/* ADC0..2 use hardware SPI0.  ADC3..5 use PIO SPI (GP16 ≠ HW SPI1). */
+static spi_inst_t *adc_hw_spi = NULL;   /* hardware SPI0 for ADC0-2 */
+
+/* PIO SPI state for ADC3-5 (non-static: accessed by bitbang_test in main.c) */
+PIO   g_pio      = NULL;
+uint  g_pio_sm   = 0;
+uint  g_pio_off  = 0;
+
+static inline bool adc_uses_pio(int adc) { return adc >= 3; }
 
 /* SPI clock: 4 MHz — well within ADS124S08 max of ~8 MHz */
 #define ADC_SPI_BAUDRATE    4000000
@@ -92,31 +104,46 @@ static inline void cs_deselect(int adc)
 void ads_cmd(int adc, uint8_t cmd)
 {
     cs_select(adc);
-    spi_write_blocking(adc_spi[adc], &cmd, 1);
+    if (adc_uses_pio(adc))
+        pio_spi_write(g_pio, g_pio_sm, &cmd, 1);
+    else
+        spi_write_blocking(adc_hw_spi, &cmd, 1);
     cs_deselect(adc);
 }
 
 /* Read n registers starting at addr.  Returns bytes read, or 0 on error.
- * Uses a single spi_write_read_blocking transaction to avoid potential
- * timing gaps between separate write/read calls. */
+ *
+ * ADS124S08 RREG protocol:
+ *   1. Send command byte (0x20 | addr)
+ *   2. Send count byte (n - 1)
+ *   3. Wait for ADC to decode command (td(SCCS) ~50 tCLK ≈ 12 µs at 4.096 MHz)
+ *   4. Clock out n data bytes (send 0x00 NOP while reading)
+ *
+ * Previous implementation sent header + data in one burst; at 4 MHz SPI the
+ * ADC had no time to decode the RREG command before data was clocked out,
+ * resulting in all-0xFF or all-0x00 reads. */
 int ads_rreg(int adc, uint8_t addr, uint8_t *buf, uint8_t n)
 {
-    /* Total transaction: 2 header bytes + n data bytes */
-    uint8_t tx[20] = {0};   /* max 18 regs + 2 hdr = 20 */
-    uint8_t rx[20] = {0};
-    uint8_t total = (uint8_t)(2 + n);
-    if (total > sizeof(tx)) total = sizeof(tx);
+    if (n == 0 || n > 18) return 0;
 
-    tx[0] = (uint8_t)(ADS_CMD_RREG | (addr & 0x1F));
-    tx[1] = (uint8_t)(n - 1);
-    /* tx[2..] = 0x00 (NOP) to clock out register data */
+    /* Send 2-byte RREG header */
+    uint8_t hdr[2] = {
+        (uint8_t)(ADS_CMD_RREG | (addr & 0x1F)),
+        (uint8_t)(n - 1)
+    };
 
     cs_select(adc);
-    spi_write_read_blocking(adc_spi[adc], tx, rx, total);
+    if (adc_uses_pio(adc)) {
+        pio_spi_write(g_pio, g_pio_sm, hdr, 2);
+        busy_wait_us(10);
+        pio_spi_read(g_pio, g_pio_sm, 0x00, buf, n);
+    } else {
+        spi_write_blocking(adc_hw_spi, hdr, 2);
+        busy_wait_us(10);
+        spi_read_blocking(adc_hw_spi, 0x00, buf, n);
+    }
     cs_deselect(adc);
 
-    /* Register data starts at rx[2] (after the 2-byte header) */
-    memcpy(buf, &rx[2], n);
     return n;
 }
 
@@ -131,7 +158,10 @@ static void ads_wreg(int adc, uint8_t addr, const uint8_t *data, uint8_t n)
     tx[1] = (uint8_t)(n - 1);
     memcpy(&tx[2], data, n);
     cs_select(adc);
-    spi_write_blocking(adc_spi[adc], tx, total);
+    if (adc_uses_pio(adc))
+        pio_spi_write(g_pio, g_pio_sm, tx, total);
+    else
+        spi_write_blocking(adc_hw_spi, tx, total);
     cs_deselect(adc);
 }
 
@@ -149,7 +179,10 @@ int32_t ads_rdata(int adc)
     uint8_t rx[4] = { 0 };
 
     cs_select(adc);
-    spi_write_read_blocking(adc_spi[adc], tx, rx, 4);
+    if (adc_uses_pio(adc))
+        pio_spi_write_read(g_pio, g_pio_sm, tx, rx, 4);
+    else
+        spi_write_read_blocking(adc_hw_spi, tx, rx, 4);
     cs_deselect(adc);
 
     /* Data is in rx[1..3], big-endian 24-bit signed */
@@ -180,23 +213,54 @@ bool adc_manager_init(void)
 {
     printf("[ADC] Initialising ADS124S08 × %u\n", (unsigned)NUM_ADCS);
 
-    /* ---- Assign SPI instances ---- */
-    for (int i = 0; i < (int)NUM_ADCS; i++)
-        adc_spi[i] = (i < 3) ? spi0 : spi1;
-
-    /* ---- Initialise SPI0 ---- */
+    /* ---- Hardware SPI0 for ADC0-2 ---- */
+    adc_hw_spi = spi0;
     spi_init(spi0, ADC_SPI_BAUDRATE);
     spi_set_format(spi0, 8, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
     gpio_set_function(SPI0_SCK,  GPIO_FUNC_SPI);
     gpio_set_function(SPI0_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(SPI0_MISO, GPIO_FUNC_SPI);
 
-    /* ---- Initialise SPI1 ---- */
-    spi_init(spi1, ADC_SPI_BAUDRATE);
-    spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_1, SPI_MSB_FIRST);
-    gpio_set_function(SPI1_SCK,  GPIO_FUNC_SPI);
-    gpio_set_function(SPI1_MOSI, GPIO_FUNC_SPI);
-    gpio_set_function(SPI1_MISO, GPIO_FUNC_SPI);
+    /* ---- PIO SPI for ADC3-5 ----
+     * GP16 maps to hardware SPI0 on RP2350 (not SPI1), so we use PIO
+     * to implement SPI Mode 1 on GP14(SCK)/GP15(MOSI)/GP16(MISO). */
+    {
+        /* Try PIO1 first (PIO0 is used by CYW43 WiFi, PIO2 on RP2350
+         * may have GPIO input routing issues). Fall back to auto-alloc. */
+        bool ok = false;
+        int pio1_sm = pio_claim_unused_sm(pio1, false);
+        if (pio1_sm >= 0) {
+            if (pio_can_add_program(pio1, &pio_spi_cpha1_program)) {
+                g_pio = pio1;
+                g_pio_sm = (uint)pio1_sm;
+                g_pio_off = pio_add_program(pio1, &pio_spi_cpha1_program);
+                ok = true;
+            } else {
+                pio_sm_unclaim(pio1, (uint)pio1_sm);
+            }
+        }
+        if (!ok) {
+            /* Fallback: auto-allocate from any PIO */
+            ok = pio_claim_free_sm_and_add_program_for_gpio_range(
+                          &pio_spi_cpha1_program, &g_pio, &g_pio_sm, &g_pio_off,
+                          SPI1_SCK,
+                          SPI1_MISO - SPI1_SCK + 1,
+                          true);
+        }
+        if (!ok) {
+            printf("[ADC] FATAL: no free PIO for SPI1 bus\n");
+        } else {
+            /* PIO clock divider: SPI freq = PIO_clock / 3 instructions per bit.
+             * For 4 MHz SPI: PIO_clock = 12 MHz → div = 150 / 12 = 12.5 */
+            float clkdiv = (float)clock_get_hz(clk_sys) / (ADC_SPI_BAUDRATE * 3.0f);
+            pio_spi_cpha1_program_init(g_pio, g_pio_sm, g_pio_off,
+                                        SPI1_MOSI, SPI1_MISO, SPI1_SCK,
+                                        clkdiv);
+            printf("[ADC] PIO SPI on PIO%d SM%d  (GP%d=SCK GP%d=MOSI GP%d=MISO)  clkdiv=%.1f\n",
+                   pio_get_index(g_pio), g_pio_sm,
+                   SPI1_SCK, SPI1_MOSI, SPI1_MISO, (double)clkdiv);
+        }
+    }
 
     /* ---- Initialise CS pins (active low, start high) ---- */
     for (int i = 0; i < (int)NUM_ADCS; i++) {
@@ -254,7 +318,7 @@ bool adc_manager_init(void)
          * INPMUX:   will be set per-channel during scan
          */
         ads_wreg1(i, ADS_REG_PGA,      0x00);  /* gain=1, PGA off */
-        ads_wreg1(i, ADS_REG_DATARATE,  0x0E);  /* 4000 SPS, sinc3 */
+        ads_wreg1(i, ADS_REG_DATARATE,  0x0D);  /* 4000 SPS, sinc3 */
         ads_wreg1(i, ADS_REG_REF,       0x3A);  /* int ref on, REFP0/REFN0 */
         ads_wreg1(i, ADS_REG_SYS,       0x00);  /* no system monitor */
     }
@@ -333,4 +397,134 @@ bool adc_manager_drdy(int adc_index)
     if (adc_index < 0 || adc_index >= (int)NUM_ADCS)
         return false;
     return !gpio_get(adc_drdy_pins[adc_index]);  /* active low */
+}
+
+/* =========================================================================
+ * Bit-bang SPI diagnostic — bypasses PIO to test MISO hardware
+ * ========================================================================= */
+
+int bitbang_spi1_test(char *out, int out_size)
+{
+    int pos = 0;
+    #define BB_APPEND(...) do { \
+        pos += snprintf(out + pos, (out_size - pos > 0) ? (size_t)(out_size - pos) : 0, __VA_ARGS__); \
+    } while(0)
+
+    BB_APPEND("[BB] Bit-bang SPI test on ADC3 (GP14=SCK GP15=MOSI GP16=MISO CS=GP11)\n");
+
+    /* 1. Read GP16 pad level right now (while PIO is active) */
+    BB_APPEND("[BB] GP16 raw pad (PIO active): %d\n", gpio_get(SPI1_MISO));
+    BB_APPEND("[BB] PIO instance: PIO%d SM%d offset=%d\n",
+              pio_get_index(g_pio), g_pio_sm, g_pio_off);
+
+    /* 2. Disable PIO state machine */
+    pio_sm_set_enabled(g_pio, g_pio_sm, false);
+
+    /* 3. Reconfigure GP14/15/16 as plain GPIO */
+    gpio_init(SPI1_SCK);
+    gpio_set_dir(SPI1_SCK, GPIO_OUT);
+    gpio_put(SPI1_SCK, 0);   /* SCK idle LOW (CPOL=0) */
+
+    gpio_init(SPI1_MOSI);
+    gpio_set_dir(SPI1_MOSI, GPIO_OUT);
+    gpio_put(SPI1_MOSI, 0);
+
+    gpio_init(SPI1_MISO);
+    gpio_set_dir(SPI1_MISO, GPIO_IN);
+    gpio_pull_up(SPI1_MISO);
+
+    sleep_us(10);
+
+    /* Read GP16 with pull-up, no CS — should read 1 if floating/pulled up */
+    BB_APPEND("[BB] GP16 no CS (pull-up): %d\n", gpio_get(SPI1_MISO));
+
+    /* 4. Assert CS for ADC3 */
+    gpio_put(adc_cs_pins[3], 0);
+    sleep_us(10);
+    BB_APPEND("[BB] GP16 after CS3 assert: %d\n", gpio_get(SPI1_MISO));
+
+    /* 5. Bit-bang RREG ID: send 0x20 0x00 (read 1 reg at addr 0) */
+    /* SPI Mode 1: data changes on rising edge, sampled on falling edge */
+    uint8_t tx_bytes[2] = { 0x20, 0x00 };
+    for (int b = 0; b < 2; b++) {
+        uint8_t byte = tx_bytes[b];
+        for (int bit = 7; bit >= 0; bit--) {
+            gpio_put(SPI1_MOSI, (byte >> bit) & 1);
+            sleep_us(2);
+            gpio_put(SPI1_SCK, 1);   /* rising edge */
+            sleep_us(2);
+            gpio_put(SPI1_SCK, 0);   /* falling edge */
+            sleep_us(2);
+        }
+    }
+
+    /* 6. Wait for ADC to decode RREG */
+    sleep_us(50);
+
+    /* 7. Clock out 1 byte while reading MISO bit-by-bit */
+    uint8_t rx_val = 0;
+    char bits_str[9] = {0};
+    gpio_put(SPI1_MOSI, 0);
+    for (int bit = 7; bit >= 0; bit--) {
+        sleep_us(2);
+        gpio_put(SPI1_SCK, 1);   /* rising edge */
+        sleep_us(2);
+        gpio_put(SPI1_SCK, 0);   /* falling edge */
+        sleep_us(1);
+        int miso = gpio_get(SPI1_MISO);
+        rx_val |= (uint8_t)(miso << bit);
+        bits_str[7 - bit] = miso ? '1' : '0';
+    }
+    bits_str[8] = '\0';
+
+    gpio_put(adc_cs_pins[3], 1);   /* deassert CS */
+
+    BB_APPEND("[BB] ID readback: 0x%02X  bits=%s\n", rx_val, bits_str);
+
+    /* 8. Test with pull-down to check if ADC drives MISO */
+    gpio_pull_down(SPI1_MISO);
+    sleep_us(10);
+    BB_APPEND("[BB] GP16 pull-down (no CS): %d\n", gpio_get(SPI1_MISO));
+    gpio_pull_up(SPI1_MISO);
+
+    /* 9. Also try ADC4 and ADC5 ID reads */
+    for (int a = 4; a <= 5; a++) {
+        gpio_put(adc_cs_pins[a], 0);
+        sleep_us(10);
+        /* Send RREG ID */
+        for (int b = 0; b < 2; b++) {
+            uint8_t byte = tx_bytes[b];
+            for (int bit = 7; bit >= 0; bit--) {
+                gpio_put(SPI1_MOSI, (byte >> bit) & 1);
+                sleep_us(2);
+                gpio_put(SPI1_SCK, 1);
+                sleep_us(2);
+                gpio_put(SPI1_SCK, 0);
+                sleep_us(2);
+            }
+        }
+        sleep_us(50);
+        uint8_t rx2 = 0;
+        gpio_put(SPI1_MOSI, 0);
+        for (int bit = 7; bit >= 0; bit--) {
+            sleep_us(2);
+            gpio_put(SPI1_SCK, 1);
+            sleep_us(2);
+            gpio_put(SPI1_SCK, 0);
+            sleep_us(1);
+            if (gpio_get(SPI1_MISO))
+                rx2 |= (uint8_t)(1 << bit);
+        }
+        gpio_put(adc_cs_pins[a], 1);
+        BB_APPEND("[BB] ADC%d ID: 0x%02X\n", a, rx2);
+    }
+
+    /* 10. Restore PIO SPI */
+    float clkdiv = (float)clock_get_hz(clk_sys) / (ADC_SPI_BAUDRATE * 3.0f);
+    pio_spi_cpha1_program_init(g_pio, g_pio_sm, g_pio_off,
+                                SPI1_MOSI, SPI1_MISO, SPI1_SCK, clkdiv);
+    BB_APPEND("[BB] PIO SPI restored\n");
+
+    #undef BB_APPEND
+    return pos;
 }

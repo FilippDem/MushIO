@@ -883,7 +883,7 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         else if (sps_f < 900.0f) dr_bits = 0x09;  /* 800  */
         else if (sps_f < 1500.0f) dr_bits = 0x0A; /* 1000 */
         else if (sps_f < 3000.0f) dr_bits = 0x0B; /* 2000 */
-        else if (sps_f <= 4000.0f) dr_bits = 0x0E; /* 4000 */
+        else if (sps_f <= 4000.0f) dr_bits = 0x0D; /* 4000 */
         if (dr_bits < 0) {
             cmd_send(pcb, "error: set_datarate <2.5|5|10|16.6|20|50|100|200|400|800|1000|2000|4000>");
         } else {
@@ -966,6 +966,180 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         }
 #else
         cmd_send(pcb, "set_refbuf: demo mode (no-op)");
+#endif
+
+    } else if (strncasecmp(cmd, "probe_adc", 9) == 0) {
+        /* probe_adc <n> — deep diagnostic for a single ADC (0-5).
+         * Reports pin mapping, ID, all registers, DRDY state,
+         * and performs a single conversion test with timing. */
+#ifndef MUSHIO_DEMO
+        const char *arg = cmd + 9;
+        while (*arg == ' ') arg++;
+        int adc = (*arg) ? atoi(arg) : -1;
+        if (adc < 0 || adc >= (int)NUM_ADCS) {
+            cmd_send(pcb, "error: probe_adc <0..%d>", (int)NUM_ADCS - 1);
+        } else {
+            static const uint8_t cs_pins[]   = ADC_CS_PINS;
+            static const uint8_t drdy_pins[] = ADC_DRDY_PINS;
+
+            g_scan_paused = true;
+            sleep_ms(100);
+
+            /* 1. Pin mapping */
+            cmd_send(pcb, "[PROBE] ADC%d on %s  CS=GP%d  DRDY=GP%d",
+                     adc, (adc < 3) ? "SPI0" : "SPI1",
+                     cs_pins[adc], drdy_pins[adc]);
+
+            /* 2. Read ID register */
+            uint8_t id = 0xFF;
+            int rd = ads_rreg(adc, 0x00, &id, 1);
+            if (rd > 0) {
+                uint8_t dev = id & 0x07;
+                cmd_send(pcb, "[PROBE] ID=0x%02X  dev=%d  %s",
+                         id, dev, (dev == 0x00) ? "ADS124S08 OK" : "UNKNOWN DEVICE");
+            } else {
+                cmd_send(pcb, "[PROBE] ID: SPI READ FAILED (no response)");
+            }
+
+            /* 3. Full register dump (18 registers) */
+            uint8_t regs[18] = {0};
+            rd = ads_rreg(adc, 0x00, regs, 18);
+            if (rd > 0) {
+                static const char *reg_names[18] = {
+                    "ID", "STATUS", "INPMUX", "PGA", "DATARATE", "REF",
+                    "IDACMAG", "IDACMUX", "VBIAS", "SYS", "OFCAL0", "OFCAL1",
+                    "OFCAL2", "FSCAL0", "FSCAL1", "FSCAL2", "GPIODAT", "GPIOCON"
+                };
+                for (int r = 0; r < 18; r++) {
+                    cmd_send(pcb, "[PROBE]   0x%02X %-8s = 0x%02X", r, reg_names[r], regs[r]);
+                }
+            } else {
+                cmd_send(pcb, "[PROBE] Register dump: SPI FAILED");
+            }
+
+            /* 4. DRDY pin state */
+            bool drdy_state = !gpio_get(drdy_pins[adc]);  /* active low */
+            cmd_send(pcb, "[PROBE] DRDY GP%d: %s (%s)",
+                     drdy_pins[adc],
+                     drdy_state ? "LOW (active)" : "HIGH (idle)",
+                     drdy_state ? "data ready or stuck" : "normal idle");
+
+            /* 5. Single conversion test */
+            ads_cmd(adc, ADS_CMD_STOP);
+            sleep_us(100);
+            ads_wreg1(adc, ADS_REG_INPMUX, 0x0C);  /* AIN0 vs AINCOM */
+            ads_cmd(adc, ADS_CMD_START);
+            uint64_t t0 = time_us_64();
+            bool got_drdy = ads_wait_drdy(adc, 5000);
+            uint64_t dt = time_us_64() - t0;
+            if (got_drdy) {
+                int32_t val = ads_rdata(adc);
+                /* Sign-extend 24-bit */
+                if (val & 0x800000) val |= (int32_t)0xFF000000;
+                float volts = (float)val * 2.5f / 8388608.0f;
+                cmd_send(pcb, "[PROBE] Conversion OK: %llu us  raw=%ld (0x%06lX)  %.6f V",
+                         (unsigned long long)dt, (long)val,
+                         (unsigned long)(val & 0xFFFFFF), (double)volts);
+            } else {
+                cmd_send(pcb, "[PROBE] Conversion FAILED: DRDY timeout after %llu us",
+                         (unsigned long long)dt);
+            }
+            ads_cmd(adc, ADS_CMD_STOP);
+
+            g_scan_paused = false;
+            cmd_send(pcb, "[PROBE] Done");
+        }
+#else
+        cmd_send(pcb, "probe_adc: demo mode (no real ADC hardware)");
+#endif
+
+    } else if (strcasecmp(cmd, "test_spi1") == 0) {
+        /* test_spi1 — bus-level SPI1 diagnostic.
+         * Tests each ADC on SPI1 (indices 3,4,5) individually.
+         * Reads ID register and checks DRDY pin for each. */
+#ifndef MUSHIO_DEMO
+        g_scan_paused = true;
+        sleep_ms(100);
+
+        static const uint8_t cs_pins[]   = ADC_CS_PINS;
+        static const uint8_t drdy_pins[] = ADC_DRDY_PINS;
+
+        cmd_send(pcb, "[SPI1] Testing SPI1 bus (GP14=SCK, GP15=MOSI, GP16=MISO)");
+
+        /* Check GPIO function assignments */
+        uint32_t sck_fn  = gpio_get_function(SPI1_SCK);
+        uint32_t mosi_fn = gpio_get_function(SPI1_MOSI);
+        uint32_t miso_fn = gpio_get_function(SPI1_MISO);
+        cmd_send(pcb, "[SPI1] GP%d(SCK) func=%lu  GP%d(MOSI) func=%lu  GP%d(MISO) func=%lu",
+                 SPI1_SCK, (unsigned long)sck_fn,
+                 SPI1_MOSI, (unsigned long)mosi_fn,
+                 SPI1_MISO, (unsigned long)miso_fn);
+        cmd_send(pcb, "[SPI1] Expected func=1 (SPI).  If not 1, bus is misconfigured.");
+
+        /* Test each SPI1 ADC */
+        for (int a = 3; a < (int)NUM_ADCS; a++) {
+            cmd_send(pcb, "[SPI1] --- ADC%d  CS=GP%d  DRDY=GP%d ---",
+                     a, cs_pins[a], drdy_pins[a]);
+
+            /* Read ID register */
+            uint8_t id = 0xFF;
+            int rd = ads_rreg(a, 0x00, &id, 1);
+            if (rd > 0) {
+                cmd_send(pcb, "[SPI1]   ID=0x%02X  %s",
+                         id, ((id & 0x07) == 0x00) ? "ADS124S08" : "UNKNOWN");
+            } else {
+                cmd_send(pcb, "[SPI1]   ID: SPI FAIL (got 0 bytes back)");
+            }
+
+            /* DRDY pin state */
+            bool drdy_low = !gpio_get(drdy_pins[a]);
+            cmd_send(pcb, "[SPI1]   DRDY: %s", drdy_low ? "LOW (active)" : "HIGH (idle)");
+
+            /* Quick conversion test */
+            ads_cmd(a, ADS_CMD_STOP);
+            sleep_us(100);
+            ads_wreg1(a, ADS_REG_INPMUX, 0x0C);
+            ads_cmd(a, ADS_CMD_START);
+            bool got = ads_wait_drdy(a, 5000);
+            if (got) {
+                int32_t val = ads_rdata(a);
+                if (val & 0x800000) val |= (int32_t)0xFF000000;
+                cmd_send(pcb, "[SPI1]   Conv: OK  raw=%ld", (long)val);
+            } else {
+                cmd_send(pcb, "[SPI1]   Conv: DRDY TIMEOUT (5ms)");
+            }
+            ads_cmd(a, ADS_CMD_STOP);
+        }
+
+        g_scan_paused = false;
+        cmd_send(pcb, "[SPI1] Test complete");
+#else
+        cmd_send(pcb, "test_spi1: demo mode (no real hardware)");
+#endif
+
+    } else if (strcasecmp(cmd, "bitbang_test") == 0) {
+        /* bitbang_test — bit-bang SPI read of ADC3-5 ID registers.
+         * Bypasses PIO entirely to test if MISO (GP16) is physically driven. */
+#ifndef MUSHIO_DEMO
+        g_scan_paused = true;
+        sleep_ms(100);
+
+        char bb_buf[2048];
+        int bb_len = bitbang_spi1_test(bb_buf, sizeof(bb_buf));
+        (void)bb_len;
+
+        /* Send each line as a separate cmd_send */
+        char *line = bb_buf;
+        while (*line) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            if (*line) cmd_send(pcb, "%s", line);
+            if (nl) line = nl + 1; else break;
+        }
+
+        g_scan_paused = false;
+#else
+        cmd_send(pcb, "bitbang_test: demo mode (no real hardware)");
 #endif
 
     } else if (strncasecmp(cmd, "read_ch", 7) == 0) {
@@ -1141,7 +1315,8 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
                       "read_regs | set_fps <hz> | set_host <ip> | "
                       "set_spacing <S> | set_txpower <qdb> | retx <seq> <n> | "
                       "cyw43_stats | blink_led | test_hardware | ota_reboot | "
-                      "crash_log | read_ch <adc> <ch> | help");
+                      "crash_log | read_ch <adc> <ch> | probe_adc <n> | "
+                      "test_spi1 | bitbang_test | help");
         cmd_send(pcb, "True wireless OTA: connect ota_client.py to port %u", OTA_PORT);
 
     } else if (cmd[0] == '\0') {

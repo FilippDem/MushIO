@@ -64,3 +64,8 @@ int32_t ads_rdata(int adc);
 
 /* Wait for DRDY to go low, with timeout in µs. Returns true if asserted. */
 bool ads_wait_drdy(int adc, uint32_t timeout_us);
+
+/* Bit-bang SPI test on ADC3 — bypasses PIO to verify MISO is physically driven.
+ * Writes diagnostic results into 'out' buffer (up to out_size chars).
+ * Returns number of chars written. */
+int bitbang_spi1_test(char *out, int out_size);

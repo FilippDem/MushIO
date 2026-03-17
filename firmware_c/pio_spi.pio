@@ -1,0 +1,70 @@
+;
+; pio_spi.pio — PIO SPI for ADS124S08 on MushIO V1.0
+;
+; ADS124S08 SPI timing:
+;   CPOL=0: SCK idles LOW
+;   DIN  captured on falling edge of SCLK
+;   DOUT changes  on falling edge of SCLK (t_DO ≈ 25 ns after edge)
+;   DOUT stable during HIGH phase → sample on rising edge
+;
+; Pins:
+;   OUT      = MOSI (1 pin)
+;   IN       = MISO (1 pin)
+;   side-set = SCK  (1 pin)
+;
+; Autopull/autopush at 8 bits, MSB first.
+; 3 PIO cycles per bit  →  SPI freq = SM clock / 3.
+;
+; When TX FIFO is empty the program stalls on `out` with side 0,
+; keeping SCK LOW (correct idle state for CPOL=0).
+;
+
+.program pio_spi_cpha1
+.side_set 1
+
+.wrap_target
+    out pins, 1   side 0       ; Set MOSI bit, SCK LOW
+    in pins, 1    side 1       ; SCK HIGH (rising edge) — sample MISO (stable from prev falling edge)
+    nop           side 0       ; SCK LOW  (falling edge) — ADC latches DIN, shifts DOUT
+.wrap
+
+% c-sdk {
+#include "hardware/gpio.h"
+
+static inline void pio_spi_cpha1_program_init(PIO pio, uint sm, uint offset,
+                                               uint mosi_pin, uint miso_pin,
+                                               uint sck_pin, float clkdiv) {
+    pio_sm_config c = pio_spi_cpha1_program_get_default_config(offset);
+
+    sm_config_set_out_pins(&c, mosi_pin, 1);
+    sm_config_set_in_pins(&c, miso_pin);
+    sm_config_set_sideset_pins(&c, sck_pin);
+
+    /* MSB first, autopull at 8 bits, autopush at 8 bits */
+    sm_config_set_out_shift(&c, false, true, 8);
+    sm_config_set_in_shift(&c, false, true, 8);
+
+    sm_config_set_clkdiv(&c, clkdiv);
+
+    /* Assign MOSI and SCK to PIO function.
+     * MISO is left as SIO/GPIO input — PIO `in pins` reads the pad
+     * state directly regardless of function mux, and setting GP16 to
+     * PIO2 function (funcsel 8) may prevent the pad input from
+     * reaching the PIO on RP2350. */
+    pio_gpio_init(pio, mosi_pin);
+    gpio_init(miso_pin);
+    gpio_set_dir(miso_pin, GPIO_IN);
+    pio_gpio_init(pio, sck_pin);
+
+    /* Pin directions: MOSI and SCK = output, MISO = input */
+    pio_sm_set_pindirs_with_mask(pio, sm,
+        (1u << mosi_pin) | (1u << sck_pin),
+        (1u << mosi_pin) | (1u << miso_pin) | (1u << sck_pin));
+
+    /* SCK starts LOW */
+    pio_sm_set_pins_with_mask(pio, sm, 0, 1u << sck_pin);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

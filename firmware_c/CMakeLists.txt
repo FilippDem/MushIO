@@ -88,6 +88,7 @@ target_link_libraries(mushio_c
     hardware_watchdog                        # watchdog_enable, watchdog_update, scratch regs
     hardware_flash                           # flash_range_erase, flash_range_program (OTA)
     hardware_spi                             # SPI buses for ADS124S08 ADCs
+    hardware_pio                             # PIO SPI for SPI1 bus (GP16 is SPI0, not SPI1)
     pico_cyw43_arch_lwip_threadsafe_background  # WiFi + lwIP (alarm-IRQ model)
 )
 
@@ -103,6 +104,12 @@ pico_enable_stdio_uart(mushio_c 0)
 # ---------------------------------------------------------------------------
 
 pico_add_extra_outputs(mushio_c)
+
+# ---------------------------------------------------------------------------
+# PIO programs  (SPI1 bus uses PIO because GP16 maps to HW SPI0, not SPI1)
+# ---------------------------------------------------------------------------
+
+pico_generate_pio_header(mushio_c ${CMAKE_CURRENT_SOURCE_DIR}/pio_spi.pio)
 
 # ---------------------------------------------------------------------------
 # Compiler flags

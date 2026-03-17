@@ -130,16 +130,19 @@
 
 #define SPI1_SCK    14
 #define SPI1_MOSI   15
-#define SPI1_MISO   12
+#define SPI1_MISO   16
 
 /* Chip Selects: ADC0..ADC5 */
-#define ADC_CS_PINS     {5, 7, 9, 11, 13, 17}
+#define ADC_CS_PINS     {5, 7, 9, 11, 27, 18}
 /* Data Ready:  ADC0..ADC5 */
-#define ADC_DRDY_PINS   {6, 8, 10, 16, 18, 19}
+#define ADC_DRDY_PINS   {6, 8, 10, 26, 17, 19}
 
 #define ADC_START_PIN   21
 #define ADC_RESET_N_PIN 20
-#define ADC_CLK_EN_PIN  22
+#define STATUS_LED_PIN  22
 
 #define I2C0_SDA_PIN    0
 #define I2C0_SCL_PIN    1
+
+/* Analog power good indicator */
+#define ANA_PGOOD_PIN   28

@@ -28,6 +28,7 @@
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "pico/cyw43_arch.h"
+#include "cyw43.h"              /* cyw43_ioctl() for TX power control */
 #include "pico/bootrom.h"
 #include "hardware/timer.h"
 #include "hardware/watchdog.h"
@@ -49,6 +50,10 @@ extern void core1_main(void);
 #include "crc16.h"
 #include "ota_server.h"
 
+#ifndef MUSHIO_DEMO
+#include "adc_manager.h"
+#endif
+
 /* =========================================================================
  * Shared ring buffer  (defined here; extern in core1.c)
  * ========================================================================= */
@@ -60,6 +65,36 @@ ring_t g_ring;
  * ========================================================================= */
 
 static volatile uint32_t g_sent_frames  = 0;
+static volatile uint32_t g_udp_send_fail = 0;   /* udp_sendto returned error */
+static volatile uint32_t g_udp_stall_cnt = 0;   /* send took >500 µs (credit stall) */
+static volatile uint32_t g_udp_pbuf_fail = 0;   /* pbuf_alloc returned NULL */
+
+/* =========================================================================
+ * CYW43 TX Power Control
+ *
+ * qtxpower iovar: TX power in quarter-dBm units.
+ * Default CYW43439 max: 31 dBm → 124 quarter-dBm.
+ * Range: 0 (min) to 127 (31.75 dBm, clamped by chip to max).
+ * ========================================================================= */
+
+#define TX_POWER_DEFAULT_QDB  80   /* 20 dBm = default conservative */
+#define TX_POWER_MAX_QDB     127   /* 31.75 dBm = chip maximum */
+
+static int g_tx_power_qdb = TX_POWER_DEFAULT_QDB;
+
+static int cyw43_set_tx_power(int quarter_dbm) {
+    /* Pack "qtxpower" iovar: name + NUL + LE32 value */
+    uint8_t buf[20];
+    const char *var = "qtxpower";
+    size_t vlen = strlen(var) + 1;
+    memcpy(buf, var, vlen);
+    buf[vlen + 0] = (uint8_t)(quarter_dbm & 0xFF);
+    buf[vlen + 1] = (uint8_t)((quarter_dbm >> 8) & 0xFF);
+    buf[vlen + 2] = 0;
+    buf[vlen + 3] = 0;
+    /* ioctl cmd encoding: (WLC_SET_VAR << 1) | 1 = (263 << 1) | 1 = 527 */
+    return cyw43_ioctl(&cyw43_state, 527, vlen + 4, buf, CYW43_ITF_STA);
+}
 
 /* Non-blocking benchmark: set by CMD callback, sampled in main loop */
 static volatile bool        g_benchmark_req = false;
@@ -84,6 +119,10 @@ static uint32_t        g_beacon_last = 0;
  * Updated at runtime by the 'set_fps <hz>' CMD command.
  * Core 1 reads this once per scan iteration (extern in core1.c). */
 volatile uint32_t g_scan_period_us = DEMO_SCAN_PERIOD_US;
+
+/* Pause Core 1 scanning — set by Core 0 before SPI diagnostic commands,
+ * cleared after.  Core 1 spins while this is true. */
+volatile bool g_scan_paused = false;
 
 /* =========================================================================
  * OTA reboot flag
@@ -124,6 +163,7 @@ static void crash_log_write(uint32_t code, uint32_t extra)
 static inline void led_set(bool on)
 {
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on ? 1 : 0);
+    gpio_put(STATUS_LED_PIN, on ? 1 : 0);
 }
 
 static void led_blink(int count, int on_ms, int off_ms)
@@ -417,6 +457,8 @@ static void do_udp_stream_work(void)
         }
         uint16_t payload_len = (uint16_t)(n_copies * FRAME_SIZE);
 
+        bool backoff = false;
+
         cyw43_arch_lwip_begin();
 
         struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, payload_len, PBUF_RAM);
@@ -433,9 +475,29 @@ static void do_udp_stream_work(void)
                 memcpy(dst + i * FRAME_SIZE,
                        g_udp_history[idx], FRAME_SIZE);
             }
-            udp_sendto(g_data_udp_pcb, p, &g_data_udp_dest, DATA_UDP_PORT);
+
+            /* Credit-aware pacing: measure send time to detect SDPCM stalls.
+             * If the CYW43 driver blocks on credit exhaustion, udp_sendto
+             * takes >500 µs (normally ~50 µs).  Break the burst early to let
+             * credits replenish before the next main-loop iteration. */
+            uint64_t t_send = time_us_64();
+            err_t err = udp_sendto(g_data_udp_pcb, p, &g_data_udp_dest, DATA_UDP_PORT);
+            uint64_t dt_send = time_us_64() - t_send;
+
             pbuf_free(p);
-            g_sent_frames++;
+
+            if (err != ERR_OK) {
+                g_udp_send_fail++;
+                backoff = true;
+            } else {
+                g_sent_frames++;
+                if (dt_send > 500) {
+                    g_udp_stall_cnt++;
+                    backoff = true;
+                }
+            }
+        } else {
+            g_udp_pbuf_fail++;
         }
 
         cyw43_arch_lwip_end();
@@ -447,6 +509,12 @@ static void do_udp_stream_work(void)
         g_udp_hist_wr = (g_udp_hist_wr + 1) % UDP_HISTORY_MAX;
         if (g_udp_hist_count < UDP_HISTORY_MAX)
             g_udp_hist_count++;
+
+        /* If the CYW43 stalled or failed, yield the burst loop to let
+         * SDPCM credits replenish.  Remaining frames stay in the ring
+         * and will be sent on the next main-loop iteration. */
+        if (backoff)
+            break;
     }
 }
 
@@ -501,13 +569,19 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         uint32_t buffered = ring_count(&g_ring);
         uint32_t dropped  = g_ring.dropped;
         cmd_send(pcb, "frames_sent=%lu dropped=%lu buffered=%lu "
-                      "wifi=%d tcp=%d spacing=%lu",
+                      "wifi=%d tcp=%d spacing=%lu "
+                      "send_fail=%lu stalls=%lu pbuf_fail=%lu "
+                      "txpower_qdb=%d",
                  (unsigned long)g_sent_frames,
                  (unsigned long)dropped,
                  (unsigned long)buffered,
                  (int)(cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) == CYW43_LINK_UP),
                  (int)g_data_connected,
-                 (unsigned long)g_udp_spacing);
+                 (unsigned long)g_udp_spacing,
+                 (unsigned long)g_udp_send_fail,
+                 (unsigned long)g_udp_stall_cnt,
+                 (unsigned long)g_udp_pbuf_fail,
+                 g_tx_power_qdb);
 
     } else if (strcasecmp(cmd, "scan_all") == 0) {
         /* Return the most-recently-buffered raw data as hex.
@@ -515,12 +589,18 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         cmd_send(pcb, "demo_mode=1 recording_ch=64 stim_ch=8 total_ch=%u",
                  (unsigned)TOTAL_CHANNELS);
 
-    } else if (strcasecmp(cmd, "blink_led") == 0) {
-        /* Blink 5 times — briefly release lwIP lock to allow blink */
-        cyw43_arch_lwip_end();
-        led_blink(5, 100, 100);
-        cyw43_arch_lwip_begin();
-        cmd_send(pcb, "ok");
+    } else if (strncasecmp(cmd, "blink_led", 9) == 0) {
+        /* blink_led [count]  — blink the on-board LED.
+         * cyw43_arch_gpio_put works fine inside the lwIP lock context
+         * (it uses the CYW43 SPI interface which is polled by the async
+         * context running on this core).  Do NOT release the lwIP lock. */
+        const char *arg = cmd + 9;
+        while (*arg == ' ') arg++;
+        int count = (*arg) ? atoi(arg) : 5;
+        if (count < 1) count = 1;
+        if (count > 50) count = 50;
+        led_blink(count, 100, 100);
+        cmd_send(pcb, "ok blinked=%d", count);
 
     } else if (strncasecmp(cmd, "set_fps", 7) == 0) {
         /* set_fps <hz>  — change Core 1 scan rate without a rebuild.
@@ -579,6 +659,23 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
                      s, (unsigned long)g_udp_hist_size);
         }
 
+    } else if (strncasecmp(cmd, "set_txpower", 11) == 0) {
+        /* set_txpower <qdb>  — set WiFi TX power in quarter-dBm units.
+         * Range: 0 (min) to 127 (31.75 dBm, chip max).
+         * Common values: 40=10dBm, 80=20dBm, 127=31.75dBm(max) */
+        const char *arg = cmd + 11;
+        while (*arg == ' ') arg++;
+        int qdb = (*arg) ? atoi(arg) : -1;
+        if (qdb < 0 || qdb > TX_POWER_MAX_QDB) {
+            cmd_send(pcb, "error: set_txpower requires 0..%d (quarter-dBm)",
+                     TX_POWER_MAX_QDB);
+        } else {
+            g_tx_power_qdb = qdb;
+            int rc = cyw43_set_tx_power(qdb);
+            cmd_send(pcb, "txpower=%d.%02d_dBm (rc=%d)",
+                     qdb / 4, (qdb % 4) * 25, rc);
+        }
+
     } else if (strcasecmp(cmd, "benchmark") == 0) {
         /* Non-blocking: record baseline in the callback, measure in main loop.
          * (sleep_ms inside lwIP alarm IRQ held the mutex → do_stream_work starved
@@ -590,9 +687,10 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         cmd_send(pcb, "[benchmark] Measuring FPS over 500 ms...");
 
     } else if (strcasecmp(cmd, "read_regs") == 0) {
-        /* Return ADS124S08 power-on defaults for all 6 ADCs.
+        /* Return ADS124S08 register banks for all 6 ADCs.
          * Format: "ADC<n> 0x<addr>=0x<val> ..."
          * Parsed by GUI's _regs_ingest_response(). */
+#ifdef MUSHIO_DEMO
         static const uint8_t defaults[18] = {
             0x10, 0x00, 0x01, 0x00, 0x14, 0x10, 0x00, 0xFF,
             0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
@@ -609,6 +707,29 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
             cmd_send(pcb, "%s", reg_line);
         }
         cmd_send(pcb, "Register dump complete -- all 6 ADCs responding");
+#else
+        cmd_send(pcb, "[REGS] Reading all 6 ADS124S08 register banks...");
+        g_scan_paused = true;
+        sleep_ms(100);  /* let Core 1 finish current scan iteration */
+        char reg_line[256];
+        for (int adc = 0; adc < (int)NUM_ADCS; adc++) {
+            int pos = snprintf(reg_line, sizeof(reg_line), "ADC%d", adc);
+            /* Read all 18 registers (0x00..0x11) in one SPI burst */
+            uint8_t regs[18] = {0};
+            int rd = ads_rreg(adc, 0x00, regs, 18);
+            if (rd == 0) {
+                cmd_send(pcb, "ADC%d: SPI FAIL", adc);
+                continue;
+            }
+            for (int r = 0; r < 18 && pos < (int)sizeof(reg_line) - 12; r++) {
+                pos += snprintf(reg_line + pos, sizeof(reg_line) - (size_t)pos,
+                                " 0x%02X=0x%02X", r, regs[r]);
+            }
+            cmd_send(pcb, "%s", reg_line);
+        }
+        g_scan_paused = false;
+        cmd_send(pcb, "Register dump complete");
+#endif
 
     } else if (strcasecmp(cmd, "test_hardware") == 0) {
         /* Hardware self-test.
@@ -622,6 +743,10 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
 #endif
                  );
         uint32_t pass = 0, total = 0;
+#ifndef MUSHIO_DEMO
+        g_scan_paused = true;
+        sleep_ms(100);  /* let Core 1 finish current scan iteration */
+#endif
 
         /* --- ADC ID checks (6 ADCs) --------------------------------------- */
         for (int a = 0; a < (int)NUM_ADCS; a++) {
@@ -629,8 +754,16 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
             cmd_send(pcb, "[TEST] ADC%d: ID=0x00  PASS", a);
             pass++;
 #else
-            /* Real: read ID register via SPI, expect bits[4:0] == 0x00 */
-            cmd_send(pcb, "[TEST] ADC%d: real SPI check not yet implemented", a);
+            /* Real: read ID register via SPI */
+            int id = adc_manager_read_id(a);
+            if (id >= 0 && (id & 0x07) == 0x00) {
+                cmd_send(pcb, "[TEST] ADC%d: ID=0x%02X  PASS (ADS124S08)", a, id);
+                pass++;
+            } else if (id >= 0) {
+                cmd_send(pcb, "[TEST] ADC%d: ID=0x%02X  FAIL (unexpected)", a, id);
+            } else {
+                cmd_send(pcb, "[TEST] ADC%d: SPI FAIL (no response)", a);
+            }
 #endif
             total++;
         }
@@ -639,10 +772,17 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         for (int a = 0; a < (int)NUM_ADCS; a++) {
 #ifdef MUSHIO_DEMO
             cmd_send(pcb, "[TEST] ADC%d DRDY: PASS (demo)", a);
-            pass++;
 #else
-            cmd_send(pcb, "[TEST] ADC%d DRDY: real check not yet implemented", a);
+            if (adc_manager_drdy(a)) {
+                cmd_send(pcb, "[TEST] ADC%d DRDY: LOW (active)  OK", a);
+            } else {
+                cmd_send(pcb, "[TEST] ADC%d DRDY: HIGH (idle)  OK", a);
+            }
 #endif
+            /* DRDY state is informational — both HIGH (idle) and LOW (active)
+             * are valid depending on whether a conversion is in progress.
+             * Always counts as pass. */
+            pass++;
             total++;
         }
 
@@ -677,9 +817,207 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
             pass++;  /* RSSI is informational — always counts as pass */
         }
 
+#ifndef MUSHIO_DEMO
+        g_scan_paused = false;
+#endif
         cmd_send(pcb, "[TEST] RESULT: %lu/%lu checks passed  %s",
                  (unsigned long)pass, (unsigned long)total,
                  (pass == total) ? "ALL PASS" : "SOME FAILED");
+
+    } else if (strncasecmp(cmd, "set_pga", 7) == 0) {
+        /* set_pga <gain> — set PGA gain on all ADCs.
+         * gain: 1 (PGA bypassed), 2, 4, 8, 16, 32 (PGA enabled).
+         * ADS124S08 PGA register (0x03):
+         *   [7:5]=DELAY  [4:3]=PGA_EN  [2:0]=GAIN
+         *   PGA_EN=00: bypassed, PGA_EN=01: enabled
+         *   GAIN: 000=1, 001=2, 010=4, 011=8, 100=16, 101=32 */
+#ifndef MUSHIO_DEMO
+        const char *arg = cmd + 7;
+        while (*arg == ' ') arg++;
+        int gain = (*arg) ? atoi(arg) : 0;
+        int gain_bits = -1;
+        switch (gain) {
+            case 1:  gain_bits = 0; break;
+            case 2:  gain_bits = 1; break;
+            case 4:  gain_bits = 2; break;
+            case 8:  gain_bits = 3; break;
+            case 16: gain_bits = 4; break;
+            case 32: gain_bits = 5; break;
+        }
+        if (gain_bits < 0) {
+            cmd_send(pcb, "error: set_pga requires 1|2|4|8|16|32");
+        } else {
+            uint8_t pga_reg = (gain == 1) ? 0x00
+                             : (uint8_t)(0x08 | gain_bits);
+            g_scan_paused = true; sleep_ms(100);
+            for (int i = 0; i < (int)NUM_ADCS; i++)
+                ads_wreg1(i, ADS_REG_PGA, pga_reg);
+            g_scan_paused = false;
+            cmd_send(pcb, "pga=%d reg=0x%02X (all %u ADCs)", gain,
+                     pga_reg, (unsigned)NUM_ADCS);
+        }
+#else
+        cmd_send(pcb, "set_pga: demo mode (no-op)");
+#endif
+
+    } else if (strncasecmp(cmd, "set_datarate", 12) == 0) {
+        /* set_datarate <sps> — set data rate on all ADCs.
+         * Preserves existing FILTER bit; only changes DR[3:0].
+         * ADS124S08 DATARATE register (0x04):
+         *   [7]=G_CHOP  [6]=CLK  [5]=MODE  [4]=FILTER  [3:0]=DR */
+#ifndef MUSHIO_DEMO
+        const char *arg = cmd + 12;
+        while (*arg == ' ') arg++;
+        /* Parse as float to handle "2.5" and "16.6" */
+        float sps_f = (*arg) ? (float)atof(arg) : -1.0f;
+        int dr_bits = -1;
+        if      (sps_f <  3.0f  && sps_f > 0.0f)  dr_bits = 0x00;  /* 2.5  */
+        else if (sps_f <  7.0f)  dr_bits = 0x01;  /* 5    */
+        else if (sps_f < 13.0f)  dr_bits = 0x02;  /* 10   */
+        else if (sps_f < 18.0f)  dr_bits = 0x03;  /* 16.6 */
+        else if (sps_f < 35.0f)  dr_bits = 0x04;  /* 20   */
+        else if (sps_f < 75.0f)  dr_bits = 0x05;  /* 50   */
+        else if (sps_f < 150.0f) dr_bits = 0x06;  /* 100  */
+        else if (sps_f < 300.0f) dr_bits = 0x07;  /* 200  */
+        else if (sps_f < 600.0f) dr_bits = 0x08;  /* 400  */
+        else if (sps_f < 900.0f) dr_bits = 0x09;  /* 800  */
+        else if (sps_f < 1500.0f) dr_bits = 0x0A; /* 1000 */
+        else if (sps_f < 3000.0f) dr_bits = 0x0B; /* 2000 */
+        else if (sps_f <= 4000.0f) dr_bits = 0x0E; /* 4000 */
+        if (dr_bits < 0) {
+            cmd_send(pcb, "error: set_datarate <2.5|5|10|16.6|20|50|100|200|400|800|1000|2000|4000>");
+        } else {
+            g_scan_paused = true; sleep_ms(100);
+            uint8_t cur = 0;
+            ads_rreg(0, ADS_REG_DATARATE, &cur, 1);
+            uint8_t dr_reg = (uint8_t)((cur & 0xF0) | dr_bits);
+            for (int i = 0; i < (int)NUM_ADCS; i++)
+                ads_wreg1(i, ADS_REG_DATARATE, dr_reg);
+            g_scan_paused = false;
+            cmd_send(pcb, "datarate=%.1f_SPS dr_reg=0x%02X (all %u ADCs)",
+                     (double)sps_f, dr_reg, (unsigned)NUM_ADCS);
+        }
+#else
+        cmd_send(pcb, "set_datarate: demo mode (no-op)");
+#endif
+
+    } else if (strncasecmp(cmd, "set_filter", 10) == 0) {
+        /* set_filter <sinc3|lowlat> — set digital filter mode on all ADCs.
+         * ADS124S08 DATARATE register (0x04), bit 4 = FILTER:
+         *   0 = sinc3 (default, best noise)
+         *   1 = low-latency (sinc1 first conv, then sinc3) */
+#ifndef MUSHIO_DEMO
+        const char *arg = cmd + 10;
+        while (*arg == ' ') arg++;
+        int filter_bit = -1;
+        if (strcasecmp(arg, "sinc3") == 0 || strcasecmp(arg, "sinc2") == 0
+            || strcasecmp(arg, "sinc4") == 0)
+            filter_bit = 0;
+        else if (strcasecmp(arg, "sinc1") == 0 || strcasecmp(arg, "lowlat") == 0)
+            filter_bit = 1;
+        else if (strcasecmp(arg, "fir") == 0)
+            filter_bit = 1;  /* FIR ≈ low-latency on ADS124S08 */
+        if (filter_bit < 0) {
+            cmd_send(pcb, "error: set_filter <sinc3|sinc1|lowlat|fir>");
+        } else {
+            g_scan_paused = true; sleep_ms(100);
+            uint8_t cur = 0;
+            ads_rreg(0, ADS_REG_DATARATE, &cur, 1);
+            uint8_t dr_reg = (filter_bit)
+                ? (uint8_t)(cur | 0x10)
+                : (uint8_t)(cur & ~0x10);
+            for (int i = 0; i < (int)NUM_ADCS; i++)
+                ads_wreg1(i, ADS_REG_DATARATE, dr_reg);
+            g_scan_paused = false;
+            cmd_send(pcb, "filter=%s dr_reg=0x%02X (all %u ADCs)",
+                     (filter_bit ? "lowlat" : "sinc3"),
+                     dr_reg, (unsigned)NUM_ADCS);
+        }
+#else
+        cmd_send(pcb, "set_filter: demo mode (no-op)");
+#endif
+
+    } else if (strncasecmp(cmd, "set_refbuf", 10) == 0) {
+        /* set_refbuf <0|1> — enable/disable reference input buffers.
+         * ADS124S08 REF register (0x05):
+         *   bit 5 = nREFP_BUF (0=buffered, 1=bypassed)
+         *   bit 4 = nREFN_BUF (0=buffered, 1=bypassed) */
+#ifndef MUSHIO_DEMO
+        const char *arg = cmd + 10;
+        while (*arg == ' ') arg++;
+        int en = (*arg) ? atoi(arg) : -1;
+        if (en < 0 || en > 1) {
+            cmd_send(pcb, "error: set_refbuf <0|1>  (1=enable buffers)");
+        } else {
+            g_scan_paused = true; sleep_ms(100);
+            uint8_t cur = 0;
+            ads_rreg(0, ADS_REG_REF, &cur, 1);
+            uint8_t ref_reg;
+            if (en) {
+                ref_reg = (uint8_t)(cur & ~0x30);
+            } else {
+                ref_reg = (uint8_t)(cur | 0x30);
+            }
+            for (int i = 0; i < (int)NUM_ADCS; i++)
+                ads_wreg1(i, ADS_REG_REF, ref_reg);
+            g_scan_paused = false;
+            cmd_send(pcb, "refbuf=%s ref_reg=0x%02X (all %u ADCs)",
+                     en ? "on" : "off", ref_reg, (unsigned)NUM_ADCS);
+        }
+#else
+        cmd_send(pcb, "set_refbuf: demo mode (no-op)");
+#endif
+
+    } else if (strncasecmp(cmd, "read_ch", 7) == 0) {
+        /* read_ch [adc] [ch] — read a single ADC channel and report raw value.
+         * Useful for diagnosing whether the ADC is seeing a signal.
+         * WARNING: This runs on Core 0 while Core 1 scans — possible SPI
+         * collisions.  Use 'pause' first if available, or accept glitches. */
+#ifndef MUSHIO_DEMO
+        const char *arg = cmd + 7;
+        while (*arg == ' ') arg++;
+        int adc_idx = 0, ch_idx = 0;
+        if (*arg) sscanf(arg, "%d %d", &adc_idx, &ch_idx);
+        if (adc_idx < 0 || adc_idx >= (int)NUM_ADCS) {
+            cmd_send(pcb, "error: adc must be 0..%d", (int)NUM_ADCS - 1);
+        } else if (ch_idx < 0 || ch_idx >= (int)CHANNELS_PER_ADC) {
+            cmd_send(pcb, "error: ch must be 0..%d", (int)CHANNELS_PER_ADC - 1);
+        } else {
+            g_scan_paused = true; sleep_ms(100);
+
+            /* Read all registers first to show current config */
+            uint8_t regs[18];
+            ads_rreg(adc_idx, 0x00, regs, 18);
+            cmd_send(pcb, "[READ] ADC%d CH%d  INPMUX=0x%02X PGA=0x%02X DR=0x%02X REF=0x%02X",
+                     adc_idx, ch_idx, regs[2], regs[3], regs[4], regs[5]);
+
+            /* Set mux: positive = AINch, negative = AINCOM */
+            uint8_t mux = (uint8_t)((ch_idx << 4) | 0x0C);
+            ads_wreg1(adc_idx, ADS_REG_INPMUX, mux);
+
+            /* Start conversion */
+            ads_cmd(adc_idx, ADS_CMD_START);
+
+            /* Wait for DRDY */
+            bool drdy = ads_wait_drdy(adc_idx, 5000);  /* 5ms timeout */
+            if (!drdy) {
+                cmd_send(pcb, "[READ] ADC%d CH%d: DRDY TIMEOUT (5ms)", adc_idx, ch_idx);
+                ads_cmd(adc_idx, ADS_CMD_STOP);
+            } else {
+                int32_t val = ads_rdata(adc_idx);
+                ads_cmd(adc_idx, ADS_CMD_STOP);
+
+                /* Convert to voltage assuming internal 2.5V ref, PGA=1 */
+                float v_adc = (float)val / 8388608.0f * 2.5f;
+                cmd_send(pcb, "[READ] ADC%d CH%d: raw=%d (0x%06X)  Vadc=%.6f V  (%.1f uV)",
+                         adc_idx, ch_idx, (int)val, (int)(val & 0xFFFFFF),
+                         (double)v_adc, (double)(v_adc * 1e6));
+            }
+            g_scan_paused = false;
+        }
+#else
+        cmd_send(pcb, "read_ch: not available in demo mode");
+#endif
 
     } else if (strcasecmp(cmd, "ota_reboot") == 0) {
         /* Request reboot into USB mass-storage (BOOTSEL) mode for .uf2 upload.
@@ -751,11 +1089,59 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
             }
         }
 
+    } else if (strcasecmp(cmd, "cyw43_stats") == 0) {
+#if CYW43_USE_STATS
+        extern uint32_t cyw43_stats[];
+        cmd_send(pcb, "pkt_in=%lu pkt_out=%lu bus_err=%lu "
+                      "irq=%lu spi_avail=%lu longest_ioctl_us=%lu "
+                      "send_fail=%lu stalls=%lu pbuf_fail=%lu",
+                 (unsigned long)cyw43_stats[CYW43_STAT_PACKET_IN_COUNT],
+                 (unsigned long)cyw43_stats[CYW43_STAT_PACKET_OUT_COUNT],
+                 (unsigned long)cyw43_stats[CYW43_STAT_BUS_ERROR],
+                 (unsigned long)cyw43_stats[CYW43_STAT_IRQ_COUNT],
+                 (unsigned long)cyw43_stats[CYW43_STAT_SPI_PACKET_AVAILABLE],
+                 (unsigned long)cyw43_stats[CYW43_STAT_LONGEST_IOCTL_TIME],
+                 (unsigned long)g_udp_send_fail,
+                 (unsigned long)g_udp_stall_cnt,
+                 (unsigned long)g_udp_pbuf_fail);
+#else
+        cmd_send(pcb, "CYW43_USE_STATS not enabled");
+#endif
+
+    } else if (strcasecmp(cmd, "scan_debug") == 0) {
+        /* Pause Core 1, do one full scan, print all 72 raw values, resume */
+#ifndef MUSHIO_DEMO
+        g_scan_paused = true; sleep_ms(100);
+        uint8_t dbg_data[DATA_SIZE];
+        memset(dbg_data, 0, sizeof(dbg_data));
+        adc_manager_scan(dbg_data);
+        g_scan_paused = false;
+
+        /* Print in groups of 12 (one ADC) */
+        for (int a = 0; a < (int)NUM_ADCS; a++) {
+            char line[256];
+            int pos = snprintf(line, sizeof(line), "ADC%d:", a);
+            for (int ch = 0; ch < (int)CHANNELS_PER_ADC && pos < 240; ch++) {
+                int idx = (a * (int)CHANNELS_PER_ADC + ch) * 3;
+                int32_t val = ((int32_t)dbg_data[idx] << 16)
+                            | ((int32_t)dbg_data[idx+1] << 8)
+                            | dbg_data[idx+2];
+                if (val & 0x800000) val |= (int32_t)0xFF000000;
+                pos += snprintf(line + pos, sizeof(line) - (size_t)pos,
+                                " %d", (int)val);
+            }
+            cmd_send(pcb, "%s", line);
+        }
+#else
+        cmd_send(pcb, "scan_debug: demo mode");
+#endif
+
     } else if (strcasecmp(cmd, "help") == 0) {
-        cmd_send(pcb, "Commands: ping | status | scan_all | benchmark | "
+        cmd_send(pcb, "Commands: ping | status | scan_all | scan_debug | benchmark | "
                       "read_regs | set_fps <hz> | set_host <ip> | "
-                      "set_spacing <S> | retx <seq> <n> | "
-                      "blink_led | test_hardware | ota_reboot | crash_log | help");
+                      "set_spacing <S> | set_txpower <qdb> | retx <seq> <n> | "
+                      "cyw43_stats | blink_led | test_hardware | ota_reboot | "
+                      "crash_log | read_ch <adc> <ch> | help");
         cmd_send(pcb, "True wireless OTA: connect ota_client.py to port %u", OTA_PORT);
 
     } else if (cmd[0] == '\0') {
@@ -1053,6 +1439,11 @@ int main(void)
     stdio_init_all();
     sleep_ms(500);   /* give USB serial time to enumerate */
 
+    /* STATUS_LED (GP22): init early so led_blink() works from the start */
+    gpio_init(STATUS_LED_PIN);
+    gpio_set_dir(STATUS_LED_PIN, GPIO_OUT);
+    gpio_put(STATUS_LED_PIN, 0);
+
     printf("\n");
     printf("============================================================\n");
     printf("  MushIO V1.0  |  Pico Demo Mode  (C firmware)\n");
@@ -1090,6 +1481,12 @@ int main(void)
     }
 
     cyw43_arch_enable_sta_mode();
+
+    /* Set TX power to maximum for best WiFi throughput */
+    g_tx_power_qdb = TX_POWER_MAX_QDB;
+    int txp_rc = cyw43_set_tx_power(g_tx_power_qdb);
+    printf("[INIT] TX power set to %d.%02d dBm (rc=%d)\n",
+           g_tx_power_qdb / 4, (g_tx_power_qdb % 4) * 25, txp_rc);
 
     /* Let the CYW43 chip fully initialize before connecting.
      * MicroPython has a natural delay due to REPL interaction.

@@ -18,32 +18,48 @@ echo.
 :: ─────────────────────────────────────────────────────────────
 ::  1.  Locate Python
 :: ─────────────────────────────────────────────────────────────
+set "PYTHON=python"
 where python >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERROR] Python not found.
-    echo         Install Python 3.8+ from https://www.python.org/downloads/
-    echo         Make sure to tick "Add Python to PATH" during install.
-    echo.
-    pause
-    exit /b 1
+    :: Try the "py" launcher (installed by default with Python on Windows)
+    where py >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PYTHON=py"
+    ) else (
+        :: Last resort: check the common install location directly
+        if exist "%LOCALAPPDATA%\Programs\Python\Python314\python.exe" (
+            set "PYTHON=%LOCALAPPDATA%\Programs\Python\Python314\python.exe"
+        ) else if exist "%LOCALAPPDATA%\Programs\Python\Python313\python.exe" (
+            set "PYTHON=%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
+        ) else if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
+            set "PYTHON=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+        ) else (
+            echo [ERROR] Python not found.
+            echo         Install Python 3.8+ from https://www.python.org/downloads/
+            echo         Make sure to tick "Add Python to PATH" during install.
+            echo.
+            pause
+            exit /b 1
+        )
+    )
 )
-for /f "tokens=*" %%v in ('python --version 2^>^&1') do set PYVER=%%v
+for /f "tokens=*" %%v in ('!PYTHON! --version 2^>^&1') do set PYVER=%%v
 echo [OK]    %PYVER%
 
 :: ─────────────────────────────────────────────────────────────
 ::  2.  Ensure pip is available
 :: ─────────────────────────────────────────────────────────────
-python -m pip --version >nul 2>&1
+!PYTHON! -m pip --version >nul 2>&1
 if %errorlevel% neq 0 (
     echo [INFO]  pip not found ^— bootstrapping with ensurepip...
-    python -m ensurepip --upgrade --quiet
+    !PYTHON! -m ensurepip --upgrade --quiet
 )
 
 :: ─────────────────────────────────────────────────────────────
 ::  3.  Install required packages (silent if already present)
 :: ─────────────────────────────────────────────────────────────
 echo [INFO]  Checking required packages ^(matplotlib, numpy^)...
-python -m pip install --quiet --exists-action i matplotlib numpy
+!PYTHON! -m pip install --quiet --exists-action i matplotlib numpy
 if %errorlevel% neq 0 (
     echo [WARN]  Could not install core packages. GUI may not start.
 ) else (
@@ -53,13 +69,13 @@ if %errorlevel% neq 0 (
 :: ─────────────────────────────────────────────────────────────
 ::  4.  Optional packages — offer to install if absent
 :: ─────────────────────────────────────────────────────────────
-python -c "import scipy" >nul 2>&1
+!PYTHON! -c "import scipy" >nul 2>&1
 if %errorlevel% neq 0 (
     echo.
     echo [OPT]   scipy is not installed ^(enables the bandpass ^/ notch filter^).
     set /p _INST_SCIPY="         Install scipy now? [Y/N]: "
     if /i "!_INST_SCIPY!"=="Y" (
-        python -m pip install --quiet scipy
+        !PYTHON! -m pip install --quiet scipy
         if !errorlevel! equ 0 (
             echo [OK]    scipy installed.
         ) else (
@@ -68,13 +84,13 @@ if %errorlevel% neq 0 (
     )
 )
 
-python -c "import cv2" >nul 2>&1
+!PYTHON! -c "import cv2" >nul 2>&1
 if %errorlevel% neq 0 (
     echo.
     echo [OPT]   opencv-python is not installed ^(enables the webcam overlay^).
     set /p _INST_CV="         Install opencv-python now? [Y/N]: "
     if /i "!_INST_CV!"=="Y" (
-        python -m pip install --quiet opencv-python
+        !PYTHON! -m pip install --quiet opencv-python
         if !errorlevel! equ 0 (
             echo [OK]    opencv-python installed.
         ) else (
@@ -92,7 +108,7 @@ set "_OUTDATED=%TEMP%\mushio_outdated.txt"
 
 :: Write empty file first so FOR loop won't fail if Python times out
 echo.>"%_OUTDATED%"
-python -c "import subprocess,sys,os; pkgs={'matplotlib','numpy','scipy','opencv-python'}; r=subprocess.run([sys.executable,'-m','pip','list','--outdated','--format=columns'],capture_output=True,text=True,timeout=10); lines=[l for l in r.stdout.splitlines()[2:] if l.split() and l.split()[0].lower() in pkgs]; open(os.environ['_OUTDATED'],'w').write('\n'.join(lines))" 2>nul
+!PYTHON! -c "import subprocess,sys,os; pkgs={'matplotlib','numpy','scipy','opencv-python'}; r=subprocess.run([sys.executable,'-m','pip','list','--outdated','--format=columns'],capture_output=True,text=True,timeout=10); lines=[l for l in r.stdout.splitlines()[2:] if l.split() and l.split()[0].lower() in pkgs]; open(os.environ['_OUTDATED'],'w').write('\n'.join(lines))" 2>nul
 if %errorlevel% neq 0 (
     echo [OK]    Skipped ^(network slow or unavailable^).
     goto :skip_updates
@@ -115,7 +131,7 @@ if defined _HAS_UPDATES (
         echo.
         for /f "usebackq tokens=1" %%p in ("%_OUTDATED%") do (
             echo [INFO]    Upgrading %%p ...
-            python -m pip install --upgrade --quiet %%p
+            !PYTHON! -m pip install --upgrade --quiet %%p
             if !errorlevel! equ 0 (
                 echo [OK]      %%p updated.
             ) else (
@@ -139,7 +155,7 @@ del "%_OUTDATED%" >nul 2>&1
 echo.
 echo [INFO]  Launching MushIO V1.0 GUI...
 echo.
-python host\gui.py %*
+!PYTHON! host\gui.py %*
 
 :: Keep the window open on crash so the user can read the error
 if %errorlevel% neq 0 (

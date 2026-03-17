@@ -1725,7 +1725,7 @@ class MushIOGUI:
 
         # ---- display state -------------------------------------------------
         self._display_secs   = tk.DoubleVar(value=DISPLAY_SECS)
-        self._uv_scale       = tk.DoubleVar(value=500.0)
+        self._uv_scale       = tk.DoubleVar(value=227000.0)  # ±227 mV = max range at PGA=1, AFE=11
         self._auto_scale     = tk.BooleanVar(value=True)
         self._display_detail = tk.StringVar(value='Med (120)')
         self._fft_mode       = tk.BooleanVar(value=False)
@@ -2291,12 +2291,21 @@ class MushIOGUI:
         _tw_entry.bind('<FocusOut>',    self._apply_custom_time_window)
         self._tw_combo.bind('<<ComboboxSelected>>', self._on_tw_combo_select)
 
-        # ---- Y-scale ---------------------------------------------------
-        tk.Label(frame, text="Y-scale (uV):", bg=BG_DARK,
+        # ---- Y range ---------------------------------------------------
+        tk.Label(frame, text="Y range (\u00b1):", bg=BG_DARK,
                  fg=FG_DIM).grid(row=2, column=0, sticky=tk.W)
-        cb2 = ttk.Combobox(frame, textvariable=self._uv_scale, width=6,
-                            values=[50, 100, 200, 500, 1000, 2000, 5000], state='readonly')
+        # Values in µV: from full-scale (±227 mV) down to ±50 µV
+        _range_vals = [227000, 100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50]
+        cb2 = ttk.Combobox(frame, textvariable=self._uv_scale, width=8,
+                            values=_range_vals, state='readonly')
         cb2.grid(row=2, column=1, sticky=tk.W, padx=4)
+        self._range_combo = cb2
+        # Show human-readable range next to combobox
+        self._range_label = tk.Label(frame, bg=BG_DARK, fg=FG_DIMMER,
+                                      font=('Helvetica', 7))
+        self._range_label.grid(row=2, column=2, sticky=tk.W)
+        self._uv_scale.trace_add('write', self._update_range_label)
+        self._update_range_label()
 
         ttk.Checkbutton(frame, text="Auto-scale Y",
                          variable=self._auto_scale).grid(
@@ -2343,6 +2352,10 @@ class MushIOGUI:
                 self._display_secs.set(v)
         except ValueError:
             pass
+
+    def _update_range_label(self, *_):
+        uv = self._uv_scale.get()
+        self._range_label.config(text=f"\u00b1{self._fmt_uv(uv)}")
 
     def _update_gain_label(self, *_):
         total = self._pga_gain.get() * GAIN
@@ -3019,14 +3032,12 @@ class MushIOGUI:
                            activebackground=BG_MID, activeforeground=ACCENT,
                            command=self._rebuild_overlay_axes).pack(side=tk.LEFT)
 
-        # Y-axis scale controls (inline — no need to use the left panel)
+        # Y-axis range controls (inline — no need to use the left panel)
         tk.Label(tb, text="  Y \u00b1", bg=BG_MID, fg=FG_DIM,
                  font=('Helvetica', 8)).pack(side=tk.LEFT, padx=(14, 2))
-        ttk.Combobox(tb, textvariable=self._uv_scale, width=6,
-                     values=[10, 50, 100, 200, 500, 1000, 2000, 5000],
+        ttk.Combobox(tb, textvariable=self._uv_scale, width=8,
+                     values=[227000, 100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50],
                      state='readonly').pack(side=tk.LEFT)
-        tk.Label(tb, text="uV", bg=BG_MID, fg=FG_DIMMER,
-                 font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(2, 0))
         ttk.Checkbutton(tb, text="Auto", variable=self._auto_scale
                         ).pack(side=tk.LEFT, padx=(8, 2))
 
@@ -3089,11 +3100,9 @@ class MushIOGUI:
 
         tk.Label(tb, text="  Y \u00b1", bg=BG_MID, fg=FG_DIM,
                  font=('Helvetica', 8)).pack(side=tk.LEFT, padx=(14, 2))
-        ttk.Combobox(tb, textvariable=self._uv_scale, width=6,
-                     values=[10, 50, 100, 200, 500, 1000, 2000, 5000],
+        ttk.Combobox(tb, textvariable=self._uv_scale, width=8,
+                     values=[227000, 100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50],
                      state='readonly').pack(side=tk.LEFT)
-        tk.Label(tb, text="uV", bg=BG_MID, fg=FG_DIMMER,
-                 font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(2, 0))
         ttk.Checkbutton(tb, text="Auto", variable=self._auto_scale
                         ).pack(side=tk.LEFT, padx=(8, 2))
 

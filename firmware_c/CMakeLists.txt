@@ -53,6 +53,7 @@ add_executable(mushio_c
     crc16.c
     frame.c
     demo_adc.c
+    adc_manager.c
     ota_server.c
 )
 
@@ -86,6 +87,7 @@ target_link_libraries(mushio_c
     hardware_timer                           # get_absolute_time, busy_wait_us
     hardware_watchdog                        # watchdog_enable, watchdog_update, scratch regs
     hardware_flash                           # flash_range_erase, flash_range_program (OTA)
+    hardware_spi                             # SPI buses for ADS124S08 ADCs
     pico_cyw43_arch_lwip_threadsafe_background  # WiFi + lwIP (alarm-IRQ model)
 )
 
@@ -118,6 +120,14 @@ target_compile_options(mushio_c PRIVATE
 # -g0 above prevents debug sections in .o files; -g0 -s here keeps the
 # linker command clean and strips any residual symbols from the ELF.
 target_link_options(mushio_c PRIVATE -g0 -s)
+
+# ---------------------------------------------------------------------------
+# CYW43 WiFi throughput tuning
+# ---------------------------------------------------------------------------
+
+# CYW43 throughput: AMPDU tuning is patched directly in cyw43_ll.c.
+# Credit-aware pacing is in do_udp_stream_work() (main.c).
+# CYW43_USE_STATS and gSPI clock change disabled — caused boot failures.
 
 # ---------------------------------------------------------------------------
 # Print memory usage after linking

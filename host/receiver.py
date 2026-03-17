@@ -35,7 +35,10 @@ CRC_SIZE = 2
 FRAME_SIZE = HEADER_SIZE + DATA_SIZE + CRC_SIZE  # 228 bytes
 
 # Reference voltage for ADC count -> voltage conversion
-VREF = 5.08   # AVDD_2V5 - AVSS_N2V5 = 2.52 - (-2.56) = 5.08V
+# ADS124S08 internal reference = 2.5 V.  Full-scale input = ±VREF/PGA.
+# AFE_GAIN is the analog front-end gain before the ADC.  The GUI divides
+# by total_gain (AFE_GAIN × PGA) to display input-referred voltage.
+VREF = 2.5
 AFE_GAIN = 11.0
 ADC_FULL_SCALE = 2**23  # 24-bit signed, positive full scale
 

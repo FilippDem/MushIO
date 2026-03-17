@@ -65,6 +65,10 @@ int32_t ads_rdata(int adc);
 /* Wait for DRDY to go low, with timeout in µs. Returns true if asserted. */
 bool ads_wait_drdy(int adc, uint32_t timeout_us);
 
+/* Scan timing diagnostic — measures per-channel cmd/drdy/read times.
+ * Writes results into 'out' buffer (up to out_size chars). */
+void adc_manager_scan_timing(char *out, int out_size);
+
 /* Bit-bang SPI test on ADC3 — bypasses PIO to verify MISO is physically driven.
  * Writes diagnostic results into 'out' buffer (up to out_size chars).
  * Returns number of chars written. */

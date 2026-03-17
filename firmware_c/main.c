@@ -1282,6 +1282,25 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         cmd_send(pcb, "CYW43_USE_STATS not enabled");
 #endif
 
+    } else if (strcasecmp(cmd, "scan_timing") == 0) {
+        /* scan_timing — measure per-channel cmd/drdy/read times */
+#ifndef MUSHIO_DEMO
+        g_scan_paused = true; sleep_ms(100);
+        char tbuf[2048];
+        adc_manager_scan_timing(tbuf, sizeof(tbuf));
+        g_scan_paused = false;
+        /* Send line by line */
+        char *line = tbuf;
+        while (*line) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            if (*line) cmd_send(pcb, "%s", line);
+            if (nl) line = nl + 1; else break;
+        }
+#else
+        cmd_send(pcb, "scan_timing: demo mode");
+#endif
+
     } else if (strcasecmp(cmd, "scan_debug") == 0) {
         /* Pause Core 1, do one full scan, print all 72 raw values, resume */
 #ifndef MUSHIO_DEMO
@@ -1311,8 +1330,8 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
 #endif
 
     } else if (strcasecmp(cmd, "help") == 0) {
-        cmd_send(pcb, "Commands: ping | status | scan_all | scan_debug | benchmark | "
-                      "read_regs | set_fps <hz> | set_host <ip> | "
+        cmd_send(pcb, "Commands: ping | status | scan_all | scan_debug | scan_timing | "
+                      "benchmark | read_regs | set_fps <hz> | set_host <ip> | "
                       "set_spacing <S> | set_txpower <qdb> | retx <seq> <n> | "
                       "cyw43_stats | blink_led | test_hardware | ota_reboot | "
                       "crash_log | read_ch <adc> <ch> | probe_adc <n> | "

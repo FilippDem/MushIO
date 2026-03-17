@@ -6135,7 +6135,8 @@ class MushIOGUI:
             ax.axvline(bt, color='#f38ba8', linewidth=0.8, alpha=0.7, linestyle='--')
         ax.tick_params(colors=FG_DIM, labelsize=7)
         ax.set_xlabel('Time (s)', color=FG_DIM, fontsize=8)
-        ax.set_ylabel('µV', color=FG_DIM, fontsize=8)
+        _u = self._apply_uv_axis_fmt(ax)
+        ax.set_ylabel(_u, color=FG_DIM, fontsize=8)
         ax.set_title(name, color=col, fontsize=10)
         ax.grid(True, color=BG_LIGHT, linewidth=0.3, alpha=0.5)
         fig.subplots_adjust(left=0.07, right=0.99, top=0.93, bottom=0.12)
@@ -6716,8 +6717,8 @@ class MushIOGUI:
                 ax.set_xlim(0, self._fft_xlim(fps_stable))
                 ax.set_ylim(0, max(float(mag.max()) * 1.2, 1.0))
                 ax.set_xlabel('Hz', color=FG_DIM, fontsize=9)
-                ax.set_ylabel(self._smart_uv_label(ax.get_ylim()),
-                              color=FG_DIM, fontsize=9)
+                _u = self._apply_uv_axis_fmt(ax)
+                ax.set_ylabel(_u, color=FG_DIM, fontsize=9)
             else:
                 n_raw  = len(raw)
                 arr    = display_decimate(arr)
@@ -6732,8 +6733,8 @@ class MushIOGUI:
                 else:
                     ax.set_ylim(-uv_half, uv_half)
                 ax.set_xlabel('s', color=FG_DIM, fontsize=9)
-                ax.set_ylabel(self._smart_uv_label(ax.get_ylim()),
-                              color=FG_DIM, fontsize=9)
+                _u = self._apply_uv_axis_fmt(ax)
+                ax.set_ylabel(_u, color=FG_DIM, fontsize=9)
 
         z['canvas'].draw_idle()
         self.root.after(100, self._update_zoom)   # 10 FPS
@@ -6830,9 +6831,27 @@ class MushIOGUI:
 
     @staticmethod
     def _smart_uv_label(ylim=None):
-        """Always return 'µV' — data values are in µV on every axis.
-        Accepts (and ignores) *ylim* so existing call-sites need no change."""
+        """Return 'mV' when the axis range is >= 1000 µV, else 'µV'."""
+        if ylim is not None:
+            lo, hi = ylim
+            if max(abs(lo), abs(hi)) >= 1000:
+                return 'mV'
         return 'µV'
+
+    @staticmethod
+    def _apply_uv_axis_fmt(ax, ylim=None):
+        """Set y-axis tick formatter to show mV (÷1000) when range >= 1000 µV.
+        Returns the unit string ('mV' or 'µV') used."""
+        if ylim is None:
+            ylim = ax.get_ylim()
+        lo, hi = ylim
+        if max(abs(lo), abs(hi)) >= 1000:
+            ax.yaxis.set_major_formatter(
+                mticker.FuncFormatter(lambda v, _: f'{v / 1000:g}'))
+            return 'mV'
+        else:
+            ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
+            return 'µV'
 
     # ---- grid ------------------------------------------------------------
 
@@ -7151,13 +7170,14 @@ class MushIOGUI:
             # Axis labels / limits — set once per panel, not per channel.
             if fft_mode:
                 ax.set_xlabel('Frequency (Hz)', fontsize=7, color=FG_DIM)
-                ax.set_ylabel(f'Amplitude ({self._smart_uv_label(ax.get_ylim())})',
+                _u = self._apply_uv_axis_fmt(ax)
+                ax.set_ylabel(f'Amplitude ({_u})',
                               fontsize=7, color=FG_DIM)
                 ax.set_xlim(0, self._fft_xlim(fps_stable))
             else:
                 ax.set_xlabel('Time (s)', fontsize=7, color=FG_DIM)
-                _lbl = self._smart_uv_label(ax.get_ylim())
-                ax.set_ylabel(f'{_lbl} (AC)' if auto_sc else _lbl,
+                _u = self._apply_uv_axis_fmt(ax)
+                ax.set_ylabel(f'{_u} (AC)' if auto_sc else _u,
                               fontsize=7, color=FG_DIM)
                 ax.set_xlim(-win_secs, 0)
 
@@ -7344,7 +7364,8 @@ class MushIOGUI:
             else:
                 ax.set_ylim(0, max(ch_fft_max * 1.2, 1.0))
             ax.set_xlabel('Frequency (Hz)', fontsize=8, color=FG_DIM)
-            ax.set_ylabel(f'Amplitude ({self._smart_uv_label(ax.get_ylim())})',
+            _u = self._apply_uv_axis_fmt(ax)
+            ax.set_ylabel(f'Amplitude ({_u})',
                           fontsize=8, color=FG_DIM)
             _leg = ax.legend(loc='upper right', fontsize=6, ncol=2,
                       facecolor=BG_LIGHT, edgecolor=BG_LIGHT,
@@ -7352,7 +7373,8 @@ class MushIOGUI:
             self._wf_prev_artists.append(_leg)
         else:
             ax.set_xlabel('Time (s)', fontsize=8, color=FG_DIM)
-            ax.set_ylabel(f'{self._smart_uv_label(ax.get_ylim())} (AC)',
+            _u = self._apply_uv_axis_fmt(ax)
+            ax.set_ylabel(f'{_u} (AC)',
                           fontsize=8, color=FG_DIM)
             ax.set_xlim(-win_secs, 0)
 

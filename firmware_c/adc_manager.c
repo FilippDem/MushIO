@@ -80,8 +80,11 @@ uint  g_pio_off  = 0;
 
 static inline bool adc_uses_pio(int adc) { return adc >= 3; }
 
-/* SPI clock: 4 MHz — well within ADS124S08 max of ~8 MHz */
-#define ADC_SPI_BAUDRATE    4000000
+/* SPI clock: 8 MHz for both buses — ADS124S08 supports up to 10 MHz at 3.3 V.
+ * PIO timing margins: at 8 MHz SPI (125 ns/bit), 4 PIO cycles per bit gives
+ * ~31 ns per phase — comfortably above ADS124S08's tDO ≤ 25 ns. */
+#define ADC_SPI_BAUDRATE    8000000
+#define PIO_SPI_BAUDRATE    8000000
 
 /* =========================================================================
  * Low-level SPI helpers
@@ -252,7 +255,7 @@ bool adc_manager_init(void)
         } else {
             /* PIO clock divider: SPI freq = PIO_clock / 4 instructions per bit.
              * For 4 MHz SPI: PIO_clock = 16 MHz → div = 150 / 16 = 9.375 */
-            float clkdiv = (float)clock_get_hz(clk_sys) / (ADC_SPI_BAUDRATE * 4.0f);
+            float clkdiv = (float)clock_get_hz(clk_sys) / (PIO_SPI_BAUDRATE * 4.0f);
             pio_spi_cpha1_program_init(g_pio, g_pio_sm, g_pio_off,
                                         SPI1_MOSI, SPI1_MISO, SPI1_SCK,
                                         clkdiv);
@@ -318,63 +321,202 @@ bool adc_manager_init(void)
          * INPMUX:   will be set per-channel during scan
          */
         ads_wreg1(i, ADS_REG_PGA,      0x00);  /* gain=1, PGA off */
-        ads_wreg1(i, ADS_REG_DATARATE,  0x0D);  /* 4000 SPS, sinc3 */
+        ads_wreg1(i, ADS_REG_DATARATE,  0x1D);  /* 4000 SPS, continuous, LL filter
+                                                  * 0x1D = G_CHOP=0, CLK=int,
+                                                  * MODE=0 (continuous),
+                                                  * FILTER=1 (low-latency),
+                                                  * DR=1101 (4000 SPS)
+                                                  * In continuous mode, WREG INPMUX
+                                                  * resets the digital filter.  The
+                                                  * LL sinc1 settles in 1/4000 s =
+                                                  * 250 µs, and the modulator stays
+                                                  * warm (no startup delay). */
         ads_wreg1(i, ADS_REG_REF,       0x3A);  /* int ref on, REFP0/REFN0 */
         ads_wreg1(i, ADS_REG_SYS,       0x00);  /* no system monitor */
     }
+
+    /* ---- Start continuous conversion on all ADCs ---- */
+    for (int i = 0; i < (int)NUM_ADCS; i++)
+        ads_cmd(i, ADS_CMD_START);
+    sleep_ms(1);   /* allow first conversion to complete */
 
     printf("[ADC] %d of %u ADCs alive\n", alive, (unsigned)NUM_ADCS);
     return (alive > 0);
 }
 
 /* =========================================================================
- * Scan — read 12 channels from each ADC
+ * Scan — read 12 channels from all 6 ADCs in parallel
+ *
+ * For each channel we:
+ *   1. WREG  INPMUX on all 6 ADCs (3 bytes per ADC — resets digital filter)
+ *   2. Poll  all 6 DRDY pins until every one goes LOW (or timeout)
+ *   3. READ  3-byte data from all 6 ADCs (continuous-mode direct read)
+ *
+ * Continuous mode + WREG-only: the modulator stays warm (no startup delay).
+ * WREG INPMUX resets the LL filter; sinc1 settles in 1/fDATA = 250 µs.
+ * 8 MHz SPI on both buses.  Target: ~290 FPS (12 × ~286 µs/channel).
  * ========================================================================= */
+
+/* Fast data read for continuous conversion mode.
+ * In continuous mode, DRDY going low means data is ready — no RDATA command
+ * needed.  Just clock out 3 bytes of NOP to read the 24-bit conversion.
+ * Saves 1 byte (8 SPI clocks) per ADC per channel vs ads_rdata(). */
+static inline int32_t ads_rdata_cont(int adc)
+{
+    uint8_t rx[3] = { 0 };
+
+    cs_select(adc);
+    if (adc_uses_pio(adc))
+        pio_spi_read(g_pio, g_pio_sm, 0x00, rx, 3);
+    else
+        spi_read_blocking(adc_hw_spi, 0x00, rx, 3);
+    cs_deselect(adc);
+
+    /* Big-endian 24-bit signed */
+    int32_t val = ((int32_t)rx[0] << 16) | ((int32_t)rx[1] << 8) | rx[2];
+    if (val & 0x800000)
+        val |= (int32_t)0xFF000000;
+    return val;
+}
+
+/* Bitmask with all NUM_ADCS bits set */
+#define ALL_ADCS_MASK  ((1u << NUM_ADCS) - 1u)   /* 0x3F for 6 ADCs */
+
+/* Send WREG INPMUX only — no STOP, no START.
+ * In continuous mode, writing INPMUX resets the digital filter (ADS124S08
+ * datasheet: "Writing to any register resets the digital filter").
+ * The LL filter then settles in 1 conversion cycle (sinc1 = 250 µs at 4000 SPS).
+ * The modulator stays warm (already running from initial START in init),
+ * so there is no modulator startup delay (~223 µs savings vs single-shot). */
+static inline void ads_set_mux(int adc, uint8_t mux)
+{
+    uint8_t cmd[3] = {
+        (uint8_t)(ADS_CMD_WREG | ADS_REG_INPMUX),  /* WREG at 0x02 */
+        0x00,                                   /* write 1 register */
+        mux                                     /* INPMUX value */
+    };
+    cs_select(adc);
+    if (adc_uses_pio(adc))
+        pio_spi_write(g_pio, g_pio_sm, cmd, 3);
+    else
+        spi_write_blocking(adc_hw_spi, cmd, 3);
+    cs_deselect(adc);
+}
 
 int adc_manager_scan(uint8_t *out_data)
 {
-    int adc_ok = 0;
+    for (int ch = 0; ch < (int)CHANNELS_PER_ADC; ch++) {
+        uint8_t mux = (uint8_t)((ch << 4) | 0x0C);
 
-    for (int a = 0; a < (int)NUM_ADCS; a++) {
-        for (int ch = 0; ch < (int)CHANNELS_PER_ADC; ch++) {
-            /* Ensure ADC is stopped and DRDY is deasserted (HIGH) before
-             * switching the MUX.  Without this, a lingering DRDY=LOW from
-             * a previous conversion could cause ads_wait_drdy() to return
-             * immediately with stale data. */
-            ads_cmd(a, ADS_CMD_STOP);
+        /* 1. Set INPMUX on all 6 ADCs (WREG resets filter, no STOP/START).
+         *    3 bytes per ADC.  Modulator stays warm in continuous mode. */
+        for (int a = 0; a < (int)NUM_ADCS; a++)
+            ads_set_mux(a, mux);
 
-            /* Set input mux: positive = AINch, negative = AINCOM (0x0C) */
-            uint8_t mux = (uint8_t)((ch << 4) | 0x0C);
-            ads_wreg1(a, ADS_REG_INPMUX, mux);
+        /* 2. Wait for ALL DRDY pins to assert LOW.
+         *    Single-shot + LL filter at 4000 SPS: 250 µs per conversion.
+         *    Use gpio_get_all() for a single register read per iteration. */
+        uint8_t ready = 0;
+        absolute_time_t deadline = make_timeout_time_us(2000);
+        while (ready != ALL_ADCS_MASK && !time_reached(deadline)) {
+            uint32_t pins = gpio_get_all();
+            for (int a = 0; a < (int)NUM_ADCS; a++) {
+                if (!(ready & (1u << a)) &&
+                    !(pins & (1u << adc_drdy_pins[a])))
+                    ready |= (uint8_t)(1u << a);
+            }
+        }
 
-            /* Start conversion */
-            ads_cmd(a, ADS_CMD_START);
-
-            /* Wait for DRDY (conversion complete).
-             * SINC3 at 4000 SPS: settling = 3/4000 = 750 µs.
-             * Use 2 ms timeout for margin. */
-            if (!ads_wait_drdy(a, 2000)) {
-                /* Timeout — fill with zero */
-                int idx = (a * (int)CHANNELS_PER_ADC + ch) * (int)BYTES_PER_SAMPLE;
+        /* 3. Read conversion data from all ADCs. */
+        for (int a = 0; a < (int)NUM_ADCS; a++) {
+            int idx = (a * (int)CHANNELS_PER_ADC + ch) * (int)BYTES_PER_SAMPLE;
+            if (ready & (1u << a)) {
+                int32_t val = ads_rdata_cont(a);
+                out_data[idx]     = (uint8_t)((val >> 16) & 0xFF);
+                out_data[idx + 1] = (uint8_t)((val >> 8)  & 0xFF);
+                out_data[idx + 2] = (uint8_t)(val & 0xFF);
+            } else {
+                /* DRDY timeout — fill with zero */
                 out_data[idx]     = 0;
                 out_data[idx + 1] = 0;
                 out_data[idx + 2] = 0;
-                continue;
             }
-
-            /* Read conversion result */
-            int32_t val = ads_rdata(a);
-
-            /* Pack as big-endian 24-bit into output buffer */
-            int idx = (a * (int)CHANNELS_PER_ADC + ch) * (int)BYTES_PER_SAMPLE;
-            out_data[idx]     = (uint8_t)((val >> 16) & 0xFF);
-            out_data[idx + 1] = (uint8_t)((val >> 8)  & 0xFF);
-            out_data[idx + 2] = (uint8_t)(val & 0xFF);
         }
-        adc_ok++;
     }
 
-    return adc_ok;
+    return (int)NUM_ADCS;
+}
+
+/* =========================================================================
+ * Scan Timing Diagnostic
+ *
+ * Measures per-channel breakdown: command send time, DRDY wait time,
+ * data read time.  Called from CMD handler via "scan_timing" command.
+ * ========================================================================= */
+
+void adc_manager_scan_timing(char *out, int out_size)
+{
+    int pos = 0;
+    #define TM_APPEND(...) do { \
+        pos += snprintf(out + pos, (out_size - pos > 0) ? (size_t)(out_size - pos) : 0, __VA_ARGS__); \
+    } while(0)
+
+    uint8_t dummy_data[DATA_SIZE];
+    uint64_t t_total_start = time_us_64();
+    uint64_t cmd_total = 0, drdy_total = 0, read_total = 0;
+
+    for (int ch = 0; ch < (int)CHANNELS_PER_ADC; ch++) {
+        uint8_t mux = (uint8_t)((ch << 4) | 0x0C);
+
+        uint64_t t0 = time_us_64();
+        for (int a = 0; a < (int)NUM_ADCS; a++)
+            ads_set_mux(a, mux);
+        uint64_t t1 = time_us_64();
+
+        uint8_t ready = 0;
+        absolute_time_t deadline = make_timeout_time_us(2000);
+        while (ready != ALL_ADCS_MASK && !time_reached(deadline)) {
+            uint32_t pins = gpio_get_all();
+            for (int a = 0; a < (int)NUM_ADCS; a++) {
+                if (!(ready & (1u << a)) &&
+                    !(pins & (1u << adc_drdy_pins[a])))
+                    ready |= (uint8_t)(1u << a);
+            }
+        }
+        uint64_t t2 = time_us_64();
+
+        for (int a = 0; a < (int)NUM_ADCS; a++) {
+            int idx = (a * (int)CHANNELS_PER_ADC + ch) * (int)BYTES_PER_SAMPLE;
+            if (ready & (1u << a)) {
+                int32_t val = ads_rdata_cont(a);
+                dummy_data[idx]     = (uint8_t)((val >> 16) & 0xFF);
+                dummy_data[idx + 1] = (uint8_t)((val >> 8)  & 0xFF);
+                dummy_data[idx + 2] = (uint8_t)(val & 0xFF);
+            } else {
+                dummy_data[idx] = dummy_data[idx+1] = dummy_data[idx+2] = 0;
+            }
+        }
+        uint64_t t3 = time_us_64();
+
+        cmd_total  += (t1 - t0);
+        drdy_total += (t2 - t1);
+        read_total += (t3 - t2);
+
+        if (ch < 3 || ch == 11) {
+            TM_APPEND("[TIMING] ch%02d: cmd=%llu drdy=%llu read=%llu total=%llu us  ready=0x%02X\n",
+                      ch, (unsigned long long)(t1-t0), (unsigned long long)(t2-t1),
+                      (unsigned long long)(t3-t2), (unsigned long long)(t3-t0), ready);
+        }
+    }
+
+    uint64_t t_total = time_us_64() - t_total_start;
+    TM_APPEND("[TIMING] TOTALS: cmd=%llu drdy=%llu read=%llu frame=%llu us\n",
+              (unsigned long long)cmd_total, (unsigned long long)drdy_total,
+              (unsigned long long)read_total, (unsigned long long)t_total);
+    TM_APPEND("[TIMING] Effective FPS: %.1f\n", 1000000.0 / (double)t_total);
+
+    (void)dummy_data;
+    #undef TM_APPEND
 }
 
 /* =========================================================================
@@ -520,7 +662,7 @@ int bitbang_spi1_test(char *out, int out_size)
     }
 
     /* 10. Restore PIO SPI */
-    float clkdiv = (float)clock_get_hz(clk_sys) / (ADC_SPI_BAUDRATE * 4.0f);
+    float clkdiv = (float)clock_get_hz(clk_sys) / (PIO_SPI_BAUDRATE * 4.0f);
     pio_spi_cpha1_program_init(g_pio, g_pio_sm, g_pio_off,
                                 SPI1_MOSI, SPI1_MISO, SPI1_SCK, clkdiv);
     BB_APPEND("[BB] PIO SPI restored\n");

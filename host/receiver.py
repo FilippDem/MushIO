@@ -46,26 +46,35 @@ ADC_FULL_SCALE = 2**23  # 24-bit signed, positive full scale
 ADC_DATA_RATE_SPS = 4000      # DATARATE register: DR_4000 → 4000 output samples/sec
 SPI_CLOCK_HZ      = 1_000_000 # Conservative 1 MHz SPI; datasheet max is 16 MHz
 
-# Electrode channel map (matches firmware config.py)
+# Electrode channel map — empirically verified via per-electrode stimulation.
+# Each sub-list is one ADC (0–5), 12 entries for AIN0–AIN11.
+# Flat index = adc_index * 12 + ain_channel.
+#
+# Channels requiring user verification (assumptions made from test data):
+#   - ELEC70: assumed grid pos "50" (digit transposition from "05" in table)
+#   - ELEC27: assumed ADC1 AIN7 → grid "14" (was listed as "25", conflicted)
+#   - ELEC67: assumed ADC5 AIN8 → grid "67" (was listed as "76", conflicted)
+#   - ADC2 AIN8-11: ELEC42/32/33/43 order is pattern-based (no test data)
+#   - ADC3 AIN8-11: ELEC37/36/35/34 order is pattern-based (no test data)
 CHANNEL_MAP = [
-    ["ELEC02", "ELEC23", "ELEC22", "ELEC12",
-     "ELEC11", "ELEC21", "ELEC20", "ELEC01",
-     "ELEC00", "ELEC10", "ELEC03", "ELEC13"],
-    ["ELEC26", "ELEC16", "ELEC25", "ELEC15",
-     "ELEC24", "ELEC05", "ELEC04", "ELEC14",
-     "ELEC17", "ELEC07", "ELEC06", "ELEC27"],
-    ["ELEC41", "ELEC31", "ELEC30", "ELEC40",
-     "ELEC43", "ELEC33", "ELEC32", "ELEC42",
-     "STIM_1", "STIM_0", "STIM_7", "STIM_6"],
-    ["ELEC45", "ELEC35", "ELEC34", "ELEC44",
-     "ELEC47", "ELEC37", "ELEC36", "ELEC46",
-     "STIM_3", "STIM_2", "STIM_5", "STIM_4"],
-    ["ELEC71", "ELEC50", "ELEC60", "ELEC70",
-     "ELEC62", "ELEC52", "ELEC51", "ELEC61",
-     "ELEC73", "ELEC63", "ELEC53", "ELEC72"],
-    ["ELEC75", "ELEC54", "ELEC64", "ELEC74",
-     "ELEC66", "ELEC56", "ELEC55", "ELEC65",
-     "ELEC67", "ELEC77", "ELEC76", "ELEC57"],
+    ["ELEC02", "ELEC23", "ELEC12", "ELEC22",   # ADC0: AIN0-3
+     "ELEC21", "ELEC11", "ELEC20", "ELEC01",   #       AIN4-7
+     "ELEC00", "ELEC10", "ELEC03", "ELEC13"],  #       AIN8-11
+    ["ELEC16", "ELEC24", "ELEC17", "ELEC04",   # ADC1: AIN0-3
+     "ELEC05", "ELEC06", "ELEC07", "ELEC27",   #       AIN4-7
+     "ELEC15", "ELEC26", "ELEC14", "ELEC25"],  #       AIN8-11
+    ["ELEC40", "ELEC30", "ELEC31", "ELEC41",   # ADC2: AIN0-3
+     "STIM_1", "STIM_0", "STIM_7", "STIM_6",  #       AIN4-7 (STIM)
+     "ELEC42", "ELEC32", "ELEC33", "ELEC43"],  #       AIN8-11 (assumed)
+    ["ELEC47", "ELEC46", "ELEC45", "ELEC44",   # ADC3: AIN0-3
+     "STIM_5", "STIM_4", "STIM_3", "STIM_2",  #       AIN4-7 (STIM)
+     "ELEC37", "ELEC36", "ELEC35", "ELEC34"],  #       AIN8-11 (assumed)
+    ["ELEC71", "ELEC70", "ELEC61", "ELEC62",   # ADC4: AIN0-3
+     "ELEC72", "ELEC53", "ELEC63", "ELEC73",   #       AIN4-7
+     "ELEC50", "ELEC60", "ELEC52", "ELEC51"],  #       AIN8-11
+    ["ELEC75", "ELEC54", "ELEC74", "ELEC64",   # ADC5: AIN0-3
+     "ELEC66", "ELEC55", "ELEC56", "ELEC65",   #       AIN4-7
+     "ELEC67", "ELEC77", "ELEC76", "ELEC57"],  #       AIN8-11
 ]
 
 # Flat list of all 72 channel names in frame order
@@ -80,14 +89,14 @@ for adc_map in CHANNEL_MAP:
 # Flat index = adc_index * CHANNELS_PER_ADC + ain_channel
 
 STIM_CHANNEL_INDICES = [
-    2 * CHANNELS_PER_ADC + 8,   # 32: STIM_1
-    2 * CHANNELS_PER_ADC + 9,   # 33: STIM_0
-    2 * CHANNELS_PER_ADC + 10,  # 34: STIM_7
-    2 * CHANNELS_PER_ADC + 11,  # 35: STIM_6
-    3 * CHANNELS_PER_ADC + 8,   # 44: STIM_3
-    3 * CHANNELS_PER_ADC + 9,   # 45: STIM_2
-    3 * CHANNELS_PER_ADC + 10,  # 46: STIM_5
-    3 * CHANNELS_PER_ADC + 11,  # 47: STIM_4
+    2 * CHANNELS_PER_ADC + 4,   # 28: STIM_1
+    2 * CHANNELS_PER_ADC + 5,   # 29: STIM_0
+    2 * CHANNELS_PER_ADC + 6,   # 30: STIM_7
+    2 * CHANNELS_PER_ADC + 7,   # 31: STIM_6
+    3 * CHANNELS_PER_ADC + 4,   # 40: STIM_5
+    3 * CHANNELS_PER_ADC + 5,   # 41: STIM_4
+    3 * CHANNELS_PER_ADC + 6,   # 42: STIM_3
+    3 * CHANNELS_PER_ADC + 7,   # 43: STIM_2
 ]  # 8 STIM channels
 
 RECORDING_CHANNEL_INDICES = [

@@ -171,6 +171,43 @@ for _flat in ELEC_IDX:
     except (IndexError, ValueError):
         pass
 
+# ---- checkerboard scan masks -----------------------------------------------
+# For each ADC, compute which AIN channels belong to checkerboard A (col+row even)
+# and B (col+row odd).  STIM channels (non-ELEC) are always included in both.
+def _compute_checkerboard_masks():
+    """Return dict: {'All Channels': [0xFFF]*6, 'Checker A (2×)': [...], 'Checker B (2×)': [...]}"""
+    num_adcs = rx.NUM_ADCS
+    ch_per_adc = rx.CHANNELS_PER_ADC
+    mask_a = [0] * num_adcs
+    mask_b = [0] * num_adcs
+    mask_all = [0x0FFF] * num_adcs
+    stim_set = set(rx.STIM_CHANNEL_INDICES)
+    for adc_i, adc_map in enumerate(rx.CHANNEL_MAP):
+        for ain, name in enumerate(adc_map):
+            flat = adc_i * ch_per_adc + ain
+            if flat in stim_set:
+                # STIM: always scan in both patterns
+                mask_a[adc_i] |= (1 << ain)
+                mask_b[adc_i] |= (1 << ain)
+            elif name.startswith('ELEC') and len(name) >= 6:
+                col = int(name[4])
+                row = int(name[5])
+                if (col + row) % 2 == 0:
+                    mask_a[adc_i] |= (1 << ain)
+                else:
+                    mask_b[adc_i] |= (1 << ain)
+            else:
+                # Unknown channel: include in both
+                mask_a[adc_i] |= (1 << ain)
+                mask_b[adc_i] |= (1 << ain)
+    return {
+        'All Channels':    mask_all,
+        'Checker A (2\u00d7)': mask_a,
+        'Checker B (2\u00d7)': mask_b,
+    }
+
+CHECKERBOARD_MASKS = _compute_checkerboard_masks()
+
 # ---- colour palette ---------------------------------------------------------
 COLORS = [
     '#4e79a7', '#f28e2b', '#e15759', '#76b7b2', '#59a14f',
@@ -295,11 +332,18 @@ def bandpass_filter(data, low_hz, high_hz, fs, order=4):
 
 
 def compute_fft(data, fs):
+    """Compute single-sided amplitude spectral density (µV/√Hz).
+
+    Uses the Hanning window with proper normalisation so the result
+    has units of [signal_unit] / √Hz — i.e. µV/√Hz when input is µV.
+    """
     n = len(data)
     if n < 8:
         return np.array([0.0, 0.5]), np.array([0.0, 0.0])
     win  = np.hanning(n)
-    mag  = np.abs(np.fft.rfft((data - data.mean()) * win)) * 2.0 / win.sum()
+    # Amplitude spectral density: |X(f)| * sqrt(2 / (fs * S2))
+    # where S2 = sum(win**2), gives units of signal/√Hz
+    mag  = np.abs(np.fft.rfft((data - data.mean()) * win)) * np.sqrt(2.0 / (fs * (win ** 2).sum()))
     freq = np.fft.rfftfreq(n, 1.0 / fs)
     return freq, mag
 
@@ -1759,6 +1803,11 @@ class MushIOGUI:
         self._adc_refbuf_var = tk.BooleanVar(value=False)
         # ADS124S08 system monitor (SYS reg bits 7:5)
         self._adc_sysmon_var = tk.StringVar(value='Off')
+        # Scan mode (checkerboard half-scan)
+        self._scan_mode_var  = tk.StringVar(value='All Channels')
+        self._checkerboard_masks = CHECKERBOARD_MASKS
+        # Guard: don't send HW commands during init
+        self._hw_send_enabled = False
 
         # ---- bandpass state ------------------------------------------------
         self._bp_enabled   = tk.BooleanVar(value=False)
@@ -2075,6 +2124,9 @@ class MushIOGUI:
         if self._cam_enable_var.get():
             self._on_cam_enable()
 
+        # Allow signal-chain dropdowns to send HW commands now that init is done
+        self._hw_send_enabled = True
+
     # ------------------------------------------------------------------
     # UI Construction
     # ------------------------------------------------------------------
@@ -2374,6 +2426,39 @@ class MushIOGUI:
         total = self._pga_gain.get() * GAIN
         self._gain_info.config(text=f"Total gain: {self._pga_gain.get()} x {GAIN} (AFE) = {total}x")
 
+    # ---- Auto-send signal chain changes to firmware -----------------------
+
+    def _on_pga_change(self, *_):
+        if not self._hw_send_enabled:
+            return
+        self._send_cmd(f'set_pga {self._pga_gain.get()}')
+
+    def _on_filter_change(self, *_):
+        if not self._hw_send_enabled:
+            return
+        fmap = {'SINC1': 'sinc1', 'SINC2': 'sinc3', 'SINC3': 'sinc3',
+                'SINC4': 'sinc3', 'FIR': 'fir'}
+        self._send_cmd(f'set_filter {fmap.get(self._adc_filter_var.get(), "sinc3")}')
+
+    def _on_datarate_change(self, *_):
+        if not self._hw_send_enabled:
+            return
+        self._send_cmd(f'set_datarate {self._adc_dr_var.get()}')
+
+    def _on_refbuf_change(self, *_):
+        if not self._hw_send_enabled:
+            return
+        self._send_cmd(f'set_refbuf {1 if self._adc_refbuf_var.get() else 0}')
+
+    def _on_scan_mode_change(self, *_):
+        if not self._hw_send_enabled:
+            return
+        mode = self._scan_mode_var.get()
+        masks = self._checkerboard_masks.get(mode)
+        if masks:
+            hex_str = ' '.join(f'0x{m:03X}' for m in masks)
+            self._send_cmd(f'set_scan_masks {hex_str}')
+
     def _build_signal_chain_section(self, parent):
         frame = ttk.LabelFrame(parent, text="Signal Chain", padding=6)
         frame.pack(fill=tk.X, padx=4, pady=3)
@@ -2398,6 +2483,7 @@ class MushIOGUI:
                                     font=('Helvetica', 7))
         self._gain_info.pack(side=tk.LEFT, padx=(4, 0))
         self._pga_gain.trace_add('write', self._update_gain_label)
+        self._pga_gain.trace_add('write', self._on_pga_change)
         self._update_gain_label()
 
         # ---- ADC digital filter -----------------------------------------
@@ -2416,6 +2502,7 @@ class MushIOGUI:
             "SINC1=fast/noisy   SINC3=default\n"
             "FIR=50/60 Hz rejection (requires lower data rate)"
             ).pack(side=tk.LEFT, padx=2)
+        self._adc_filter_var.trace_add('write', self._on_filter_change)
 
         # ---- Data rate --------------------------------------------------
         r2 = tk.Frame(frame, bg=BG_DARK)
@@ -2435,6 +2522,7 @@ class MushIOGUI:
             ).pack(side=tk.LEFT, padx=2)
         tk.Label(r2, text="SPS", bg=BG_DARK, fg=FG_DIMMER,
                  font=('Helvetica', 7)).pack(side=tk.LEFT, padx=(3, 0))
+        self._adc_dr_var.trace_add('write', self._on_datarate_change)
 
         # ---- Reference buffer -------------------------------------------
         r3 = tk.Frame(frame, bg=BG_DARK)
@@ -2445,6 +2533,7 @@ class MushIOGUI:
             "Reduces noise on the VREF line at the cost of\n"
             "slightly longer settling time after MUX switch."
             ).pack(side=tk.LEFT)
+        self._adc_refbuf_var.trace_add('write', self._on_refbuf_change)
 
         # ---- System monitor (internal temp / supply) --------------------
         r4 = tk.Frame(frame, bg=BG_DARK)
@@ -2519,6 +2608,18 @@ class MushIOGUI:
             "Higher order = steeper roll-off, more phase distortion.\n"
             "4 is a good default."
             ).pack(side=tk.LEFT, padx=2)
+
+        # ---- Details button → Signal Chain tab ----------------------------
+        ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=4)
+        tk.Button(frame, text="Details \u25b8", bg=BG_LIGHT, fg=FG_MAIN,
+                  relief=tk.FLAT, padx=8, pady=3,
+                  command=self._show_signal_chain_tab
+                  ).pack(anchor=tk.W)
+
+    def _show_signal_chain_tab(self):
+        """Switch the notebook to the Signal Chain tab."""
+        if 'sigchain' in self._tab_frames:
+            self._notebook.select(self._tab_frames['sigchain'])
 
     def _build_stim_section(self, parent):
         frame = ttk.LabelFrame(parent, text="STIM Channels", padding=6)
@@ -2707,6 +2808,7 @@ class MushIOGUI:
         ('review',       '  Review Data  ',        '_build_review_tab'),
         ('regs',         '  ADC Regs  ',           '_build_regs_tab'),
         ('selftest',     '  Self-Test  ',          '_build_selftest_tab'),
+        ('sigchain',     '  Signal Chain  ',       '_build_signal_chain_tab'),
         ('programming',  '  Programming  ',        '_build_programming_tab'),
     ]
 
@@ -2747,6 +2849,19 @@ class MushIOGUI:
         tk.Label(tb, text="  Selected = bright + added to Overlay",
                  bg=BG_MID, fg=FG_DIMMER, font=('Helvetica', 8)).pack(side=tk.LEFT, padx=8)
 
+        # ---- Scan mode (checkerboard half-scan) -------------------------
+        ttk.Separator(tb, orient='vertical').pack(side=tk.LEFT, fill=tk.Y,
+                                                   padx=6, pady=3)
+        tk.Label(tb, text="Scan:", bg=BG_MID,
+                 fg=FG_DIMMER, font=('Helvetica', 8)).pack(side=tk.LEFT)
+        _tt(ttk.Combobox(tb, textvariable=self._scan_mode_var, width=16,
+                         values=list(CHECKERBOARD_MASKS.keys()), state='readonly'),
+            "All Channels: scan all 12 ADC channels (normal).\n"
+            "Checker A/B: scan half the electrodes in a\n"
+            "checkerboard pattern at ~2× frame rate."
+            ).pack(side=tk.LEFT, padx=2)
+        self._scan_mode_var.trace_add('write', self._on_scan_mode_change)
+
         # ---- Colour mode toggle -----------------------------------------
         ttk.Separator(tb, orient='vertical').pack(side=tk.LEFT, fill=tk.Y,
                                                    padx=6, pady=3)
@@ -2760,7 +2875,7 @@ class MushIOGUI:
                            font=('Helvetica', 8),
                            command=self._apply_grid_color_mode
                            ).pack(side=tk.LEFT, padx=3)
-        self._grid_fft_note = tk.Label(tb, text="X=Hz  Y=Amplitude (µV)",
+        self._grid_fft_note = tk.Label(tb, text="X = Hz   Y = \u00b5V/\u221aHz",
                                         bg=BG_MID, fg=ACCENT, font=('Helvetica', 8))
 
         # 10x10 GridSpec: outer ring (row/col 0 and 9) = STIM/AGND, inner (1-8) = electrodes
@@ -2819,7 +2934,7 @@ class MushIOGUI:
                     ax.patch.set_linewidth(0.8)
                     line, = ax.plot([], [], color=ORANGE, linewidth=0.7)
                     _stxt = ax.text(0.04, 0.92, sname, transform=ax.transAxes,
-                                    fontsize=4, color=ORANGE, va='top', ha='left')
+                                    fontsize=6, color=ORANGE, va='top', ha='left')
                     self._stim_grid_lines[flat] = line
                     self._stim_grid_texts[flat] = _stxt
                     self._stim_grid_axes[flat]  = ax
@@ -2855,7 +2970,7 @@ class MushIOGUI:
                         self._grid_ax_to_elec[ax] = flat
                         self._grid_texts[flat] = ax.text(
                             0.04, 0.92, nm[4:], transform=ax.transAxes,
-                            fontsize=6, color=_line_col, va='top', ha='left')
+                            fontsize=9, color=_line_col, va='top', ha='left')
                         # Clipping warning — shown when bandpass on but raw clips
                         self._clip_texts[flat] = ax.text(
                             0.5, 0.5, 'CLIP!', transform=ax.transAxes,
@@ -3354,6 +3469,28 @@ class MushIOGUI:
                  bg=BG_DARK, fg=FG_DIM, font=('Helvetica', 8),
                  wraplength=260, justify=tk.LEFT).pack(anchor=tk.W)
 
+        # ---- Developer: STIM as input toggle ------------------------------
+        dev_f = ttk.LabelFrame(linner, text="Developer", padding=6)
+        dev_f.pack(fill=tk.X, padx=4, pady=(8, 4))
+        self._stim_as_input_var = tk.BooleanVar(value=False)
+        _tt(tk.Checkbutton(dev_f, text="Use STIM channels as inputs",
+                           variable=self._stim_as_input_var,
+                           bg=BG_DARK, fg=ORANGE, selectcolor=BG_LIGHT,
+                           activebackground=BG_DARK, activeforeground=ORANGE,
+                           font=('Helvetica', 8, 'bold'),
+                           command=self._on_stim_input_toggle),
+            "Enable this to read STIM channels as regular ADC inputs\n"
+            "for channel mapping verification.\n\n"
+            "WARNING: STIM pins connect directly to the ADC with NO\n"
+            "analog front-end. Do not apply voltages outside the\n"
+            "ADC input range (0 – AVDD)."
+            ).pack(anchor=tk.W)
+        self._stim_input_warn = tk.Label(dev_f,
+            text="\u26a0 STIM pins go DIRECT to ADC — no AFE protection.\n"
+                 "Do not exceed ADC input range (0 – AVDD).",
+            bg='#3a2000', fg='#ffaa00', font=('Helvetica', 7),
+            wraplength=250, justify=tk.LEFT, padx=4, pady=3)
+
         # ---- Right panel: view toggle + preview figure ----
         vtb = tk.Frame(right, bg=BG_MID, pady=3)
         vtb.pack(fill=tk.X)
@@ -3738,6 +3875,28 @@ class MushIOGUI:
                 f"Loaded {len(data)} samples — click Apply to save to channel")
         except Exception as e:
             self._stim_upload_status.set(f"Error reading CSV: {e}")
+
+    def _on_stim_input_toggle(self):
+        """Toggle STIM channels between stimulation and input mode.
+
+        In input mode, STIM AIN4-7 on ADC2/ADC3 are read as regular
+        ADC inputs (muxed against AINCOM) so the user can stimulate
+        them externally for channel-mapping verification.
+
+        WARNING: STIM pins connect directly to the ADS124S08 with no
+        analog front-end — no gain, no protection.
+        """
+        enabled = self._stim_as_input_var.get()
+        if enabled:
+            self._stim_input_warn.pack(anchor=tk.W, pady=(4, 0))
+            # No firmware command needed — the scan loop already reads
+            # STIM channels (AIN4-7) via the same INPMUX mux scan.
+            # The data is always captured; this toggle just shows/hides
+            # the warning and could be used to gate STIM output commands.
+            print("[STIM] STIM-as-input mode ENABLED — treat STIM channels as inputs")
+        else:
+            self._stim_input_warn.pack_forget()
+            print("[STIM] STIM-as-input mode DISABLED — normal stimulation mode")
 
     def _stim_upload_all(self):
         if not self._cmd_client or not self._cmd_client.connected:
@@ -6200,6 +6359,211 @@ class MushIOGUI:
         # Terminal fills remaining space
         term = self._build_terminal(parent)
         term.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+    # ---- Signal Chain tab ------------------------------------------------
+
+    def _build_signal_chain_tab(self, parent):
+        """Signal Chain tab: block diagram showing the full signal path
+        from electrode to display, with interactive controls at each stage."""
+        canvas = tk.Canvas(parent, bg=BG_DARK, highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+        self._sigchain_canvas = canvas
+
+        # Redraw on resize
+        canvas.bind('<Configure>', lambda e: self._draw_signal_chain())
+        # Defer first draw until canvas has a size
+        parent.after(100, self._draw_signal_chain)
+
+    def _draw_signal_chain(self):
+        """Render the signal chain block diagram on the canvas."""
+        c = self._sigchain_canvas
+        c.delete('all')
+        W = c.winfo_width()
+        H = c.winfo_height()
+        if W < 100 or H < 100:
+            return
+
+        # ---- Layout parameters -------------------------------------------
+        block_h   = 60
+        block_gap = 20
+        row_y1    = H // 2 - block_h // 2 - 50   # top row (HW chain)
+        row_y2    = H // 2 - block_h // 2 + 60    # bottom row (SW chain)
+        margin_x  = 40
+        arrow_col = '#585880'
+        block_bg  = '#1e1e30'
+        block_fg  = '#cdd6f4'
+        accent    = '#89b4fa'
+        label_font = ('Helvetica', 9)
+        title_font = ('Helvetica', 10, 'bold')
+        detail_font = ('Helvetica', 8)
+
+        # ---- Block definitions (label, detail_text, is_interactive, row) --
+        # Row 0 = hardware, Row 1 = software
+        blocks = [
+            # Row 0: Hardware signal chain
+            ('Electrode',   'Biopotential\ninput',              False, 0),
+            ('AFE',         f'Fixed gain\n\u00d7{GAIN:.0f}',    False, 0),
+            ('PGA',         None,                                True,  0),  # interactive
+            ('ADC',         None,                                True,  0),  # interactive
+            ('Filter',      None,                                True,  0),  # interactive
+            # Row 1: Transport + Software
+            ('WiFi / TCP',  'Pico \u2192 Host\nover network',   False, 1),
+            ('Bandpass',    None,                                True,  1),  # interactive
+            ('Display',     'Grid / Overlay\n/ Waterfall',       False, 1),
+        ]
+
+        # Compute block positions
+        row0 = [b for b in blocks if b[3] == 0]
+        row1 = [b for b in blocks if b[3] == 1]
+
+        def layout_row(items, y_top):
+            n = len(items)
+            usable = W - 2 * margin_x
+            bw = min(160, max(100, (usable - (n - 1) * block_gap) // n))
+            total_w = n * bw + (n - 1) * block_gap
+            x_start = (W - total_w) // 2
+            positions = []
+            for i in range(n):
+                x = x_start + i * (bw + block_gap)
+                positions.append((x, y_top, bw, block_h))
+            return positions
+
+        pos0 = layout_row(row0, row_y1)
+        pos1 = layout_row(row1, row_y2)
+
+        def draw_block(x, y, w, h, label, detail, highlight=False):
+            """Draw a rounded-rect block with label and detail text."""
+            r = 8
+            bg = accent if highlight else block_bg
+            fg = BG_DARK if highlight else block_fg
+            # Rounded rectangle via polygon
+            pts = [x+r,y, x+w-r,y, x+w,y, x+w,y+r,
+                   x+w,y+h-r, x+w,y+h, x+w-r,y+h, x+r,y+h,
+                   x,y+h, x,y+h-r, x,y+r, x,y]
+            c.create_polygon(pts, fill=bg, outline='#45456a', width=1, smooth=True)
+            c.create_text(x + w // 2, y + 14, text=label,
+                          font=title_font, fill=fg, anchor='center')
+            if detail:
+                c.create_text(x + w // 2, y + 38, text=detail,
+                              font=detail_font, fill='#a6adc8' if not highlight else '#1e1e30',
+                              anchor='center', justify='center')
+
+        def draw_arrow(x1, y1, x2, y2):
+            """Draw a horizontal arrow between blocks."""
+            mid_y = (y1 + y2) // 2
+            c.create_line(x1, mid_y, x2, mid_y, fill=arrow_col,
+                          width=2, arrow=tk.LAST, arrowshape=(8, 10, 4))
+
+        # Draw row 0 blocks
+        for i, (label, detail, interactive, _) in enumerate(row0):
+            x, y, w, h = pos0[i]
+            # Build detail text for interactive blocks
+            if label == 'PGA':
+                gain = self._pga_gain.get()
+                total = gain * GAIN
+                detail = f'Gain: \u00d7{gain}\nTotal: \u00d7{total:.0f}'
+            elif label == 'ADC':
+                detail = f'ADS124S08\n{self._adc_dr_var.get()} SPS'
+            elif label == 'Filter':
+                detail = f'{self._adc_filter_var.get()}\nDigital filter'
+            draw_block(x, y, w, h, label, detail, highlight=interactive)
+            # Arrow to next block
+            if i < len(row0) - 1:
+                nx, ny, nw, nh = pos0[i + 1]
+                draw_arrow(x + w, y + h // 2, nx, ny + nh // 2)
+
+        # Arrow from last row0 block down to first row1 block
+        if pos0 and pos1:
+            lx, ly, lw, lh = pos0[-1]
+            fx, fy, fw, fh = pos1[0]
+            mid_x = lx + lw // 2
+            mid_x2 = fx + fw // 2
+            # Down arrow from last HW block, then across to first SW block
+            drop_y = ly + lh + 15
+            c.create_line(lx + lw, ly + lh // 2, lx + lw + 20, ly + lh // 2,
+                          fill=arrow_col, width=2)
+            c.create_line(lx + lw + 20, ly + lh // 2, lx + lw + 20, fy + fh // 2,
+                          fill=arrow_col, width=2)
+            c.create_line(lx + lw + 20, fy + fh // 2, fx, fy + fh // 2,
+                          fill=arrow_col, width=2, arrow=tk.LAST,
+                          arrowshape=(8, 10, 4))
+
+        # Draw row 1 blocks
+        for i, (label, detail, interactive, _) in enumerate(row1):
+            x, y, w, h = pos1[i]
+            if label == 'Bandpass':
+                if self._bp_enabled.get():
+                    detail = f'{self._bp_low.get():.1f} – {self._bp_high.get():.1f} Hz\nOrder {self._bp_order_var.get()}'
+                else:
+                    detail = 'Disabled'
+            draw_block(x, y, w, h, label, detail, highlight=interactive)
+            if i < len(row1) - 1:
+                nx, ny, nw, nh = pos1[i + 1]
+                draw_arrow(x + w, y + h // 2, nx, ny + nh // 2)
+
+        # ---- Interactive controls below the diagram ----------------------
+        ctrl_y = max(pos0[-1][1] + pos0[-1][3], pos1[-1][1] + pos1[-1][3]) + 40
+
+        # Title
+        c.create_text(W // 2, ctrl_y, text='Signal Chain Controls',
+                      font=('Helvetica', 11, 'bold'), fill=block_fg, anchor='center')
+        ctrl_y += 30
+
+        # Create a frame embedded in the canvas for the controls
+        ctrl_frame = tk.Frame(c, bg=BG_DARK)
+        c.create_window(W // 2, ctrl_y + 60, window=ctrl_frame, anchor='center')
+
+        # 2-column grid layout for controls
+        controls = [
+            ('PGA Gain:',      self._pga_gain,       [1, 2, 4, 8, 16, 32]),
+            ('ADC Filter:',    self._adc_filter_var,  ['SINC1', 'SINC2', 'SINC3', 'SINC4', 'FIR']),
+            ('Data Rate:',     self._adc_dr_var,      ['2.5', '5', '10', '16.6', '20', '50',
+                                                        '100', '200', '400', '800', '1000', '2000', '4000']),
+        ]
+        for row_i, (lbl, var, vals) in enumerate(controls):
+            tk.Label(ctrl_frame, text=lbl, bg=BG_DARK, fg=FG_DIM,
+                     font=label_font, anchor=tk.E, width=12).grid(
+                         row=row_i, column=0, padx=(0, 6), pady=3, sticky='e')
+            ttk.Combobox(ctrl_frame, textvariable=var, width=10,
+                         values=vals, state='readonly').grid(
+                             row=row_i, column=1, pady=3, sticky='w')
+            if lbl == 'Data Rate:':
+                tk.Label(ctrl_frame, text='SPS', bg=BG_DARK, fg=FG_DIMMER,
+                         font=('Helvetica', 7)).grid(row=row_i, column=2, padx=3)
+
+        # Ref buffer checkbox
+        row_i = len(controls)
+        ttk.Checkbutton(ctrl_frame, text='Reference buffer',
+                        variable=self._adc_refbuf_var).grid(
+                            row=row_i, column=0, columnspan=2, pady=3, sticky='w')
+
+        # Bandpass section
+        row_i += 1
+        ttk.Separator(ctrl_frame, orient='horizontal').grid(
+            row=row_i, column=0, columnspan=3, sticky='ew', pady=6)
+        row_i += 1
+        ttk.Checkbutton(ctrl_frame, text='Enable bandpass',
+                        variable=self._bp_enabled).grid(
+                            row=row_i, column=0, columnspan=2, pady=3, sticky='w')
+        for _lbl, _var, _unit in [('Low:', self._bp_low, 'Hz'),
+                                   ('High:', self._bp_high, 'Hz')]:
+            row_i += 1
+            tk.Label(ctrl_frame, text=_lbl, bg=BG_DARK, fg=FG_DIM,
+                     font=label_font, anchor=tk.E, width=12).grid(
+                         row=row_i, column=0, padx=(0, 6), pady=2, sticky='e')
+            tk.Entry(ctrl_frame, textvariable=_var, width=8,
+                     bg=BG_LIGHT, fg=FG_MAIN, insertbackground=FG_MAIN,
+                     relief=tk.FLAT).grid(row=row_i, column=1, pady=2, sticky='w')
+            tk.Label(ctrl_frame, text=_unit, bg=BG_DARK, fg=FG_DIMMER,
+                     font=('Helvetica', 7)).grid(row=row_i, column=2, padx=3)
+
+        row_i += 1
+        tk.Label(ctrl_frame, text='Order:', bg=BG_DARK, fg=FG_DIM,
+                 font=label_font, anchor=tk.E, width=12).grid(
+                     row=row_i, column=0, padx=(0, 6), pady=2, sticky='e')
+        ttk.Combobox(ctrl_frame, textvariable=self._bp_order_var, width=5,
+                     values=[2, 4, 6, 8], state='readonly').grid(
+                         row=row_i, column=1, pady=2, sticky='w')
 
     # ---- Programming tab -------------------------------------------------
 

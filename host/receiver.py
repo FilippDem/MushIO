@@ -50,25 +50,22 @@ SPI_CLOCK_HZ      = 1_000_000 # Conservative 1 MHz SPI; datasheet max is 16 MHz
 # Each sub-list is one ADC (0–5), 12 entries for AIN0–AIN11.
 # Flat index = adc_index * 12 + ain_channel.
 #
-# Channels requiring user verification (assumptions made from test data):
-#   - ELEC70: assumed grid pos "50" (digit transposition from "05" in table)
-#   - ELEC27: assumed ADC1 AIN7 → grid "14" (was listed as "25", conflicted)
-#   - ELEC67: assumed ADC5 AIN8 → grid "67" (was listed as "76", conflicted)
-#   - ADC2 AIN8-11: ELEC42/32/33/43 order is pattern-based (no test data)
-#   - ADC3 AIN8-11: ELEC37/36/35/34 order is pattern-based (no test data)
+# Full channel map verified 2026-03-17 via stimulation testing.
+# Corrections applied: ADC1 AIN2/6/7 (17↔07↔27 3-way rotation),
+# ADC2 AIN8-11 (43,33,42,32), ADC3 AIN8-11 (34,35,36,37 reversed).
 CHANNEL_MAP = [
     ["ELEC02", "ELEC23", "ELEC12", "ELEC22",   # ADC0: AIN0-3
      "ELEC21", "ELEC11", "ELEC20", "ELEC01",   #       AIN4-7
      "ELEC00", "ELEC10", "ELEC03", "ELEC13"],  #       AIN8-11
-    ["ELEC16", "ELEC24", "ELEC17", "ELEC04",   # ADC1: AIN0-3
-     "ELEC05", "ELEC06", "ELEC07", "ELEC27",   #       AIN4-7
+    ["ELEC16", "ELEC24", "ELEC27", "ELEC04",   # ADC1: AIN0-3  (AIN2: was ELEC17, tested 27→17)
+     "ELEC05", "ELEC06", "ELEC17", "ELEC07",   #       AIN4-7  (AIN6: was ELEC07, tested 17→07; AIN7: was ELEC27, tested 07→27)
      "ELEC15", "ELEC26", "ELEC14", "ELEC25"],  #       AIN8-11
     ["ELEC40", "ELEC30", "ELEC31", "ELEC41",   # ADC2: AIN0-3
      "STIM_1", "STIM_0", "STIM_7", "STIM_6",  #       AIN4-7 (STIM)
-     "ELEC42", "ELEC32", "ELEC33", "ELEC43"],  #       AIN8-11 (assumed)
+     "ELEC43", "ELEC33", "ELEC42", "ELEC32"],  #       AIN8-11 (tested: 43→42, 33→32, 42→33, 32→43)
     ["ELEC47", "ELEC46", "ELEC45", "ELEC44",   # ADC3: AIN0-3
      "STIM_5", "STIM_4", "STIM_3", "STIM_2",  #       AIN4-7 (STIM)
-     "ELEC37", "ELEC36", "ELEC35", "ELEC34"],  #       AIN8-11 (assumed)
+     "ELEC34", "ELEC35", "ELEC36", "ELEC37"],  #       AIN8-11 (tested: 34→37, 35→36, 36→35, 37→34)
     ["ELEC71", "ELEC70", "ELEC61", "ELEC62",   # ADC4: AIN0-3
      "ELEC72", "ELEC53", "ELEC63", "ELEC73",   #       AIN4-7
      "ELEC50", "ELEC60", "ELEC52", "ELEC51"],  #       AIN8-11

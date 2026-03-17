@@ -65,6 +65,10 @@ int32_t ads_rdata(int adc);
 /* Wait for DRDY to go low, with timeout in µs. Returns true if asserted. */
 bool ads_wait_drdy(int adc, uint32_t timeout_us);
 
+/* Per-ADC channel scan masks (bitmask of AIN channels 0-11).
+ * 0x0FFF = all channels.  Set via CMD "set_scan_masks" for checkerboard mode. */
+extern volatile uint16_t g_scan_ch_mask[NUM_ADCS];
+
 /* Scan timing diagnostic — measures per-channel cmd/drdy/read times.
  * Writes results into 'out' buffer (up to out_size chars). */
 void adc_manager_scan_timing(char *out, int out_size);

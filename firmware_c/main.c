@@ -968,6 +968,39 @@ static void cmd_dispatch(struct tcp_pcb *pcb, const char *cmd)
         cmd_send(pcb, "set_refbuf: demo mode (no-op)");
 #endif
 
+    } else if (strncasecmp(cmd, "set_scan_masks", 14) == 0) {
+        /* set_scan_masks <m0> <m1> <m2> <m3> <m4> <m5>
+         * Set per-ADC channel scan masks (12-bit hex, 0x000-0xFFF).
+         * Channels not in the mask are skipped during scan (zeroed output).
+         * Used for checkerboard half-scan to ~2× frame rate. */
+        const char *arg = cmd + 14;
+        while (*arg == ' ') arg++;
+        uint16_t masks[NUM_ADCS];
+        int parsed = 0;
+        const char *p = arg;
+        for (int i = 0; i < (int)NUM_ADCS && *p; i++) {
+            char *end;
+            unsigned long v = strtoul(p, &end, 16);
+            if (end == p) break;
+            masks[i] = (uint16_t)(v & 0x0FFFu);
+            parsed++;
+            p = end;
+            while (*p == ' ' || *p == ',') p++;
+        }
+        if (parsed != (int)NUM_ADCS) {
+            cmd_send(pcb, "error: set_scan_masks needs %u hex masks (got %d)",
+                     (unsigned)NUM_ADCS, parsed);
+        } else {
+            for (int i = 0; i < (int)NUM_ADCS; i++)
+                g_scan_ch_mask[i] = masks[i];
+            int total_ch = 0;
+            for (int i = 0; i < (int)NUM_ADCS; i++)
+                for (int b = 0; b < (int)CHANNELS_PER_ADC; b++)
+                    if (masks[i] & (1u << b)) total_ch++;
+            cmd_send(pcb, "scan_masks set: %u active channels (of %u)",
+                     total_ch, (unsigned)TOTAL_CHANNELS);
+        }
+
     } else if (strncasecmp(cmd, "probe_adc", 9) == 0) {
         /* probe_adc <n> — deep diagnostic for a single ADC (0-5).
          * Reports pin mapping, ID, all registers, DRDY state,

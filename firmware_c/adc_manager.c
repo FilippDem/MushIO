@@ -86,6 +86,13 @@ static inline bool adc_uses_pio(int adc) { return adc >= 3; }
 #define ADC_SPI_BAUDRATE    8000000
 #define PIO_SPI_BAUDRATE    8000000
 
+/* Per-ADC channel scan masks — each bit selects an AIN channel (0-11).
+ * 0x0FFF = all 12 channels enabled (default).
+ * Set via CMD "set_scan_masks" for checkerboard half-scan. */
+volatile uint16_t g_scan_ch_mask[NUM_ADCS] = {
+    0x0FFFu, 0x0FFFu, 0x0FFFu, 0x0FFFu, 0x0FFFu, 0x0FFFu
+};
+
 /* =========================================================================
  * Low-level SPI helpers
  * ========================================================================= */
@@ -406,31 +413,52 @@ static inline void ads_set_mux(int adc, uint8_t mux)
 int adc_manager_scan(uint8_t *out_data)
 {
     for (int ch = 0; ch < (int)CHANNELS_PER_ADC; ch++) {
+        /* Build active-ADC mask for this channel from per-ADC scan masks. */
+        uint8_t active = 0;
+        for (int a = 0; a < (int)NUM_ADCS; a++) {
+            if (g_scan_ch_mask[a] & (1u << ch))
+                active |= (uint8_t)(1u << a);
+        }
+
+        /* If no ADC needs this channel, zero all and skip entirely. */
+        if (active == 0) {
+            for (int a = 0; a < (int)NUM_ADCS; a++) {
+                int idx = (a * (int)CHANNELS_PER_ADC + ch) * (int)BYTES_PER_SAMPLE;
+                out_data[idx] = 0;
+                out_data[idx + 1] = 0;
+                out_data[idx + 2] = 0;
+            }
+            continue;
+        }
+
         uint8_t mux = (uint8_t)((ch << 4) | 0x0C);
 
-        /* 1. Set INPMUX on all 6 ADCs (WREG resets filter, no STOP/START).
-         *    3 bytes per ADC.  Modulator stays warm in continuous mode. */
-        for (int a = 0; a < (int)NUM_ADCS; a++)
-            ads_set_mux(a, mux);
+        /* 1. Set INPMUX only on active ADCs. */
+        for (int a = 0; a < (int)NUM_ADCS; a++) {
+            if (active & (1u << a))
+                ads_set_mux(a, mux);
+        }
 
-        /* 2. Wait for ALL DRDY pins to assert LOW.
-         *    Single-shot + LL filter at 4000 SPS: 250 µs per conversion.
-         *    Use gpio_get_all() for a single register read per iteration. */
+        /* 2. Wait for active DRDY pins to assert LOW. */
         uint8_t ready = 0;
         absolute_time_t deadline = make_timeout_time_us(2000);
-        while (ready != ALL_ADCS_MASK && !time_reached(deadline)) {
+        while ((ready & active) != active && !time_reached(deadline)) {
             uint32_t pins = gpio_get_all();
             for (int a = 0; a < (int)NUM_ADCS; a++) {
-                if (!(ready & (1u << a)) &&
+                if ((active & (1u << a)) && !(ready & (1u << a)) &&
                     !(pins & (1u << adc_drdy_pins[a])))
                     ready |= (uint8_t)(1u << a);
             }
         }
 
-        /* 3. Read conversion data from all ADCs. */
+        /* 3. Read conversion data from active ADCs; zero inactive. */
         for (int a = 0; a < (int)NUM_ADCS; a++) {
             int idx = (a * (int)CHANNELS_PER_ADC + ch) * (int)BYTES_PER_SAMPLE;
-            if (ready & (1u << a)) {
+            if (!(active & (1u << a))) {
+                out_data[idx] = 0;
+                out_data[idx + 1] = 0;
+                out_data[idx + 2] = 0;
+            } else if (ready & (1u << a)) {
                 int32_t val = ads_rdata_cont(a);
                 out_data[idx]     = (uint8_t)((val >> 16) & 0xFF);
                 out_data[idx + 1] = (uint8_t)((val >> 8)  & 0xFF);
